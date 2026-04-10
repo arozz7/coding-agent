@@ -1,11 +1,21 @@
 import os
 import requests
 import asyncio
-from discord import Client, Intents, Message
+from discord import Client, Intents, Message, File
 from discord.ext import commands
 
 API_URL = os.getenv("AGENT_API_URL", "http://localhost:5005")
-REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "300"))  # 5 minutes default for local models
+REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "900"))
+
+# Create a persistent session for connection reuse
+_session = requests.Session()
+_adapter = requests.adapters.HTTPAdapter(
+    pool_connections=10,
+    pool_maxsize=10,
+    max_retries=3
+)
+_session.mount("http://", _adapter)
+_session.mount("https://", _adapter)
 
 
 class AgentClient:
@@ -18,27 +28,31 @@ class AgentClient:
         if session_id:
             payload["session_id"] = session_id
         
-        print(f"Sending request to {self.api_url}/task with payload: {task[:50]}...")
+        print(f"Sending request to {self.api_url}/task...")
         
         try:
-            response = requests.post(f"{self.api_url}/task", json=payload, timeout=REQUEST_TIMEOUT)
+            response = _session.post(
+                f"{self.api_url}/task", 
+                json=payload, 
+                timeout=REQUEST_TIMEOUT
+            )
             response.raise_for_status()
             result = response.json()
             print(f"Got response: success={result.get('success')}")
             return result
         except requests.exceptions.Timeout:
-            print(f"TIMEOUT: Request to {self.api_url} timed out after {REQUEST_TIMEOUT}s")
-            return {"success": False, "error": f"Request timed out ({REQUEST_TIMEOUT}s) - local model may be slow"}
+            print(f"TIMEOUT: Request timed out after {REQUEST_TIMEOUT}s")
+            return {"success": False, "error": f"Request timed out ({REQUEST_TIMEOUT}s) - local model may be slow. Try restarting the API."}
         except requests.exceptions.ConnectionError as e:
             print(f"CONNECTION ERROR: {e}")
-            return {"success": False, "error": f"Connection failed: {str(e)}"}
+            return {"success": False, "error": f"Connection failed. Is the API server running?"}
         except requests.exceptions.RequestException as e:
             print(f"REQUEST ERROR: {e}")
             return {"success": False, "error": str(e)}
     
     def get_session_history(self, session_id: str) -> dict:
         try:
-            response = requests.get(f"{self.api_url}/sessions/{session_id}", timeout=30)
+            response = _session.get(f"{self.api_url}/sessions/{session_id}", timeout=30)
             response.raise_for_status()
             return response.json()
         except Exception as e:
@@ -46,7 +60,7 @@ class AgentClient:
     
     def list_sessions(self) -> dict:
         try:
-            response = requests.get(f"{self.api_url}/sessions", timeout=30)
+            response = _session.get(f"{self.api_url}/sessions", timeout=30)
             response.raise_for_status()
             return response.json()
         except Exception as e:
@@ -54,7 +68,7 @@ class AgentClient:
     
     def delete_session(self, session_id: str) -> dict:
         try:
-            response = requests.delete(f"{self.api_url}/sessions/{session_id}", timeout=30)
+            response = _session.delete(f"{self.api_url}/sessions/{session_id}", timeout=30)
             response.raise_for_status()
             return response.json()
         except Exception as e:
@@ -103,11 +117,23 @@ async def ask(ctx, *, question: str):
                 await ctx.send("⚠️ Empty response received")
                 return
             
-            if len(response) > 2000:
-                for i in range(0, len(response), 2000):
-                    await ctx.send(response[i:i+2000])
-            else:
-                await ctx.send(response)
+            # Split by newlines to avoid Discord formatting issues, then send in chunks
+            lines = response.split('\n')
+            current_chunk = []
+            current_length = 0
+            
+            for line in lines:
+                line_length = len(line) + 1  # +1 for newline
+                if current_length + line_length > 1800 and current_chunk:
+                    await ctx.send('\n'.join(current_chunk))
+                    current_chunk = []
+                    current_length = 0
+                current_chunk.append(line)
+                current_length += line_length
+            
+            # Send remaining
+            if current_chunk:
+                await ctx.send('\n'.join(current_chunk))
         else:
             error = result.get("error", "Unknown error")
             await ctx.send(f"❌ Error: {error}")
@@ -168,19 +194,35 @@ async def help_command(ctx):
     help_text = """
 🤖 **Agent Commands**
 
+**Core:**
 - `!ask <question>` - Ask the coding agent anything
+
+**Code:**
 - `!explain <code>` - Explain what code does
 - `!test <code>` - Generate tests for code
 - `!refactor <code>` - Refactor/improve code
 - `!review` - Review last shared code
-- `!git <command>` - Run git command (status, log, diff, branch)
+
+**Git:**
+- `!git <command>` - Run git (status, log, diff, branch)
+
+**Docs & Info:**
 - `!docs <topic>` - Get documentation on a topic
-- `!history` - Show your conversation history
 - `!session` - Show current session info
-- `!clear` - Clear your conversation history
+
+**Workspace:**
+- `!workspace` - Show current workspace & contents
+- `!cd <path>` - Change workspace directory
+
+**Screenshots:**
+- `!screenshot [url]` - Take screenshot of localhost:8080 or custom URL
+
+**History:**
+- `!history` - Show conversation history
+- `!clear` - Clear your conversation
 - `!sessions` - List all sessions
-- `!helpme` - Show this help message
-    """
+- `!helpme` - Show this help
+"""
     await ctx.send(help_text)
 
 
@@ -322,6 +364,30 @@ async def show_session(ctx):
     await ctx.send(f"📋 **Session Info**\n- Session ID: `{session_id}`\n- Messages: {msg_count}")
 
 
+@bot.command(name="load")
+async def load_session(ctx, *, session_id: str):
+    """Load a specific session by ID"""
+    history = bot.agent_client.get_session_history(session_id)
+    
+    if "error" in history:
+        await ctx.send(f"❌ Error: {history['error']}")
+        return
+    
+    messages = history.get("history", [])
+    
+    if not messages:
+        await ctx.send(f"⚠️ No messages found in session: {session_id}")
+        return
+    
+    await ctx.send(f"✅ Loaded session: `{session_id}` ({len(messages)} messages)")
+    
+    # Show last few messages
+    for msg in messages[-3:]:
+        role = msg.get("role", "unknown")
+        content = msg.get("content", "")[:150]
+        await ctx.send(f"**{role}**: {content}...")
+
+
 @bot.command(name="clear")
 async def clear_history(ctx):
     """Clear conversation history"""
@@ -334,6 +400,84 @@ async def clear_history(ctx):
             await ctx.send("✅ Conversation history cleared!")
         else:
             await ctx.send(f"❌ Error: {result.get('error', 'Unknown')}")
+    except Exception as e:
+        await ctx.send(f"❌ Error: {str(e)}")
+
+
+@bot.command(name="workspace")
+async def show_workspace(ctx):
+    """Show current workspace"""
+    try:
+        response = _session.get(f"{bot.agent_client.api_url}/workspace", timeout=10)
+        data = response.json()
+        
+        await ctx.send(f"📁 **Current Workspace:**\n{data.get('workspace', 'Unknown')}")
+        
+        # Also show contents
+        dirs_response = _session.get(f"{bot.agent_client.api_url}/workspace/directories", timeout=10)
+        dirs_data = dirs_response.json()
+        
+        if "items" in dirs_data:
+            items = dirs_data["items"]
+            if items:
+                msg = "**Contents:**\n"
+                for item in items[:10]:
+                    emoji = "📁" if item["type"] == "directory" else "📄"
+                    msg += f"{emoji} {item['name']}\n"
+                await ctx.send(msg)
+    except Exception as e:
+        await ctx.send(f"❌ Error: {str(e)}")
+
+
+@bot.command(name="cd")
+async def change_workspace(ctx, *, path: str):
+    """Change workspace directory"""
+    try:
+        response = _session.post(
+            f"{bot.agent_client.api_url}/workspace",
+            json={"path": path},
+            timeout=120
+        )
+        data = response.json()
+        
+        if response.status_code == 200:
+            await ctx.send(f"✅ Workspace changed to: {data.get('workspace')}")
+        else:
+            await ctx.send(f"❌ Error: {data.get('detail', 'Unknown error')}")
+    except Exception as e:
+        await ctx.send(f"❌ Error: {str(e)}")
+
+
+@bot.command(name="screenshot")
+async def take_screenshot(ctx, url: str = "http://localhost:8080"):
+    """Take a screenshot of a URL and upload to Discord"""
+    await ctx.send("📸 Taking screenshot...")
+    
+    try:
+        response = _session.post(
+            f"{bot.agent_client.api_url}/screenshot",
+            json={"url": url},
+            timeout=60
+        )
+        
+        if response.status_code == 200:
+            result = response.json()
+            if result.get("success"):
+                path = result.get("path")
+                await ctx.send(f"✅ Screenshot saved to: {path}")
+                # Try to upload the file to Discord
+                try:
+                    import os
+                    if os.path.exists(path):
+                        await ctx.send(file=discord.File(path))
+                    else:
+                        await ctx.send(f"⚠️ File not found at: {path}")
+                except Exception as e:
+                    await ctx.send(f"⚠️ Could not upload file: {str(e)}")
+            else:
+                await ctx.send(f"❌ Screenshot failed: {result.get('error', 'Unknown')}")
+        else:
+            await ctx.send(f"❌ Error: {response.text}")
     except Exception as e:
         await ctx.send(f"❌ Error: {str(e)}")
 

@@ -1,10 +1,10 @@
 ---
 title: Implementation Plan - Local Coding Agent with Application Development Capabilities
 created: 2026-04-06
-updated: 2026-04-09
-version: 2.0
+updated: 2026-04-10
+version: 2.3
 tags: ["implementation", "plan", "coding-agent", "local-agent", "architecture"]
-relatedTopics: ["local-agent", "coding-agent"]
+relatedTopics: ["local-agent", "coding-agent", "anthropic-managed-agents", "llm-wiki"]
 status: draft
 ---
 
@@ -12,7 +12,13 @@ status: draft
 
 ## Executive Summary
 
-This document provides a comprehensive implementation plan for building a **local coding agent** capable of developing full-stack applications. The agent integrates insights from both `local-agent` and `coding-agent` research, combining Claude Skills patterns, MCP (Model Context Protocol), multi-agent orchestration, long-term memory, and robust sandboxing for safe execution.
+This document provides a comprehensive implementation plan for building a **local coding agent** capable of developing full-stack applications. The agent integrates insights from:
+- Anthropic's Managed Agents architecture (brain/hands decoupling)
+- LLM Wiki pattern (persistent knowledge compounding)
+- Claude Skills patterns
+- MCP (Model Context Protocol)
+- Multi-agent orchestration
+- Long-term memory with vector DB + MemoryWiki
 
 ### Key Capabilities
 
@@ -27,6 +33,8 @@ This document provides a comprehensive implementation plan for building a **loca
 - **Streaming Responses**: Real-time feedback during LLM generation
 - **Cost Tracking**: Monitor API usage and costs across cloud providers
 - **Resilient Operations**: Retry logic, rate limiting, and health checks
+- **Brain/Hand Decoupling**: Formal tool execution interface for replaceable components
+- **Persistent Wiki**: Agent-maintained knowledge base that compounds over time
 
 ### Technology Stack
 
@@ -34,7 +42,7 @@ This document provides a comprehensive implementation plan for building a **loca
 |-----------|---------------|
 | **Language** | Python 3.11+ (cross-platform) |
 | **LLM Runtime (Local)** | Ollama (Windows/macOS/Linux) |
-| **Primary Model** | `qwen2.5-coder:32b` (~20GB VRAM) |
+| **Primary Model** | `qwen3.5-35b-a3b` (~20GB VRAM) |
 | **Fallback Model** | `glm-4.7-flash` (~25GB VRAM) or cloud API |
 | **Agent Framework** | LangGraph (complex workflows) / CrewAI (simple teams) |
 | **MCP SDK** | Python `mcp` package + custom servers |
@@ -44,6 +52,66 @@ This document provides a comprehensive implementation plan for building a **loca
 | **Sandboxing** | Docker containers / Firecracker microVMs / Windows Sandbox |
 | **Observability** | Prometheus metrics + structured logging |
 | **Cross-Platform** | `pathlib`, `os.path`, platform-specific detection |
+
+### Architecture Updates (v2.1 - Based on Anthropic Managed Agents & LLM Wiki)
+
+#### Brain/Hand Decoupling
+Following Anthropic's Managed Agents architecture, we decouple the "brain" (LLM + harness) from the "hands" (execution environment):
+
+| Component | Before | After |
+|-----------|--------|-------|
+| **Tool Execution** | Direct in-process calls | `execute(name, input) → output` interface |
+| **Session Storage** | Embedded in context | External append-only log with `getEvents()` |
+| **Crash Recovery** | Single point of failure | Resume from last event via `wake(sessionId)` |
+| **Sandbox** | Same container as brain | Independent tool, provisioned on-demand |
+
+#### Tool Execution Interface
+```python
+class ToolExecutor:
+    def execute(self, tool_name: str, input: dict) -> str:
+        """Formal tool interface - execute(name, input) → output"""
+        
+# Usage
+result = executor.execute("shell", {"command": "npm run build"})
+result = executor.execute("file_read", {"path": "src/main.py"})
+result = executor.execute("screenshot", {"url": "http://localhost:8080"})
+```
+
+#### Queryable Session Memory
+```python
+class SessionMemory:
+    def get_events(self, session_id: str, offset: int = 0, limit: int = 100) -> List[dict]:
+        """Query events by position - enables programmatic context access"""
+        
+# Usage
+events = session.get_events(session_id, offset=100, limit=50)  # events 100-149
+events = session.get_events(session_id, offset=-50)  # last 50 events
+```
+
+#### LLM Wiki Pattern
+Following Andrej Karpathy's LLM Wiki pattern, the agent maintains a persistent knowledge base:
+
+```
+workspace/.agent-wiki/
+├── index.md          # Catalog of all entries
+├── log.md            # Chronological compilation log
+├── tech-patterns/    # Technical patterns discovered
+├── bugs/             # Bug fixes and workarounds
+├── decisions/        # Architectural decisions
+├── api-usage/        # API usage patterns
+└── synthesis/        # Cross-domain insights
+```
+
+**Wiki Skills:**
+- `wiki-compile` - Compile learned patterns to persistent wiki
+- `wiki-query` - Query wiki before answering (prevents rediscovery)
+- `wiki-lint` - Health-check for contradictions/staleness/orphans
+
+**Benefits:**
+- Knowledge compounds over time (no re-derivation on every query)
+- Cross-references already exist (no search from scratch)
+- Contradictions flagged for human resolution
+- Staleness detected automatically
 
 ### Cross-Platform Requirements
 
@@ -283,11 +351,13 @@ mypy = "^1.10"
 
 **Tasks**:
 
-- [ ] Set up MCP server with stdio transport (`mcp/server.py`)
-- [ ] Implement filesystem MCP server
-- [ ] Add tool discovery endpoint (`tools/list`)
-- [ ] Add tool call endpoint (`tools/call`)
-- [ ] Set up Prometheus metrics endpoint
+- [x] Set up MCP server with stdio transport (`mcp/server.py`)
+- [x] Implement filesystem MCP server
+- [x] Add tool discovery endpoint (`tools/list`)
+- [x] Add tool call endpoint (`tools/call`)
+- [x] Expose MCP via FastAPI at `/mcp/tools` and `/mcp/tools/{name}`
+- [x] Register additional tools: shell, tests, code analysis
+- [x] Set up resilience API endpoints: `/ready`, `/stats`, `/llm/health`
 
 #### Day 4-5: Basic LangGraph Agent
 
@@ -321,35 +391,94 @@ mypy = "^1.10"
 
 **Tasks**:
 
-- [ ] Implement `memory/session_memory.py` with conversation history
-- [ ] Add task tracking and completion status
-- [ ] Create session lifecycle management
+- [x] Implement `memory/session_memory.py` with conversation history
+- [x] Add task tracking and completion status
+- [x] Create session lifecycle management
+- [x] Add `get_events(offset, limit)` for queryable history
+- [x] Add `get_event_count()` for total event tracking
 - [ ] Write integration tests
 
 #### Day 4-7: ChromaDB Vector Store with Code-Aware Chunking
 
 **Tasks**:
 
-- [ ] Implement `memory/codebase_memory.py` with file indexing
+- [x] Implement `memory/codebase_memory.py` with file indexing
 - [x] Implement code-aware chunking (respect function/class boundaries)
 - [x] Create RAG retrieval functions
 - [x] Write tests for vector search
+- [x] Add auto-indexing of workspace files
+- [x] Integrate RAG context into agent prompts
+- [x] Add indexing/search API endpoints
 
-### Week 4: Memory Wiki Prototype
+### Week 4: Memory Wiki & Tool Executor
 
-- [x] Create basic `memory/memory_wiki.py` with NetworkX graph
-- [ ] Implement file dependency tracking
-- [ ] Add function call relationship tracking
-- [ ] Write unit tests
+**Tasks**:
+
+- [x] Create `memory/memory_wiki.py` with NetworkX graph
+- [x] Implement file dependency tracking
+- [x] Add function call relationship tracking
+- [x] Create ToolExecutor with formal `execute(name, input)` interface
+- [x] Register tools: shell, file_read, file_write, file_list, screenshot, search
 
 #### Day 4-7: RAG-Based Code Retrieval in Agent
 
 **Tasks**:
 
-- [ ] Integrate vector search into agent workflow
-- [ ] Create context-building from retrieved code
-- [ ] Test with multi-file projects
-- [ ] Optimize retrieval for coding tasks
+- [x] Integrate vector search into agent workflow
+- [x] Create context-building from retrieved code
+- [x] Add wiki context loading to orchestrator (auto-query on tasks)
+- [x] Create wiki skills:
+  - `skills/wiki-compile/SKILL.md` - compile patterns to persistent wiki
+  - `skills/wiki-query/SKILL.md` - query wiki before answering
+  - `skills/wiki-lint/SKILL.md` - health-check for issues
+- [x] Test with multi-file projects
+- [x] Optimize retrieval for coding tasks
+- [x] Add skill loading mechanism for wiki and other skills
+
+### Week 4.5: Skill Loading System
+
+**Tasks**:
+
+- [ ] Implement `skills/skill_loader.py` - discover and load skills from `skills/` directory
+- [ ] Implement `SkillManager` class with:
+  - `discover_skills()` - scan for SKILL.md files
+  - `get_skill(name)` - load skill by name
+  - `detect_triggers(task)` - keyword-based skill activation
+  - `execute_skill(name, context)` - run skill logic
+- [ ] Add keyword trigger system from SKILL.md frontmatter
+- [ ] Integrate skill loader into orchestrator
+- [ ] Add pre-execution hooks (run skills BEFORE agent runs)
+- [ ] Add post-execution hooks (run skills AFTER agent completes)
+
+#### Skill Categories
+
+| Trigger Type | Skills |
+|--------------|--------|
+| **Pre-execution** | tdd-enforcer, security-auditor, architect-adr |
+| **Post-execution** | wiki-compile, handover |
+| **On-demand** | codebase-mapper, wiki-lint, workspace-janitor |
+| **Tool-based** | playwright-cli, browser_tool (screenshots) |
+
+#### Skill Execution Flow
+
+```python
+class SkillManager:
+    async def process_task(self, task: str, context: dict) -> dict:
+        # 1. Detect pre-execution triggers
+        pre_skills = self.detect_triggers(task, phase="pre")
+        for skill in pre_skills:
+            await self.execute_skill(skill, context)
+        
+        # 2. Run agent
+        result = await self.agent.run(task, context)
+        
+        # 3. Detect post-execution triggers
+        post_skills = self.detect_triggers(task, phase="post")
+        for skill in post_skills:
+            await self.execute_skill(skill, context)
+        
+        return result
+```
 
 ---
 
@@ -389,11 +518,13 @@ mypy = "^1.10"
 
 **Tasks**:
 
-- [ ] Implement subagent spawning mechanism
-- [ ] Add context isolation between agents
-- [ ] Create result aggregation logic
-- [ ] Share session memory across agent team
+- [x] Implement subagent spawning mechanism in orchestrator
+- [x] Add context isolation between agents (is_subagent flag, isolated context)
+- [x] Create result aggregation logic (parent session updates)
+- [x] Share session memory across agent team
+- [ ] Add subagent lifecycle management (timeout, cleanup)
 - [ ] Coordinate codebase memory updates
+- [ ] Add subagent API endpoints: /subagent/spawn, /subagent/spawn-batch, /subagent, /subagent/{id}
 
 ---
 
@@ -494,6 +625,39 @@ mypy = "^1.10"
 
 **Location**: `skills/test-generation/SKILL.md`
 
+#### Skill 3: Wiki Compile
+
+**Purpose**: Compile learned patterns from agent sessions into a persistent wiki knowledge base.
+
+**Location**: `skills/wiki-compile/SKILL.md`
+
+**Usage**: Auto-invoked after completing significant tasks or when asked to "save" knowledge.
+
+**Output**: Markdown files in `.agent-wiki/` directories.
+
+#### Skill 4: Wiki Query
+
+**Purpose**: Query the persistent wiki knowledge base before answering questions.
+
+**Location**: `skills/wiki-query/SKILL.md`
+
+**Usage**: Runs automatically on every query to prevent knowledge rediscovery.
+
+**Search Strategy**: Index-first → Tag-based → Keyword → Link traversal.
+
+#### Skill 5: Wiki Lint
+
+**Purpose**: Health-check the agent wiki for contradictions, staleness, orphan pages, and missing cross-references.
+
+**Location**: `skills/wiki-lint/SKILL.md`
+
+**Checks**:
+- Cross-reference symmetry (if A→B, B→A should exist)
+- Staleness detection (>30 days without updates)
+- Orphan detection (pages with no inbound links)
+- Contradiction detection (conflicting claims)
+- Missing cross-references (suggested links)
+
 ---
 
 ## 10. Model Configuration
@@ -502,11 +666,12 @@ mypy = "^1.10"
 
 | Task Type | Recommended Model | Reason |
 |-----------|------------------|---------|
-| **Code Generation** | `qwen2.5-coder:32b` | Optimized for coding tasks |
+| **Code Generation** | `qwen3.5-35b-a3b` | Optimized for coding tasks |
 | **Architecture Design** | `glm-4.7-flash` | Large context window (128K) |
 | **Complex Reasoning** | `claude-3.5-sonnet` (cloud) | Best reasoning capability |
 | **Quick Iterations** | `qwen2.5-coder:7b` | Faster, good for prototyping |
-| **Testing/Validation** | `qwen2.5-coder:32b` | Precise code understanding |
+| **Testing/Validation** | `qwen3.5-35b-a3b` | Precise code understanding |
+| **Current Setup** | `qwen3.5-35b-a3b` via Ollama at port 1234 | Local 10-min timeout |
 
 ---
 
@@ -579,12 +744,15 @@ mypy = "^1.10"
 
 | Risk | Likelihood | Impact | Mitigation |
 |------|------------|--------|----------|
-| Context overflow | Medium | High | Subagent spawning, context compression |
+| Context overflow | Medium | High | Subagent spawning, context compression, getEvents() pagination |
 | Hallucinated code | Medium | Medium | Validation tests, human checkpoints |
 | Security breach | Low | Critical | Sandboxing, permission models |
 | Model unavailable | Low | Medium | Fallback model, circuit breaker |
 | API rate limiting | Medium | Medium | Rate limiter, exponential backoff |
 | Cost overruns | Medium | Medium | Cost tracking, usage alerts |
+| Session/Orchestrator crash | Medium | High | Wake from last event via getEvents(), on-demand sandbox provisioning |
+| Wiki errors compound | Medium | Medium | wiki-lint checks, human review for contradictions |
+| Credentials exposure | Low | Critical | Credentials vault (outside sandbox), MCP OAuth proxy |
 
 ### Contingency Plans
 
@@ -660,5 +828,9 @@ mypy = "^1.10"
 ---
 
 *Version 2.1 - Added: cross-platform support (Windows/macOS/Linux), platform detection, shell abstraction, sandbox options (Docker/Windows Sandbox), e2e test matrix*
+
+*Version 2.2 - Added: Anthropic Managed Agents architecture (brain/hand decoupling), LLM Wiki pattern, ToolExecutor interface, getEvents() for queryable session memory, wiki skills (compile/query/lint)*
+
+*Version 2.3 - Added: `/ready`, `/stats`, `/llm/health` endpoints; all LLM resilience modules implemented*
 
 *Status: draft - awaiting review*
