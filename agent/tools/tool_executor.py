@@ -9,6 +9,9 @@ and enabling crash recovery.
 
 Use `await executor.execute(name, input)` from async contexts.
 The method is a coroutine and handles both sync and async tools.
+
+EventEmittingExecutor wraps ToolExecutor to persist tool_call/tool_result
+events to SessionMemory for observability and crash recovery.
 """
 import asyncio
 import inspect
@@ -20,38 +23,46 @@ logger = structlog.get_logger()
 
 class ToolExecutor:
     """Formal tool execution interface.
-    
+
     Usage:
-        executor = ToolExecutor(workspace_path)
-        
+        executor = ToolExecutor(workspace_path, code_analyzer, pytest_tool)
+
         # Execute a tool by name
-        result = executor.execute("shell", {"command": "npm run build"})
-        result = executor.execute("file_read", {"path": "src/main.py"})
-        result = executor.execute("screenshot", {"url": "http://localhost:8080"})
+        result = await executor.execute("shell", {"command": "npm run build"})
+        result = await executor.execute("file_read", {"path": "src/main.py"})
+        result = await executor.execute("analyze", {"path": "src/main.py"})
+        result = await executor.execute("test", {"path": "tests/"})
     """
-    
-    def __init__(self, workspace_path: str):
+
+    def __init__(self, workspace_path: str, code_analyzer=None, pytest_tool=None):
         self.workspace_path = workspace_path
         self.tools: Dict[str, Callable] = {}
         self.logger = logger.bind(component="tool_executor")
-        self._register_builtin_tools()
-    
-    def _register_builtin_tools(self) -> None:
+        self._register_builtin_tools(code_analyzer, pytest_tool)
+
+    def _register_builtin_tools(self, code_analyzer=None, pytest_tool=None) -> None:
         """Register built-in tools."""
         from agent.tools.shell_tool import ShellTool
         from agent.tools.file_system_tool import FileSystemTool
         from agent.tools.browser_tool import BrowserTool
-        
+
         self.shell_tool = ShellTool(self.workspace_path)
         self.fs_tool = FileSystemTool(self.workspace_path)
         self.browser_tool = BrowserTool(self.workspace_path)
-        
+        self.code_analyzer = code_analyzer
+        self.pytest_tool = pytest_tool
+
         self.tools["shell"] = self._run_shell
         self.tools["file_read"] = self._read_file
         self.tools["file_write"] = self._write_file
         self.tools["file_list"] = self._list_files
         self.tools["screenshot"] = self._take_screenshot
         self.tools["search"] = self._search_files
+
+        if code_analyzer is not None:
+            self.tools["analyze"] = self._analyze_code
+        if pytest_tool is not None:
+            self.tools["test"] = self._run_tests
     
     def _run_shell(self, input: Dict[str, Any]) -> str:
         """Execute a shell command."""
@@ -116,7 +127,39 @@ class ToolExecutor:
             return "\n".join(results) if results else "No matches found"
         except Exception as e:
             return f"Error searching: {str(e)}"
-    
+
+    def _analyze_code(self, input: Dict[str, Any]) -> str:
+        """Analyze a source file for structure and dependencies."""
+        if self.code_analyzer is None:
+            return "Error: code_analyzer not available"
+        path = input.get("path", "")
+        try:
+            result = self.code_analyzer.analyze_file(path)
+            if not result.get("success"):
+                return f"Analysis failed: {result.get('error', 'unknown error')}"
+            lines = [
+                f"Functions: {len(result.get('functions', []))}",
+                f"Classes: {len(result.get('classes', []))}",
+                f"Imports: {result.get('imports', [])}",
+                f"Total lines: {result.get('total_lines', 0)}",
+            ]
+            return "\n".join(lines)
+        except Exception as e:
+            return f"Error analyzing {path}: {str(e)}"
+
+    def _run_tests(self, input: Dict[str, Any]) -> str:
+        """Run pytest on a path."""
+        if self.pytest_tool is None:
+            return "Error: pytest_tool not available"
+        path = input.get("path", "")
+        try:
+            result = self.pytest_tool.run(path=path)
+            output = result.get("stdout", "") + result.get("stderr", "")
+            status = "passed" if result.get("success") else f"failed (exit {result.get('returncode')})"
+            return f"Tests {status}:\n{output}"
+        except Exception as e:
+            return f"Error running tests: {str(e)}"
+
     async def execute(self, tool_name: str, input: Dict[str, Any]) -> str:
         """Execute a tool by name with input dict.
 
@@ -158,4 +201,42 @@ class ToolExecutor:
         return list(self.tools.keys())
 
 
-__all__ = ["ToolExecutor"]
+class EventEmittingExecutor:
+    """Thin wrapper around ToolExecutor that emits tool_call/tool_result events.
+
+    Keeps ToolExecutor session-agnostic while adding per-session observability
+    for the Anthropic Managed Agents emitEvent pattern.
+
+    Usage:
+        executor = EventEmittingExecutor(tool_executor, session_memory, session_id)
+        result = await executor.execute("shell", {"command": "pytest"})
+    """
+
+    def __init__(self, executor: "ToolExecutor", session_memory, session_id: str):
+        self.executor = executor
+        self.session_memory = session_memory
+        self.session_id = session_id
+        self.logger = logger.bind(component="event_emitting_executor", session_id=session_id)
+
+    async def execute(self, tool_name: str, input: Dict[str, Any]) -> str:
+        self.session_memory.emit_event(
+            self.session_id,
+            "tool_call",
+            {"tool": tool_name, "input": input},
+        )
+        result = await self.executor.execute(tool_name, input)
+        self.session_memory.emit_event(
+            self.session_id,
+            "tool_result",
+            {"tool": tool_name, "output": str(result)[:1000]},
+        )
+        return result
+
+    def list_tools(self) -> list:
+        return self.executor.list_tools()
+
+    def register_tool(self, name: str, func) -> None:
+        self.executor.register_tool(name, func)
+
+
+__all__ = ["ToolExecutor", "EventEmittingExecutor"]

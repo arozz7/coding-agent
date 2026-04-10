@@ -53,17 +53,16 @@ Focus on:
     
     async def execute(self, context: Dict[str, Any]) -> Dict[str, Any]:
         task = context.get("task", "")
-        
+        tool_executor = context.get("tool_executor")
+
         workspace_context = ""
-        if self.file_system_tool:
+        if tool_executor:
             try:
-                files = self.file_system_tool.list_directory(".")
-                workspace_context = f"\n\nWorkspace contains {len(files)} items:\n"
-                for f in files[:20]:
-                    workspace_context += f"- {f['name']} ({f['type']})\n"
+                listing = await tool_executor.execute("file_list", {"path": ""})
+                workspace_context = f"\n\nWorkspace:\n{listing}"
             except Exception as e:
                 self.logger.warning("workspace_list_failed", error=str(e))
-        
+
         prompt = f"""{self.get_system_prompt()}
 
 Task: {task}
@@ -83,26 +82,26 @@ FILE: docs/adr/ADR-XXX.md
 ...
 ```"""
         model_router = context.get("model_router")
-        
+
         if not model_router:
             return {"success": False, "error": "model_router not available"}
-        
+
         model = model_router.get_model("coding")
         if not model:
             return {"success": False, "error": "No coding model configured"}
-        
+
         response = await model_router.generate(prompt, model)
-        
+
         files_created = []
-        if self.file_system_tool:
+        if tool_executor:
             file_writes = self._extract_file_writes(response)
             for file_path, content in file_writes:
                 try:
-                    self.file_system_tool.write_file(file_path, content)
+                    await tool_executor.execute("file_write", {"path": file_path, "content": content})
                     files_created.append(file_path)
                 except Exception as e:
                     self.logger.error("adr_write_failed", path=file_path, error=str(e))
-        
+
         return {
             "success": True,
             "role": self.name,
@@ -117,14 +116,8 @@ class ArchitectAgent:
         from agent.agents.base_agent import BaseAgent
         role = ArchitectRole(file_system_tool, code_analyzer)
         self.base = BaseAgent(role, model_router, tools)
-        self.file_system_tool = file_system_tool
-        self.code_analyzer = code_analyzer
-    
+
     async def run(self, task: str, context: Dict[str, Any] = None):
         if context is None:
             context = {}
-        if self.file_system_tool and "file_system_tool" not in context:
-            context["file_system_tool"] = self.file_system_tool
-        if self.code_analyzer and "code_analyzer" not in context:
-            context["code_analyzer"] = self.code_analyzer
         return await self.base.run(task, context)

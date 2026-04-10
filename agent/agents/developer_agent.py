@@ -67,10 +67,11 @@ Focus on:
         architecture = context.get("architecture", "")
         files_created = []
         model_router = context.get("model_router")
-        
+        tool_executor = context.get("tool_executor")
+
         if not model_router:
             return {"success": False, "error": "model_router not available"}
-        
+
         prompt = f"""{self.get_system_prompt()}
 
 Task: {task}
@@ -84,55 +85,52 @@ Implement the solution with:
 4. Clear documentation in comments
 
 Write actual files using the format:
-FILE: 
+FILE:
 ```<language>
 # file content here
 ```
 """
-        
+
         model = model_router.get_model("coding")
         if not model:
             return {"success": False, "error": "No coding model configured"}
-        
+
         response = await model_router.generate(prompt, model)
-        
-        if self.file_system_tool:
+
+        if tool_executor:
             file_writes = self._extract_file_writes(response)
             for file_path, content in file_writes:
                 try:
-                    self.file_system_tool.write_file(file_path, content)
+                    await tool_executor.execute("file_write", {"path": file_path, "content": content})
                     files_created.append(file_path)
                     self.logger.info("file_written", path=file_path, size=len(content))
                 except Exception as e:
                     self.logger.error("file_write_failed", path=file_path, error=str(e))
-        
+
         shell_output = None
-        if self.shell_tool:
+        if tool_executor:
             cmd_matches = re.findall(r'`([^`]+)`', response)
             for cmd in cmd_matches:
                 try:
-                    shell_output = self.shell_tool.run(cmd)
-                    self.logger.info("shell_output", cmd=cmd, result=shell_output)
+                    shell_output = await tool_executor.execute("shell", {"command": cmd})
+                    self.logger.info("shell_output", cmd=cmd)
                 except Exception as e:
                     self.logger.error("shell_failed", cmd=cmd, error=str(e))
-        
-        # Append shell output to response for user visibility (last output)
+
         if shell_output:
-            response += f"\n\n**Shell Output:**\n```\n{shell_output.get('stdout', '')}{shell_output.get('stderr', '')}\n```"
-            if not shell_output.get("success"):
-                response += f"\n⚠️ Exit code: {shell_output.get('returncode')}"
-        
+            response += f"\n\n**Shell Output:**\n```\n{shell_output}\n```"
+
         screenshot_path = None
-        if self.browser_tool:
-            if re.search(r'screenshot', task, re.IGNORECASE) or re.search(r'run_and_screenshot|capture', response, re.IGNORECASE):
-                try:
-                    result = await self.browser_tool.run_and_screenshot()
-                    if result.get("success"):
-                        screenshot_path = result.get("path")
-                        response += f"\n\n📸 Screenshot captured: {screenshot_path}"
-                except Exception as e:
-                    self.logger.error("screenshot_failed", error=str(e))
-        
+        if tool_executor and (
+            re.search(r'screenshot', task, re.IGNORECASE)
+            or re.search(r'run_and_screenshot|capture', response, re.IGNORECASE)
+        ):
+            try:
+                screenshot_path = await tool_executor.execute("screenshot", {})
+                response += f"\n\nScreenshot captured: {screenshot_path}"
+            except Exception as e:
+                self.logger.error("screenshot_failed", error=str(e))
+
         return {
             "success": True,
             "role": self.name,
@@ -149,15 +147,8 @@ class DeveloperAgent:
         from agent.agents.base_agent import BaseAgent
         role = DeveloperRole(file_system_tool, shell_tool, browser_tool)
         self.base = BaseAgent(role, model_router, tools)
-        self.file_system_tool = file_system_tool
-        self.shell_tool = shell_tool
-        self.browser_tool = browser_tool
-    
+
     async def run(self, task: str, context: Dict[str, Any] = None):
         if context is None:
             context = {}
-        if self.file_system_tool and "file_system_tool" not in context:
-            context["file_system_tool"] = self.file_system_tool
-        if self.browser_tool and "browser_tool" not in context:
-            context["browser_tool"] = self.browser_tool
         return await self.base.run(task, context)

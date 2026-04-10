@@ -214,6 +214,18 @@ async def delete_session(session_id: str):
     return {"success": True, "session_id": session_id}
 
 
+@app.post("/wake/{session_id}")
+async def wake_session(session_id: str):
+    """Resume an interrupted session (Anthropic Managed Agents wake pattern)."""
+    if not _orchestrator:
+        raise HTTPException(status_code=503, detail="Agent not initialized")
+
+    result = await _orchestrator.wake(session_id)
+    if not result.get("success"):
+        raise HTTPException(status_code=404, detail=result.get("error", "Session not found"))
+    return result
+
+
 @app.get("/models")
 async def list_models():
     if not _orchestrator:

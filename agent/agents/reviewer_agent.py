@@ -37,38 +37,27 @@ Focus on:
         task = context.get("task", "")
         code = context.get("code", "")
         file_path = context.get("file_path", "")
-        
-        analysis_result = None
-        if file_path and self.code_analyzer:
+        tool_executor = context.get("tool_executor")
+
+        analysis_summary = ""
+        if file_path and tool_executor:
             try:
-                analysis_result = self.code_analyzer.analyze_file(file_path)
-                self.logger.info("file_analyzed", path=file_path, success=analysis_result.get("success"))
+                analysis_summary = await tool_executor.execute("analyze", {"path": file_path})
+                self.logger.info("file_analyzed", path=file_path)
             except Exception as e:
                 self.logger.error("analysis_failed", path=file_path, error=str(e))
-        
+
         prompt = f"""{self.get_system_prompt()}
 
 Original Task: {task}
 """
-        
-        if analysis_result and analysis_result.get("success"):
-            prompt += f"""
-File Analysis:
-- Functions: {len(analysis_result.get("functions", []))}
-- Classes: {len(analysis_result.get("classes", []))}
-- Imports: {analysis_result.get("imports", [])}
-- Dependencies: {analysis_result.get("dependencies", [])}
-- Total lines: {analysis_result.get("total_lines", 0)}
-"""
-        
+
+        if analysis_summary:
+            prompt += f"\nFile Analysis:\n{analysis_summary}\n"
+
         if code:
-            prompt += f"""
-Code to Review:
-```
-{code}
-```
-"""
-        
+            prompt += f"\nCode to Review:\n```\n{code}\n```\n"
+
         prompt += """
 Provide a detailed review with:
 1. Issues found (severity: critical/high/medium/low)
@@ -79,27 +68,22 @@ Provide a detailed review with:
 
 Format as a structured review."""
         model_router = context.get("model_router")
-        
+
         if not model_router:
             return {"success": False, "error": "model_router not available"}
-        
+
         model = model_router.get_model("coding")
         if not model:
             return {"success": False, "error": "No coding model configured"}
-        
+
         response = await model_router.generate(prompt, model)
-        
-        issues_count = 0
-        if analysis_result and analysis_result.get("success"):
-            issues_count = len(analysis_result.get("functions", [])) + len(analysis_result.get("classes", []))
-        
+
         return {
             "success": True,
             "role": self.name,
             "response": response,
             "task": task,
-            "analysis": analysis_result,
-            "issues_found": issues_count,
+            "analysis": analysis_summary,
         }
 
 
@@ -108,14 +92,8 @@ class ReviewerAgent:
         from agent.agents.base_agent import BaseAgent
         role = ReviewerRole(code_analyzer, file_system_tool)
         self.base = BaseAgent(role, model_router, tools)
-        self.code_analyzer = code_analyzer
-        self.file_system_tool = file_system_tool
-    
+
     async def run(self, task: str, context: Dict[str, Any] = None):
         if context is None:
             context = {}
-        if self.code_analyzer and "code_analyzer" not in context:
-            context["code_analyzer"] = self.code_analyzer
-        if self.file_system_tool and "file_system_tool" not in context:
-            context["file_system_tool"] = self.file_system_tool
         return await self.base.run(task, context)

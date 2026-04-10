@@ -51,7 +51,8 @@ Focus on:
         task = context.get("task", "")
         code = context.get("code", "")
         language = context.get("language", "python")
-        
+        tool_executor = context.get("tool_executor")
+
         framework_hint = {
             "python": "pytest",
             "javascript": "jest",
@@ -60,7 +61,7 @@ Focus on:
             "go": "testing",
             "rust": "#[test]",
         }.get(language, "pytest")
-        
+
         prompt = f"""{self.get_system_prompt()}
 
 Original Task: {task}
@@ -85,37 +86,36 @@ FILE: tests/test_<module>.py
 
 Run the tests if pytest tool is available."""
         model_router = context.get("model_router")
-        
+
         if not model_router:
             return {"success": False, "error": "model_router not available"}
-        
+
         model = model_router.get_model("coding")
         if not model:
             return {"success": False, "error": "No coding model configured"}
-        
+
         response = await model_router.generate(prompt, model)
-        
+
         files_created = []
         test_output = None
-        
-        if self.file_system_tool:
+
+        if tool_executor:
             file_writes = self._extract_file_writes(response)
             for file_path, content in file_writes:
                 try:
-                    self.file_system_tool.write_file(file_path, content)
+                    await tool_executor.execute("file_write", {"path": file_path, "content": content})
                     files_created.append(file_path)
                     self.logger.info("test_file_written", path=file_path)
                 except Exception as e:
                     self.logger.error("test_file_write_failed", path=file_path, error=str(e))
-        
-        if self.pytest_tool and files_created:
-            try:
-                test_result = self.pytest_tool.run(path=files_created[0])
-                test_output = test_result
-                self.logger.info("tests_run", files=files_created, result=test_result)
-            except Exception as e:
-                self.logger.error("test_run_failed", error=str(e))
-        
+
+            if files_created:
+                try:
+                    test_output = await tool_executor.execute("test", {"path": files_created[0]})
+                    self.logger.info("tests_run", files=files_created)
+                except Exception as e:
+                    self.logger.error("test_run_failed", error=str(e))
+
         return {
             "success": True,
             "role": self.name,
@@ -133,14 +133,8 @@ class TesterAgent:
         from agent.agents.base_agent import BaseAgent
         role = TesterRole(file_system_tool, pytest_tool)
         self.base = BaseAgent(role, model_router, tools)
-        self.file_system_tool = file_system_tool
-        self.pytest_tool = pytest_tool
-    
+
     async def run(self, task: str, context: Dict[str, Any] = None):
         if context is None:
             context = {}
-        if self.file_system_tool and "file_system_tool" not in context:
-            context["file_system_tool"] = self.file_system_tool
-        if self.pytest_tool and "pytest_tool" not in context:
-            context["pytest_tool"] = self.pytest_tool
         return await self.base.run(task, context)

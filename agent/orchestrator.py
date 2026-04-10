@@ -40,10 +40,11 @@ class AgentOrchestrator:
         self.code_analyzer = CodeAnalyzer()
         from agent.tools.shell_tool import ShellTool
         from agent.tools.browser_tool import BrowserTool
-        from agent.tools.tool_executor import ToolExecutor
+        from agent.tools.tool_executor import ToolExecutor, EventEmittingExecutor
+        self._EventEmittingExecutor = EventEmittingExecutor
         self.shell_tool = ShellTool(workspace_path)
         self.browser_tool = BrowserTool(workspace_path)
-        self.tool_executor = ToolExecutor(workspace_path)
+        self.tool_executor = ToolExecutor(workspace_path, self.code_analyzer, self.pytest_tool)
         self.skill_manager = SkillManager("skills")
         
         # Create MCP server for tool exposure
@@ -284,107 +285,64 @@ class AgentOrchestrator:
         
         return "\n".join(context_parts)
     
+    def _create_session_executor(self, session_id: str) -> "EventEmittingExecutor":
+        """Create an EventEmittingExecutor bound to this session."""
+        return self._EventEmittingExecutor(
+            self.tool_executor,
+            self.session_memory,
+            session_id,
+        )
+
     async def _run_specialized_agent(self, task: str, task_type: str, session_id: str) -> dict:
+        session_executor = self._create_session_executor(session_id)
         context = {
             "session_id": session_id,
             "workspace_path": self.workspace_path,
             "model_router": self.model_router,
-            "browser_tool": self.browser_tool,
+            "tool_executor": session_executor,
         }
-        
+
         if task_type == "review":
             return await self.reviewer_agent.run(task, context)
         elif task_type == "test":
             return await self.tester_agent.run(task, context)
         elif task_type == "architect":
             return await self.architect_agent.run(task, context)
-        elif task_type == "develop":
-            return await self.developer_agent.run(task, context)
         else:
-            return await self._run_general_agent(task, session_id)
-    
-    async def _run_general_agent(self, task: str, session_id: str) -> dict:
-        """Fallback general-purpose agent"""
-        history = self.session_memory.get_conversation_history(session_id, max_messages=10)
-        
-        context = "\n\nPrevious conversation:\n"
-        for msg in history[-6:]:
-            role = msg["role"].capitalize()
-            content = msg["content"]
-            context += f"{role}: {content[:500]}\n"
-        
-        # Add skill context based on task triggers
-        pre_skills = self._detect_skills(task, "pre")
-        skill_context = self._get_skill_context(pre_skills)
-        
-        # Add wiki context
-        wiki_context = self._load_wiki_context(task)
-        
-        # Add RAG context from vector store
-        rag_context = self._load_rag_context(task)
-        
-        prompt = f"""You are a helpful coding assistant with execution capabilities. Respond to:
+            # "develop" and "general" both go to developer agent
+            return await self.developer_agent.run(task, context)
 
-{task}{context}{skill_context}{wiki_context}{rag_context}
+    def _build_context_from_events(self, session_id: str) -> str:
+        """Build conversation context from paginated events.
 
-IMPORTANT - You CAN execute:
-- Write files using: FILE: path\n```language\ncode\n```
-- Run commands in backticks: `npm install`, `npm run start`, etc.
+        Fetches the last 20 events and truncates large tool_result payloads
+        to avoid stuffing the full execution trace into the context window.
+        """
+        events = self.session_memory.get_events(session_id, offset=-20, limit=20)
+        if not events:
+            return ""
 
-If asked to run/test/verify, ALWAYS run the commands and report results.
-"""
-        config = self.model_router.get_model("coding")
-        if not config:
-            return {"success": False, "error": "No coding model configured"}
-        
-        response = await self.model_router.generate(prompt, config)
-        
-        if self.fs_tool:
-            import re
-            pattern = r'FILE:\s*(.+?)\n```\w*\n(.*?)```'
-            matches = re.findall(pattern, response, re.DOTALL)
-            self.logger.info("file_extraction", match_count=len(matches), matches=matches)
-            for file_path, content in matches:
-                try:
-                    self.fs_tool.write_file(file_path, content)
-                    self.logger.info("file_written", path=file_path, size=len(content))
-                except Exception as e:
-                    self.logger.error("file_write_failed", path=file_path, error=str(e))
-        
-        # Also run shell commands if present (any command in backticks)
-        shell_output = None
-        if self.shell_tool:
-            cmd_matches = re.findall(r'`([^`]+)`', response)
-            for cmd in cmd_matches:
-                try:
-                    shell_output = self.shell_tool.run(cmd)
-                    self.logger.info("shell_output", cmd=cmd, result=shell_output)
-                    if shell_output:
-                        response += f"\n\n**Shell Output for `{cmd}`:**\n```\n{shell_output.get('stdout', '')}{shell_output.get('stderr', '')}\n```"
-                        if not shell_output.get("success"):
-                            response += f"\n⚠️ Exit code: {shell_output.get('returncode')}"
-                except Exception as e:
-                    self.logger.error("shell_failed", cmd=cmd, error=str(e))
-                    response += f"\n❌ Command failed: {str(e)}"
-        
-        return {"success": True, "response": response}
+        context_lines = ["\n\nRecent conversation:\n"]
+        for ev in events:
+            role = ev["role"]
+            content = ev["content"]
+
+            if role.startswith("event:"):
+                event_type = role[len("event:"):]
+                if event_type == "tool_result":
+                    # Cap large tool outputs so they don't flood the prompt
+                    content = content[:500] + ("…" if len(content) > 500 else "")
+                context_lines.append(f"[{event_type}] {content}")
+            elif role in ("user", "assistant"):
+                context_lines.append(f"{role.capitalize()}: {content[:500]}")
+
+        return "\n".join(context_lines)
 
     def _build_context(self, session_id: str, include_history: bool = True) -> str:
+        """Build context string for streaming endpoint."""
         if not include_history:
             return ""
-        
-        history = self.session_memory.get_conversation_history(session_id, max_messages=10)
-        
-        if not history:
-            return ""
-        
-        context_lines = ["\n\nPrevious conversation:\n"]
-        for msg in history[-6:]:
-            role = msg["role"].capitalize()
-            content = msg["content"]
-            context_lines.append(f"{role}: {content[:500]}")
-        
-        return "\n".join(context_lines)
+        return self._build_context_from_events(session_id)
 
     async def run_task(
         self, task: str, session_id: Optional[str] = None, include_history: bool = True
@@ -404,24 +362,26 @@ If asked to run/test/verify, ALWAYS run the commands and report results.
             }
 
         self.agent_logger.log_task_start("agent", {"task": task})
-
         task_type = self._detect_task_type(task)
         self.logger.info("task_type_detected", task_type=task_type)
-        
+        self.session_memory.emit_event(session_id, "status", {"phase": "start", "task_type": task_type})
+
         try:
             result = await self._run_specialized_agent(task, task_type, session_id)
-            
+
             if result.get("success"):
                 response = result.get("response", "")
                 model_name = config.name
-                
+
                 self.session_memory.save_message(
                     session_id,
                     "assistant",
                     response,
                     model_name=model_name,
                 )
-
+                self.session_memory.emit_event(
+                    session_id, "status", {"phase": "complete", "files": result.get("files_created", [])}
+                )
                 self.agent_logger.log_task_complete(
                     "agent", 0, {"response_length": len(response)}
                 )
@@ -442,6 +402,7 @@ If asked to run/test/verify, ALWAYS run the commands and report results.
         except Exception as ex:
             import traceback
             self.logger.error("task_failed", error=str(ex), traceback=traceback.format_exc())
+            self.session_memory.emit_event(session_id, "status", {"phase": "error", "error": str(ex)})
             self.session_memory.update_task_status(
                 session_id, task, "failed", {"error": str(ex)}
             )
@@ -450,6 +411,39 @@ If asked to run/test/verify, ALWAYS run the commands and report results.
                 "session_id": session_id,
                 "error": str(ex),
             }
+
+    async def wake(self, session_id: str) -> dict:
+        """Resume an interrupted session by replaying its last known state.
+
+        Implements the Anthropic Managed Agents wake(sessionId) pattern.
+        Reads the last events from the session, emits a wake event, and
+        returns summary info so the caller can decide whether to re-run
+        the last task.
+        """
+        summary = self.session_memory.get_session_summary(session_id)
+        if not summary or summary.get("message_count", 0) == 0:
+            return {"success": False, "error": f"Session '{session_id}' not found or empty"}
+
+        # Fetch last events to find the most recent user message
+        events = self.session_memory.get_events(session_id, offset=-10, limit=10)
+        last_user_task = None
+        for ev in reversed(events):
+            if ev["role"] == "user":
+                last_user_task = ev["content"]
+                break
+
+        self.session_memory.emit_event(session_id, "status", {"phase": "wake", "resumed": True})
+        self.session_memory.update_session_status(session_id, "active")
+
+        self.logger.info("session_woken", session_id=session_id, last_task=last_user_task)
+
+        return {
+            "success": True,
+            "session_id": session_id,
+            "message_count": summary["message_count"],
+            "last_user_task": last_user_task,
+            "status": "active",
+        }
 
     def _load_wiki_context(self, task: str) -> str:
         """Load relevant wiki entries for the current task."""

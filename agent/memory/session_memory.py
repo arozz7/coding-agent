@@ -359,6 +359,25 @@ class SessionMemory:
         )
         self.conn.commit()
 
+    def emit_event(self, session_id: str, event_type: str, data: dict) -> None:
+        """Persist a structured execution event for observability and crash recovery.
+
+        Follows the Anthropic Managed Agents emitEvent(id, event) pattern.
+        Events are stored in the messages table with role='event:<type>' so that
+        get_events() returns them in chronological order alongside user/assistant turns.
+
+        Args:
+            session_id:  The active session.
+            event_type:  One of 'tool_call', 'tool_result', 'file_write',
+                         'shell_run', 'status'.
+            data:        Arbitrary dict serialised to JSON as the content.
+        """
+        self.save_message(
+            session_id=session_id,
+            role=f"event:{event_type}",
+            content=json.dumps(data),
+        )
+
     def delete_session(self, session_id: str) -> bool:
         """Delete a session and all its messages and tasks.
 
