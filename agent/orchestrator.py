@@ -12,6 +12,8 @@ from agent.agents.tester_agent import TesterAgent
 from agent.agents.reviewer_agent import ReviewerAgent
 from agent.agents.architect_agent import ArchitectAgent
 from agent.skills.skill_loader import SkillManager
+from agent.skills.wiki_manager import WikiManager
+from agent.skills.skill_executor import SkillExecutor
 from observability.logging import AgentLogger
 
 logger = structlog.get_logger()
@@ -46,7 +48,9 @@ class AgentOrchestrator:
         self.browser_tool = BrowserTool(workspace_path)
         self.tool_executor = ToolExecutor(workspace_path, self.code_analyzer, self.pytest_tool)
         self.skill_manager = SkillManager("skills")
-        
+        self.wiki_manager = WikiManager(workspace_path)
+        self.skill_executor = SkillExecutor(self.wiki_manager, self.skill_manager)
+
         # Create MCP server for tool exposure
         from mcp.server import create_mcp_server
         self.mcp_server = create_mcp_server(workspace_path)
@@ -239,52 +243,69 @@ class AgentOrchestrator:
         
         return "general"
     
-    def _detect_skills(self, task: str, phase: str = "pre") -> List[str]:
-        """Detect which skills should run based on task content."""
-        triggered_skills = []
-        
-        # Pre-execution skill triggers
-        pre_triggers = {
-            "test": ["tdd-enforcer"],
-            "security": ["security-auditor"],
-            "audit": ["security-auditor"],
-            "database": ["architect-adr"],
-            "api": ["architect-adr"],
-            "auth": ["architect-adr"],
-            "architecture": ["architect-adr"],
-            "adr": ["architect-adr"],
-        }
-        
-        post_triggers = {
-            "compile": ["wiki-compile"],
-            "save": ["wiki-compile"],
-            "remember": ["wiki-compile"],
-            "handover": ["handover"],
-            "context bridge": ["handover"],
-        }
-        
+    # Keyword → skill name mapping for pre/post phase detection
+    _PRE_TRIGGERS: dict[str, list[str]] = {
+        "test": ["tdd-enforcer"],
+        "security": ["security-auditor"],
+        "audit": ["security-auditor"],
+        "database": ["architect-decision-engine"],
+        "api": ["architect-decision-engine"],
+        "auth": ["architect-decision-engine"],
+        "architecture": ["architect-decision-engine"],
+        "adr": ["architect-decision-engine"],
+    }
+    _POST_TRIGGERS: dict[str, list[str]] = {
+        "compile": ["wiki-compile"],
+        "save": ["wiki-compile"],
+        "remember": ["wiki-compile"],
+        "wiki": ["wiki-compile"],
+        "handover": ["handover"],
+        "context bridge": ["handover"],
+    }
+
+    def _detect_skill_names(self, task: str, phase: str = "pre") -> List[str]:
+        """Return skill names triggered by task keywords for the given phase."""
         task_lower = task.lower()
-        triggers = pre_triggers if phase == "pre" else post_triggers
-        
-        for keyword, skill_names in triggers.items():
+        triggers = self._PRE_TRIGGERS if phase == "pre" else self._POST_TRIGGERS
+        seen: list[str] = []
+        for keyword, names in triggers.items():
             if keyword in task_lower:
-                for skill_name in skill_names:
-                    if skill_name not in triggered_skills:
-                        triggered_skills.append(skill_name)
-        
-        return triggered_skills
-    
-    def _get_skill_context(self, skill_names: List[str]) -> str:
-        """Get skill content to add to context."""
-        context_parts = []
-        
-        for skill_name in skill_names:
-            skill = self.skill_manager.get_skill(skill_name)
-            if skill:
-                context_parts.append(f"\n\n## Skill: {skill.name}\n{skill.content}")
-        
-        return "\n".join(context_parts)
-    
+                for name in names:
+                    if name not in seen:
+                        seen.append(name)
+        return seen
+
+    async def _build_enriched_context(self, task: str) -> str:
+        """Build prompt enrichment: wiki-query results + RAG chunks + skill instructions.
+
+        Replaces the four dead helper methods (_detect_skills, _get_skill_context,
+        _load_wiki_context, _load_rag_context) that were disconnected when
+        _run_general_agent() was removed.
+        """
+        parts: list[str] = []
+
+        # 1. Wiki query — check persistent knowledge before every task
+        wiki_ctx = await self.skill_executor.execute_pre("wiki-query", task)
+        if wiki_ctx:
+            parts.append(wiki_ctx)
+
+        # 2. RAG — semantic code search from vector store
+        try:
+            project_id = Path(self.workspace_path).name
+            rag_ctx = self.codebase_memory.get_relevant_context(task, project_id, max_chunks=3)
+            if rag_ctx:
+                parts.append(rag_ctx)
+        except Exception as e:
+            self.logger.warning("rag_context_failed", error=str(e))
+
+        # 3. Pre-execution skill instructions (tdd-enforcer, security-auditor, etc.)
+        for skill_name in self._detect_skill_names(task, "pre"):
+            skill_ctx = await self.skill_executor.execute_pre(skill_name, task)
+            if skill_ctx:
+                parts.append(skill_ctx)
+
+        return "\n".join(parts)
+
     def _create_session_executor(self, session_id: str) -> "EventEmittingExecutor":
         """Create an EventEmittingExecutor bound to this session."""
         return self._EventEmittingExecutor(
@@ -295,11 +316,13 @@ class AgentOrchestrator:
 
     async def _run_specialized_agent(self, task: str, task_type: str, session_id: str) -> dict:
         session_executor = self._create_session_executor(session_id)
+        enriched_context = await self._build_enriched_context(task)
         context = {
             "session_id": session_id,
             "workspace_path": self.workspace_path,
             "model_router": self.model_router,
             "tool_executor": session_executor,
+            "enriched_context": enriched_context,  # wiki + RAG + skill instructions
         }
 
         if task_type == "review":
@@ -386,6 +409,18 @@ class AgentOrchestrator:
                     "agent", 0, {"response_length": len(response)}
                 )
 
+                # Post-execution skills (wiki-compile, handover, etc.)
+                post_skill_reports: list[str] = []
+                for skill_name in self._detect_skill_names(task, "post"):
+                    try:
+                        report = await self.skill_executor.execute_post(
+                            skill_name, task, result, self.model_router
+                        )
+                        if report.get("report"):
+                            post_skill_reports.append(report["report"])
+                    except Exception as se:
+                        self.logger.error("post_skill_failed", skill=skill_name, error=str(se))
+
                 return {
                     "success": True,
                     "session_id": session_id,
@@ -394,6 +429,7 @@ class AgentOrchestrator:
                         "task": task,
                         "task_type": task_type,
                         "files_created": result.get("files_created", []),
+                        "skill_reports": post_skill_reports,
                     },
                 }
             else:
@@ -445,59 +481,10 @@ class AgentOrchestrator:
             "status": "active",
         }
 
-    def _load_wiki_context(self, task: str) -> str:
-        """Load relevant wiki entries for the current task."""
-        wiki_path = Path(self.workspace_path) / ".agent-wiki" / "index.md"
-        if not wiki_path.exists():
-            return ""
-        
-        try:
-            with open(wiki_path, "r", encoding="utf-8") as f:
-                index_content = f.read()
-            
-            task_lower = task.lower()
-            relevant_entries = []
-            
-            for line in index_content.split("\n"):
-                if any(keyword in line.lower() for keyword in task_lower.split()[:3]):
-                    relevant_entries.append(line)
-            
-            if relevant_entries:
-                context = "\n**From Agent Wiki:**\n"
-                for entry in relevant_entries[:5]:
-                    context += f"- {entry}\n"
-                return context
-        except Exception as e:
-            self.logger.warn("wiki_load_failed", error=str(e))
-        
-        return ""
-    
-    def _load_rag_context(self, task: str, max_chunks: int = 3) -> str:
-        """Load relevant code context from vector store using RAG."""
-        try:
-            # Get project ID from workspace name
-            project_id = Path(self.workspace_path).name
-            
-            # Use CodebaseMemory to get relevant context
-            context = self.codebase_memory.get_relevant_context(
-                task=task,
-                project_id=project_id,
-                max_chunks=max_chunks,
-            )
-            
-            if context:
-                self.logger.info("rag_context_loaded", task=task[:50], chunks=max_chunks)
-            
-            return context
-        except Exception as e:
-            self.logger.warn("rag_context_failed", error=str(e))
-            return ""
-    
     def index_workspace(self, project_id: str = None) -> dict:
         """Index all files in the workspace for RAG."""
         if project_id is None:
             project_id = Path(self.workspace_path).name
-        
         return self.codebase_memory.index_workspace(self.workspace_path, project_id)
 
     async def run_stream(

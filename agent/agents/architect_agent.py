@@ -63,10 +63,11 @@ Focus on:
             except Exception as e:
                 self.logger.warning("workspace_list_failed", error=str(e))
 
+        enriched_context = context.get("enriched_context", "")
         prompt = f"""{self.get_system_prompt()}
 
 Task: {task}
-{workspace_context}
+{workspace_context}{enriched_context}
 
 Provide a detailed architectural design with:
 1. High-level components and their responsibilities

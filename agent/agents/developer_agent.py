@@ -72,11 +72,12 @@ Focus on:
         if not model_router:
             return {"success": False, "error": "model_router not available"}
 
+        enriched_context = context.get("enriched_context", "")
         prompt = f"""{self.get_system_prompt()}
 
 Task: {task}
 
-{architecture if architecture else ''}
+{architecture if architecture else ''}{enriched_context}
 
 Implement the solution with:
 1. Complete, working code

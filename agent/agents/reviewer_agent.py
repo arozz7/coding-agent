@@ -47,10 +47,11 @@ Focus on:
             except Exception as e:
                 self.logger.error("analysis_failed", path=file_path, error=str(e))
 
+        enriched_context = context.get("enriched_context", "")
         prompt = f"""{self.get_system_prompt()}
 
 Original Task: {task}
-"""
+{enriched_context}"""
 
         if analysis_summary:
             prompt += f"\nFile Analysis:\n{analysis_summary}\n"

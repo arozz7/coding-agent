@@ -62,9 +62,11 @@ Focus on:
             "rust": "#[test]",
         }.get(language, "pytest")
 
+        enriched_context = context.get("enriched_context", "")
         prompt = f"""{self.get_system_prompt()}
 
 Original Task: {task}
+{enriched_context}
 
 Code to Test:
 ```
