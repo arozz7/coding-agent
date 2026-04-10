@@ -19,3 +19,6 @@ build/
 # Claude skills cache
 .claude/skills/*/scripts/__pycache__/
 .claude/skills/*/__pycache__/
+
+# Claude worktrees (embedded repos)
+.claude/worktrees/
