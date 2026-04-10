@@ -2,6 +2,7 @@ __pycache__/
 *.pyc
 *.pyo
 .pytest_cache/
+.pytype/
 data/
 *.db
 *.db-journal
@@ -14,3 +15,7 @@ build/
 .mypy_cache/
 .ruff_cache/
 .DS_Store
+
+# Claude skills cache
+.claude/skills/*/scripts/__pycache__/
+.claude/skills/*/__pycache__/
