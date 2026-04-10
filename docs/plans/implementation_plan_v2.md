@@ -32,17 +32,54 @@ This document provides a comprehensive implementation plan for building a **loca
 
 | Component | Recommendation |
 |-----------|---------------|
-| **Language** | Python 3.11+ |
-| **LLM Runtime (Local)** | Ollama |
+| **Language** | Python 3.11+ (cross-platform) |
+| **LLM Runtime (Local)** | Ollama (Windows/macOS/Linux) |
 | **Primary Model** | `qwen2.5-coder:32b` (~20GB VRAM) |
 | **Fallback Model** | `glm-4.7-flash` (~25GB VRAM) or cloud API |
 | **Agent Framework** | LangGraph (complex workflows) / CrewAI (simple teams) |
 | **MCP SDK** | Python `mcp` package + custom servers |
-| **Session Memory** | SQLite |
-| **Vector Memory** | ChromaDB |
+| **Session Memory** | SQLite (cross-platform) |
+| **Vector Memory** | ChromaDB (cross-platform) |
 | **Graph Memory** | NetworkX + Custom MemoryWiki |
-| **Sandboxing** | Docker containers / Firecracker microVMs |
+| **Sandboxing** | Docker containers / Firecracker microVMs / Windows Sandbox |
 | **Observability** | Prometheus metrics + structured logging |
+| **Cross-Platform** | `pathlib`, `os.path`, platform-specific detection |
+
+### Cross-Platform Requirements
+
+The agent must function identically on Windows, macOS, and Linux with the following considerations:
+
+| Feature | Windows | macOS | Linux |
+|---------|---------|-------|-------|
+| **Shell** | PowerShell / CMD | bash/zsh | bash |
+| **Paths** | `C:\Users\...` | `/Users/...` | `/home/...` |
+| **Default Shell** | PowerShell | bash | bash |
+| **Ollama** | `ollama serve` | `ollama serve` | `ollama serve` |
+| **Git** | Git for Windows | System git | System git |
+| **Docker** | Docker Desktop | Docker Desktop | Docker Engine |
+| **Virtual Env** | `python -m venv` | `python3 -m venv` | `python3 -m venv` |
+
+#### Path Handling Best Practices
+
+- Always use `pathlib.Path` for path operations
+- Use `os.path.join()` for constructing paths
+- Use `/` in strings (works on all platforms in Python)
+- Detect platform via `sys.platform` or `platform.system()`
+- Store paths as strings in config (relative paths preferred)
+
+#### Shell Detection Logic
+
+```python
+import platform
+import shutil
+
+def get_shell():
+    system = platform.system()
+    if system == "Windows":
+        # Prefer PowerShell if available
+        return shutil.which("pwsh") or "powershell"
+    return shutil.which("bash") or "sh"
+```
 
 ---
 
@@ -67,13 +104,15 @@ This document provides a comprehensive implementation plan for building a **loca
 
 ## 1. Project Structure & Architecture
 
-### Directory Layout
+### Cross-Platform Project Layout
 
 ```
 local-coding-agent/
 ├── agent/                          # Core agent orchestration
 │   ├── __init__.py
 │   ├── orchestrator.py             # Main agent coordinator (LangGraph/CrewAI)
+│   ├── platform.py                 # Platform detection & utilities
+│   ├── shell.py                    # Cross-platform shell execution
 │   ├── memory/                     # Memory layer
 │   │   ├── __init__.py
 │   │   ├── session_memory.py       # SQLite session storage
@@ -93,11 +132,17 @@ local-coding-agent/
 │   └── tools/                      # MCP tool wrappers
 │       ├── __init__.py
 │       ├── base_tool.py            # Abstract tool base class
-│       ├── file_system_tool.py      # File operations
+│       ├── file_system_tool.py      # File operations (cross-platform)
 │       ├── git_tool.py              # Git operations
 │       ├── code_analysis_tool.py    # AST parsing, dependencies
 │       ├── test_tool.py             # Test execution
-│       └── terminal_tool.py         # Sandbox command execution
+│       ├── terminal_tool.py         # Sandbox command execution
+│       └── sandbox/                 # Platform-specific sandbox
+│           ├── __init__.py
+│           ├── base.py              # Base sandbox interface
+│           ├── docker_sandbox.py    # Docker-based (Linux/macOS)
+│           ├── windows_sandbox.py   # Windows Sandbox
+│           └── native_sandbox.py    # Process isolation (all)
 ├── mcp/                            # MCP servers
 │   ├── __init__.py
 │   ├── server.py                    # Main MCP server
@@ -124,7 +169,8 @@ local-coding-agent/
 │   ├── __init__.py
 │   ├── sandbox_manager.py           # Container lifecycle management
 │   ├── docker_executor.py           # Docker-based execution
-│   └── firecracker_executor.py      # MicroVM execution (advanced)
+│   ├── firecracker_executor.py      # MicroVM execution (advanced)
+│   └── windows_executor.py          # Windows Sandbox execution
 ├── observability/                   # Observability layer
 │   ├── __init__.py
 │   ├── metrics.py                   # Prometheus metrics
@@ -140,6 +186,9 @@ local-coding-agent/
 │   ├── unit/
 │   ├── integration/
 │   └── e2e/
+│       ├── test_windows.py          # Windows-specific tests
+│       ├── test_macos.py            # macOS-specific tests
+│       └── test_linux.py            # Linux-specific tests
 ├── skills/                          # User-facing skills (Claude Code style)
 │   ├── code-review/
 │   │   └── SKILL.md
@@ -147,18 +196,16 @@ local-coding-agent/
 │   │   └── SKILL.md
 │   └── deployment/
 │       └── SKILL.md
-├── logs/                            # Runtime logs
-├── data/                            # Persistent data
-│   ├── memory.db                    # SQLite session database
-│   ├── chroma_db/                   # Vector store
-│   └── backups/                     # Backup storage
 ├── scripts/                         # Utility scripts
 │   ├── init_project.py              # Project scaffolding
 │   ├── benchmark_models.py          # Model performance testing
-│   └── backup.py                    # Backup and recovery scripts
+│   ├── backup.py                    # Backup and recovery scripts
+│   ├── install_ollama.py            # Platform-specific Ollama setup
+│   └── platform_check.py           # Verify platform requirements
 ├── pyproject.toml                   # Python dependencies
 ├── README.md                        # Project documentation
-└── .env.example                     # Environment template
+├── .env.example                     # Environment template
+└── .gitignore                      # Git ignore (platform-specific)
 ```
 
 ---
@@ -580,11 +627,41 @@ mypy = "^1.10"
 ### Phase 5 Completion (Week 10)
 - [ ] Sandbox prevents unauthorized access
 - [ ] Security audit passed
-- [ ] Full test suite green
+- [ ] Full test suite green (all platforms)
 - [ ] Backup/recovery tested
+- [ ] Cross-platform compatibility verified
 
 ---
 
-*Version 2.0 - Added: streaming, cost tracking, rate limiting, retry logic, health checks, Prometheus metrics, code-aware chunking, circuit breaker, backup/recovery, cost guard*
+## Cross-Platform Testing Strategy
+
+### Test Matrix
+
+| Platform | Python | Ollama | Git | Docker | Tests |
+|----------|--------|--------|-----|--------|-------|
+| **Windows 10/11** | 3.11+ | ✓ | ✓ | Docker Desktop | `test_windows.py` |
+| **macOS 12+** | 3.11+ | ✓ | ✓ | Docker Desktop | `test_macos.py` |
+| **Linux (Ubuntu 20.04+)** | 3.11+ | ✓ | ✓ | Docker Engine | `test_linux.py` |
+
+### Required Tests
+
+1. **Path Handling** - Verify `pathlib` works correctly across platforms
+2. **Shell Execution** - Test PowerShell (Windows) vs bash (macOS/Linux)
+3. **Git Operations** - Verify git commands work identically
+4. **File Permissions** - Test read/write/execute on each platform
+5. **Ollama Connectivity** - Verify localhost:11434 works
+6. **SQLite** - Test database operations
+7. **ChromaDB** - Verify vector store works
+8. **CLI Entry Point** - Test `python -m local_coding_agent` works
+
+### Platform-Specific Considerations
+
+- **Windows**: Handle `\` vs `/` paths, PowerShell execution policy, long paths
+- **macOS**: Handle `.DS_Store`, Apple Silicon vs Intel, Homebrew paths
+- **Linux**: Handle different distros, systemd, SELinux/AppArmor
+
+---
+
+*Version 2.1 - Added: cross-platform support (Windows/macOS/Linux), platform detection, shell abstraction, sandbox options (Docker/Windows Sandbox), e2e test matrix*
 
 *Status: draft - awaiting review*
