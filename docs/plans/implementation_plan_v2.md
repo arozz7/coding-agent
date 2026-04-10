@@ -362,9 +362,10 @@ mypy = "^1.10"
 **Tasks**:
 
 - [ ] Create `agents/base_agent.py` abstract class
-- [ ] Implement `agents/architect_agent.py` for architecture design
-- [ ] Implement `agents/developer_agent.py` for code implementation
-- [ ] Implement `agents/reviewer_agent.py` for code review
+- [x] Implement `agents/architect_agent.py` for architecture design
+- [x] Implement `agents/developer_agent.py` for code implementation
+- [x] Implement `agents/reviewer_agent.py` for code review
+- [x] Implement `agents/tester_agent.py` for test generation
 
 #### Day 3-4: CrewAI Team Setup
 
