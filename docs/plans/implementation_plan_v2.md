@@ -331,17 +331,13 @@ mypy = "^1.10"
 **Tasks**:
 
 - [ ] Implement `memory/codebase_memory.py` with file indexing
-- [ ] Implement code-aware chunking (respect function/class boundaries)
-- [ ] Create RAG retrieval functions
-- [ ] Write tests for vector search
+- [x] Implement code-aware chunking (respect function/class boundaries)
+- [x] Create RAG retrieval functions
+- [x] Write tests for vector search
 
-### Week 4: Memory Integration & RAG Patterns
+### Week 4: Memory Wiki Prototype
 
-#### Day 1-3: Memory Wiki Prototype
-
-**Tasks**:
-
-- [ ] Create basic `memory/memory_wiki.py` with NetworkX graph
+- [x] Create basic `memory/memory_wiki.py` with NetworkX graph
 - [ ] Implement file dependency tracking
 - [ ] Add function call relationship tracking
 - [ ] Write unit tests
