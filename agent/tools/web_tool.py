@@ -7,6 +7,7 @@ All text is truncated before returning to avoid flooding the context window.
 """
 
 import asyncio
+import os
 import re
 import time
 from pathlib import Path
@@ -44,7 +45,51 @@ class WebTool:
             return await self._fetch_httpx(url)
 
     async def search(self, query: str, max_results: int = 5) -> List[Dict[str, str]]:
-        """Search the web via DuckDuckGo. Returns list of {title, url, snippet}."""
+        """Search the web. Uses Google Custom Search if credentials are configured,
+        otherwise falls back to DuckDuckGo (no API key required)."""
+        google_key = os.environ.get("GOOGLE_SEARCH_API_KEY", "")
+        google_cx = os.environ.get("GOOGLE_SEARCH_CX", "")
+        if google_key and google_cx:
+            results = await self._search_google(query, max_results, google_key, google_cx)
+            if results and "error" not in results[0]:
+                return results
+            self.logger.warning("google_search_failed_fallback_duckduckgo")
+
+        return await self._search_duckduckgo(query, max_results)
+
+    async def _search_google(
+        self,
+        query: str,
+        max_results: int,
+        api_key: str,
+        cx: str,
+    ) -> List[Dict[str, str]]:
+        """Call the Google Custom Search JSON API."""
+        n = min(max_results, 10)  # Google API max is 10 per request
+        params = {"key": api_key, "cx": cx, "q": query, "num": n}
+        try:
+            async with httpx.AsyncClient(timeout=15.0) as client:
+                r = await client.get(
+                    "https://www.googleapis.com/customsearch/v1", params=params
+                )
+                r.raise_for_status()
+                data = r.json()
+            return [
+                {
+                    "title": item.get("title", ""),
+                    "url": item.get("link", ""),
+                    "snippet": (item.get("snippet") or "")[:400],
+                }
+                for item in data.get("items", [])
+            ]
+        except Exception as e:
+            self.logger.error("google_search_failed", query=query, error=str(e))
+            return [{"error": str(e)}]
+
+    async def _search_duckduckgo(
+        self, query: str, max_results: int
+    ) -> List[Dict[str, str]]:
+        """Fall back to DuckDuckGo (no API key required)."""
         try:
             from duckduckgo_search import DDGS  # type: ignore
         except ImportError:
@@ -64,7 +109,7 @@ class WebTool:
                 for r in raw
             ]
         except Exception as e:
-            self.logger.error("search_failed", query=query, error=str(e))
+            self.logger.error("duckduckgo_search_failed", query=query, error=str(e))
             return [{"error": str(e)}]
 
     async def screenshot_url(
