@@ -11,6 +11,7 @@ import structlog
 
 from llm import ModelRouter
 from agent.orchestrator import AgentOrchestrator
+from api.job_store import JobStore
 
 logger = structlog.get_logger()
 
@@ -110,8 +111,8 @@ _model_router: Optional[ModelRouter] = None
 _orchestrator: Optional[AgentOrchestrator] = None
 _current_workspace: str = WORKSPACE_PATH
 
-# In-memory job store for background tasks (keyed by job_id)
-_jobs: Dict[str, dict] = {}
+# SQLite-backed job store (write-through, in-memory hot cache)
+_job_store: JobStore = JobStore("data/jobs.db")
 
 
 def _summarize_response(text: str, max_chars: int = 500) -> str:
@@ -127,9 +128,12 @@ def _summarize_response(text: str, max_chars: int = 500) -> str:
 async def startup_event():
     global _model_router, _orchestrator, _current_workspace
     from local_coding_agent import create_agent
-    
+
     logger.info("starting_api", component="api", workspace=WORKSPACE_PATH)
-    
+
+    # Restore persisted jobs; mark stale running jobs as failed
+    _job_store.load()
+
     try:
         _orchestrator = create_agent(WORKSPACE_PATH, "config/models.yaml")
         logger.info("agent_initialized")
@@ -188,8 +192,9 @@ async def start_task_background(request: TaskRequest):
     job_id = f"job_{uuid.uuid4().hex[:12]}"
     session_id = request.session_id or f"session_{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}"
 
-    # Detect task type early so the Discord bot can show a meaningful phase label
-    task_type = _orchestrator._detect_task_type(request.task)
+    # Detect task type early so the Discord bot can show a meaningful phase label.
+    # _detect_task_type is now async (tries LLM first, keyword fallback on failure).
+    task_type = await _orchestrator._detect_task_type(request.task)
     _phase_label = {
         "develop": "developing",
         "review": "reviewing",
@@ -199,21 +204,16 @@ async def start_task_background(request: TaskRequest):
         "chat": "thinking",
     }.get(task_type, "working")
 
-    _jobs[job_id] = {
-        "job_id": job_id,
-        "status": "pending",
-        "phase": _phase_label,
-        "task_type": task_type,
-        "summary": None,
-        "files_created": [],
-        "error": None,
-        "session_id": session_id,
-        "task": request.task,
-        "_full_response": None,
-    }
+    _job_store.create(
+        job_id=job_id,
+        session_id=session_id,
+        task=request.task,
+        task_type=task_type,
+        phase=_phase_label,
+    )
 
     async def _run():
-        _jobs[job_id]["status"] = "running"
+        _job_store.update(job_id, status="running")
         try:
             result = await _orchestrator.run_task(
                 task=request.task,
@@ -223,35 +223,43 @@ async def start_task_background(request: TaskRequest):
             if result.get("success"):
                 inner = result.get("result", {})
                 full_response = inner.get("response", "")
-                _jobs[job_id].update({
-                    "status": "done",
-                    "phase": "complete",
-                    "task_type": inner.get("task_type", task_type),
-                    "files_created": inner.get("files_created", []),
-                    "summary": _summarize_response(full_response),
-                    "_full_response": full_response,
-                })
+                _job_store.update(
+                    job_id,
+                    status="done",
+                    phase="complete",
+                    task_type=inner.get("task_type", task_type),
+                    files_created=inner.get("files_created", []),
+                    summary=_summarize_response(full_response),
+                    _full_response=full_response,
+                )
             else:
-                _jobs[job_id].update({
-                    "status": "failed",
-                    "error": result.get("error", "Unknown error"),
-                })
+                _job_store.update(
+                    job_id,
+                    status="failed",
+                    error=result.get("error", "Unknown error"),
+                )
         except Exception as e:
             import traceback
             logger.error("background_job_failed", job_id=job_id, error=str(e),
                          traceback=traceback.format_exc())
-            _jobs[job_id].update({"status": "failed", "error": str(e)})
+            _job_store.update(job_id, status="failed", error=str(e))
 
     asyncio.create_task(_run())
     return {"job_id": job_id, "session_id": session_id, "task_type": task_type}
 
 
+@app.get("/jobs")
+async def list_jobs(limit: int = 50, offset: int = 0):
+    """List all jobs ordered by creation time descending (no full_response)."""
+    return {"jobs": _job_store.list_jobs(limit=limit, offset=offset)}
+
+
 @app.get("/task/{job_id}")
 async def get_job_status(job_id: str):
     """Poll a background job for its current status and summary."""
-    if job_id not in _jobs:
+    job = _job_store.get(job_id)
+    if job is None:
         raise HTTPException(status_code=404, detail=f"Job '{job_id}' not found")
-    job = _jobs[job_id]
     # Never expose the full response here — use /task/{job_id}/result for that
     return {k: v for k, v in job.items() if k != "_full_response"}
 
@@ -259,9 +267,9 @@ async def get_job_status(job_id: str):
 @app.get("/task/{job_id}/result")
 async def get_job_result(job_id: str):
     """Retrieve the full agent response for a completed job."""
-    if job_id not in _jobs:
+    job = _job_store.get(job_id)
+    if job is None:
         raise HTTPException(status_code=404, detail=f"Job '{job_id}' not found")
-    job = _jobs[job_id]
     if job["status"] != "done":
         return {"status": job["status"], "result": None}
     return {"status": "done", "result": job.get("_full_response", "")}
@@ -270,12 +278,12 @@ async def get_job_result(job_id: str):
 @app.delete("/task/{job_id}")
 async def cancel_job(job_id: str):
     """Request cancellation of a pending or running job."""
-    if job_id not in _jobs:
+    job = _job_store.get(job_id)
+    if job is None:
         raise HTTPException(status_code=404, detail=f"Job '{job_id}' not found")
-    job = _jobs[job_id]
     if job["status"] in ("pending", "running"):
-        job["status"] = "cancelled"
-        job["phase"] = "cancelled"
+        _job_store.update(job_id, status="cancelled", phase="cancelled")
+        job = _job_store.get(job_id)
     return {"cancelled": True, "job_id": job_id, "status": job["status"]}
 
 

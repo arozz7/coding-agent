@@ -251,8 +251,8 @@ class AgentOrchestrator:
             for sa in self.subagents.values()
         ]
     
-    def _detect_task_type(self, task: str) -> str:
-        """Return the most appropriate agent role for this task.
+    def _detect_task_type_keyword(self, task: str) -> str:
+        """Keyword-based task classifier — used as fallback when LLM is unavailable.
 
         Priority (highest first):
           1. Explicit coding — output is new/modified source files
@@ -320,6 +320,63 @@ class AgentOrchestrator:
 
         # 6. Default: chat (general questions, explanations, conversation)
         return "chat"
+
+    async def _detect_task_type_llm(self, task: str) -> str:
+        """LLM-based task classifier. Returns one of the 6 valid task types.
+
+        Sends a tiny zero-shot prompt to the active model with a short timeout.
+        Raises on timeout or unexpected output so the caller can fall back.
+        """
+        import asyncio
+        import re as _re
+        import yaml as _yaml
+
+        # Load classifier config (prompt + valid_types).
+        # _PROJECT_ROOT is the directory containing this package (the repo root).
+        from local_coding_agent import _PROJECT_ROOT
+        cfg_path = _PROJECT_ROOT / "config" / "task_classifier.yaml"
+        if not cfg_path.exists():
+            raise FileNotFoundError(f"task_classifier.yaml not found at {cfg_path}")
+
+        with open(cfg_path) as fh:
+            cfg = _yaml.safe_load(fh)
+
+        valid_types: List[str] = cfg["valid_types"]
+        timeout_s: float = float(cfg.get("timeout_seconds", 3))
+        prompt_template: str = cfg["prompt"]
+        prompt = prompt_template.format(task=task)
+
+        config = self.model_router.get_model("coding")
+        if not config:
+            raise RuntimeError("No model configured")
+
+        raw = await asyncio.wait_for(
+            self.model_router.generate(prompt, config),
+            timeout=timeout_s,
+        )
+
+        # Extract first word on first non-empty line
+        first_line = next((ln.strip() for ln in raw.splitlines() if ln.strip()), "")
+        candidate = _re.sub(r"[^a-z]", "", first_line.lower().split()[0]) if first_line else ""
+
+        if candidate not in valid_types:
+            raise ValueError(f"LLM returned unexpected type: {candidate!r}")
+
+        return candidate
+
+    async def _detect_task_type(self, task: str) -> str:
+        """Return the most appropriate agent role for this task.
+
+        Tries the LLM classifier first; falls back to keyword matching on
+        any failure (timeout, model unavailable, unexpected output).
+        """
+        try:
+            result = await self._detect_task_type_llm(task)
+            self.logger.info("task_type_llm", task_type=result)
+            return result
+        except Exception as e:
+            self.logger.warning("task_type_llm_fallback", reason=str(e))
+            return self._detect_task_type_keyword(task)
     
     # Keyword → skill name mapping for pre/post phase detection
     _PRE_TRIGGERS: dict[str, list[str]] = {
@@ -467,7 +524,7 @@ class AgentOrchestrator:
             }
 
         self.agent_logger.log_task_start("agent", {"task": task})
-        task_type = self._detect_task_type(task)
+        task_type = await self._detect_task_type(task)
         self.logger.info("task_type_detected", task_type=task_type)
         self.session_memory.emit_event(session_id, "status", {"phase": "start", "task_type": task_type})
 
