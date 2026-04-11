@@ -65,12 +65,24 @@ class ToolExecutor:
             self.tools["test"] = self._run_tests
     
     def _run_shell(self, input: Dict[str, Any]) -> str:
-        """Execute a shell command."""
+        """Execute a shell command and return stdout + stderr with exit code on failure."""
         command = input.get("command", "")
         result = self.shell_tool.run(command)
+        stdout = (result.get("stdout") or "").strip()
+        stderr = (result.get("stderr") or "").strip()
+        rc = result.get("returncode")
+
         if result.get("success"):
-            return result.get("stdout", "") + result.get("stderr", "")
-        return f"Error: {result.get('stderr', 'Command failed')}"
+            return stdout or "(command completed, no output)"
+
+        parts = []
+        if stdout:
+            parts.append(f"stdout:\n{stdout}")
+        if stderr:
+            parts.append(f"stderr:\n{stderr}")
+        body = "\n".join(parts) if parts else result.get("error", "unknown error")
+        rc_str = f" (exit {rc})" if rc is not None else ""
+        return f"Command failed{rc_str}:\n{body}"
     
     def _read_file(self, input: Dict[str, Any]) -> str:
         """Read a file."""

@@ -1,8 +1,11 @@
 from fastapi import FastAPI, HTTPException, BackgroundTasks, Response
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-from typing import Optional, List
+from typing import Optional, List, Dict
 from prometheus_client import generate_latest, CONTENT_TYPE_LATEST
+import uuid
+import re
+from datetime import datetime
 import asyncio
 import structlog
 
@@ -107,6 +110,18 @@ _model_router: Optional[ModelRouter] = None
 _orchestrator: Optional[AgentOrchestrator] = None
 _current_workspace: str = WORKSPACE_PATH
 
+# In-memory job store for background tasks (keyed by job_id)
+_jobs: Dict[str, dict] = {}
+
+
+def _summarize_response(text: str, max_chars: int = 500) -> str:
+    """Strip fenced code blocks and return a short prose summary."""
+    prose = re.sub(r'```[\s\S]*?```', '', text).strip()
+    prose = re.sub(r'\n{3,}', '\n\n', prose)
+    if len(prose) > max_chars:
+        return prose[:max_chars].rstrip() + "…"
+    return prose or "(task completed)"
+
 
 @app.on_event("startup")
 async def startup_event():
@@ -161,6 +176,136 @@ async def run_task(request: TaskRequest):
     except Exception as e:
         import traceback
         logger.error("task_failed", error=str(e), traceback=traceback.format_exc())
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/task/start")
+async def start_task_background(request: TaskRequest):
+    """Submit a task and return a job_id immediately. Poll GET /task/{job_id} for status."""
+    if not _orchestrator:
+        raise HTTPException(status_code=503, detail="Agent not initialized")
+
+    job_id = f"job_{uuid.uuid4().hex[:12]}"
+    session_id = request.session_id or f"session_{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}"
+
+    # Detect task type early so the Discord bot can show a meaningful phase label
+    task_type = _orchestrator._detect_task_type(request.task)
+    _phase_label = {
+        "develop": "developing",
+        "review": "reviewing",
+        "test": "testing",
+        "architect": "designing",
+        "research": "researching",
+        "chat": "thinking",
+    }.get(task_type, "working")
+
+    _jobs[job_id] = {
+        "job_id": job_id,
+        "status": "pending",
+        "phase": _phase_label,
+        "task_type": task_type,
+        "summary": None,
+        "files_created": [],
+        "error": None,
+        "session_id": session_id,
+        "task": request.task,
+        "_full_response": None,
+    }
+
+    async def _run():
+        _jobs[job_id]["status"] = "running"
+        try:
+            result = await _orchestrator.run_task(
+                task=request.task,
+                session_id=session_id,
+                include_history=request.include_history,
+            )
+            if result.get("success"):
+                inner = result.get("result", {})
+                full_response = inner.get("response", "")
+                _jobs[job_id].update({
+                    "status": "done",
+                    "phase": "complete",
+                    "task_type": inner.get("task_type", task_type),
+                    "files_created": inner.get("files_created", []),
+                    "summary": _summarize_response(full_response),
+                    "_full_response": full_response,
+                })
+            else:
+                _jobs[job_id].update({
+                    "status": "failed",
+                    "error": result.get("error", "Unknown error"),
+                })
+        except Exception as e:
+            import traceback
+            logger.error("background_job_failed", job_id=job_id, error=str(e),
+                         traceback=traceback.format_exc())
+            _jobs[job_id].update({"status": "failed", "error": str(e)})
+
+    asyncio.create_task(_run())
+    return {"job_id": job_id, "session_id": session_id, "task_type": task_type}
+
+
+@app.get("/task/{job_id}")
+async def get_job_status(job_id: str):
+    """Poll a background job for its current status and summary."""
+    if job_id not in _jobs:
+        raise HTTPException(status_code=404, detail=f"Job '{job_id}' not found")
+    job = _jobs[job_id]
+    # Never expose the full response here — use /task/{job_id}/result for that
+    return {k: v for k, v in job.items() if k != "_full_response"}
+
+
+@app.get("/task/{job_id}/result")
+async def get_job_result(job_id: str):
+    """Retrieve the full agent response for a completed job."""
+    if job_id not in _jobs:
+        raise HTTPException(status_code=404, detail=f"Job '{job_id}' not found")
+    job = _jobs[job_id]
+    if job["status"] != "done":
+        return {"status": job["status"], "result": None}
+    return {"status": "done", "result": job.get("_full_response", "")}
+
+
+@app.delete("/task/{job_id}")
+async def cancel_job(job_id: str):
+    """Request cancellation of a pending or running job."""
+    if job_id not in _jobs:
+        raise HTTPException(status_code=404, detail=f"Job '{job_id}' not found")
+    job = _jobs[job_id]
+    if job["status"] in ("pending", "running"):
+        job["status"] = "cancelled"
+        job["phase"] = "cancelled"
+    return {"cancelled": True, "job_id": job_id, "status": job["status"]}
+
+
+@app.get("/workspace/file")
+async def read_workspace_file(path: str):
+    """Read a file from the workspace by relative path."""
+    workspace = Path(_current_workspace).resolve()
+    try:
+        target = (workspace / path).resolve()
+        # Security: prevent path traversal
+        target.relative_to(workspace)
+    except ValueError:
+        raise HTTPException(status_code=403, detail="Path is outside workspace")
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+    if not target.exists():
+        raise HTTPException(status_code=404, detail=f"File not found: {path}")
+    if not target.is_file():
+        raise HTTPException(status_code=400, detail=f"Not a file: {path}")
+
+    try:
+        content = target.read_text(encoding="utf-8", errors="replace")
+        return {
+            "path": path,
+            "content": content,
+            "lines": len(content.splitlines()),
+            "size": len(content),
+        }
+    except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
 

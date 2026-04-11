@@ -1,497 +1,530 @@
-import os
-import requests
+"""Discord bot for the local coding agent.
+
+UX model
+--------
+- `!ask <task>` submits a task to the background job API and immediately
+  returns. A background coroutine edits the status message every few seconds
+  with phase updates. When the job finishes the message is replaced with a
+  short summary — no code is ever dumped into the channel.
+- Code output lives server-side. Use `!show <path>` to upload a file,
+  `!result` to view the prose response, `!files` to list created files.
+"""
+
 import asyncio
-from discord import Client, Intents, Message, File
+import io
+import os
+import re
+import time
+from typing import Optional
+
+import discord
+import httpx
+import requests as _requests
+from discord import Intents, Message, File
 from discord.ext import commands
 
 API_URL = os.getenv("AGENT_API_URL", "http://localhost:5005")
-REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "900"))
+POLL_INTERVAL = int(os.getenv("BOT_POLL_INTERVAL", "5"))  # seconds
 
-# Create a persistent session for connection reuse
-_session = requests.Session()
-_adapter = requests.adapters.HTTPAdapter(
-    pool_connections=10,
-    pool_maxsize=10,
-    max_retries=3
-)
-_session.mount("http://", _adapter)
-_session.mount("https://", _adapter)
 
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+def strip_code_blocks(text: str) -> str:
+    """Replace fenced code blocks with a one-liner so prose stays readable."""
+    def _replace(m: re.Match) -> str:
+        lang = m.group(1).strip() or "code"
+        n = len(m.group(2).strip().splitlines())
+        return f"[{lang} — {n} lines · use !show to view]"
+
+    return re.sub(r'```(\w*)\n([\s\S]*?)```', _replace, text)
+
+
+def _chunk(text: str, limit: int = 1900) -> list[str]:
+    """Split text into Discord-safe chunks, breaking on newlines where possible."""
+    chunks: list[str] = []
+    while text:
+        if len(text) <= limit:
+            chunks.append(text)
+            break
+        # Try to break at a newline
+        split = text.rfind("\n", 0, limit)
+        if split == -1:
+            split = limit
+        chunks.append(text[:split])
+        text = text[split:].lstrip("\n")
+    return chunks
+
+
+def _truncate(text: str, limit: int = 2000) -> str:
+    return text if len(text) <= limit else text[: limit - 1] + "…"
+
+
+# ---------------------------------------------------------------------------
+# Async API client
+# ---------------------------------------------------------------------------
 
 class AgentClient:
+    """Thin async wrapper around the agent REST API."""
+
     def __init__(self, api_url: str = API_URL):
         self.api_url = api_url
-        print(f"AgentClient initialized with API URL: {api_url}, timeout: {REQUEST_TIMEOUT}s")
-    
-    def send_task(self, task: str, session_id: str = None) -> dict:
-        payload = {"task": task}
+
+    async def _get(self, path: str, **params) -> dict:
+        async with httpx.AsyncClient(timeout=20.0) as c:
+            r = await c.get(f"{self.api_url}{path}", params=params or None)
+            r.raise_for_status()
+            return r.json()
+
+    async def _post(self, path: str, body: dict, timeout: float = 30.0) -> dict:
+        async with httpx.AsyncClient(timeout=timeout) as c:
+            r = await c.post(f"{self.api_url}{path}", json=body)
+            r.raise_for_status()
+            return r.json()
+
+    async def _delete(self, path: str) -> dict:
+        async with httpx.AsyncClient(timeout=15.0) as c:
+            r = await c.delete(f"{self.api_url}{path}")
+            r.raise_for_status()
+            return r.json()
+
+    async def start_task(self, task: str, session_id: Optional[str] = None) -> dict:
+        payload: dict = {"task": task}
         if session_id:
             payload["session_id"] = session_id
-        
-        print(f"Sending request to {self.api_url}/task...")
-        
-        try:
-            response = _session.post(
-                f"{self.api_url}/task", 
-                json=payload, 
-                timeout=REQUEST_TIMEOUT
-            )
-            response.raise_for_status()
-            result = response.json()
-            print(f"Got response: success={result.get('success')}")
-            return result
-        except requests.exceptions.Timeout:
-            print(f"TIMEOUT: Request timed out after {REQUEST_TIMEOUT}s")
-            return {"success": False, "error": f"Request timed out ({REQUEST_TIMEOUT}s) - local model may be slow. Try restarting the API."}
-        except requests.exceptions.ConnectionError as e:
-            print(f"CONNECTION ERROR: {e}")
-            return {"success": False, "error": f"Connection failed. Is the API server running?"}
-        except requests.exceptions.RequestException as e:
-            print(f"REQUEST ERROR: {e}")
-            return {"success": False, "error": str(e)}
-    
-    def get_session_history(self, session_id: str) -> dict:
-        try:
-            response = _session.get(f"{self.api_url}/sessions/{session_id}", timeout=30)
-            response.raise_for_status()
-            return response.json()
-        except Exception as e:
-            return {"error": str(e)}
-    
-    def list_sessions(self) -> dict:
-        try:
-            response = _session.get(f"{self.api_url}/sessions", timeout=30)
-            response.raise_for_status()
-            return response.json()
-        except Exception as e:
-            return {"error": str(e)}
-    
-    def delete_session(self, session_id: str) -> dict:
-        try:
-            response = _session.delete(f"{self.api_url}/sessions/{session_id}", timeout=30)
-            response.raise_for_status()
-            return response.json()
-        except Exception as e:
-            return {"error": str(e)}
+        return await self._post("/task/start", payload)
 
+    async def get_job(self, job_id: str) -> dict:
+        return await self._get(f"/task/{job_id}")
+
+    async def get_job_result(self, job_id: str) -> dict:
+        return await self._get(f"/task/{job_id}/result")
+
+    async def cancel_job(self, job_id: str) -> dict:
+        return await self._delete(f"/task/{job_id}")
+
+    async def get_file(self, path: str) -> dict:
+        return await self._get("/workspace/file", path=path)
+
+    async def get_session_history(self, session_id: str) -> dict:
+        return await self._get(f"/sessions/{session_id}")
+
+    async def list_sessions(self) -> dict:
+        return await self._get("/sessions")
+
+    async def delete_session(self, session_id: str) -> dict:
+        return await self._delete(f"/sessions/{session_id}")
+
+    # Sync health probe used at startup
+    def is_reachable(self) -> bool:
+        try:
+            _requests.get(f"{self.api_url}/health", timeout=5).raise_for_status()
+            return True
+        except Exception:
+            return False
+
+
+# ---------------------------------------------------------------------------
+# Bot
+# ---------------------------------------------------------------------------
 
 class DiscordAgentBot(commands.Bot):
     def __init__(self):
         intents = Intents.default()
         intents.message_content = True
         super().__init__(command_prefix="!", intents=intents)
-        self.agent_client = AgentClient()
-        self.user_sessions = {}
-    
+        self.client = AgentClient()
+        # Per-user state
+        self.user_sessions: dict[str, str] = {}   # user_id → session_id
+        self.user_jobs: dict[str, str] = {}        # user_id → current job_id
+
     async def on_ready(self):
-        print(f"Logged in as {self.user}")
-        print(f"API URL: {API_URL}")
-    
+        print(f"[bot] Logged in as {self.user}  |  API: {API_URL}")
+
     async def on_message(self, message: Message):
         if message.author == self.user:
             return
-        
         if not message.content.startswith("!"):
             return
-        
         await self.process_commands(message)
 
 
 bot = DiscordAgentBot()
 
 
-@bot.command(name="ask")
-async def ask(ctx, *, question: str):
-    """Ask the agent a question"""
-    await ctx.send("🤔 Thinking...")
-    
-    session_id = str(ctx.author.id)
-    
-    try:
-        result = bot.agent_client.send_task(question, session_id)
-        
-        if result.get("success"):
-            response = result.get("response", "No response")
-            
-            if not response:
-                await ctx.send("⚠️ Empty response received")
-                return
-            
-            # Split by newlines to avoid Discord formatting issues, then send in chunks
-            lines = response.split('\n')
-            current_chunk = []
-            current_length = 0
-            
-            for line in lines:
-                line_length = len(line) + 1  # +1 for newline
-                if current_length + line_length > 1800 and current_chunk:
-                    await ctx.send('\n'.join(current_chunk))
-                    current_chunk = []
-                    current_length = 0
-                current_chunk.append(line)
-                current_length += line_length
-            
-            # Send remaining
-            if current_chunk:
-                await ctx.send('\n'.join(current_chunk))
+# ---------------------------------------------------------------------------
+# Background job poller
+# ---------------------------------------------------------------------------
+
+_PHASE_LABELS: dict[str, str] = {
+    "queued":      "Queued",
+    "pending":     "Queued",
+    "developing":  "Writing code",
+    "reviewing":   "Reviewing",
+    "testing":     "Running tests",
+    "designing":   "Designing architecture",
+    "researching": "Researching codebase",
+    "thinking":    "Thinking",
+    "working":     "Working",
+    "complete":    "Finishing up",
+}
+
+
+async def _poll_job(ctx: commands.Context, status_msg: discord.Message, job_id: str):
+    """Edit *status_msg* until the job finishes, then post a summary."""
+    start = time.monotonic()
+
+    while True:
+        await asyncio.sleep(POLL_INTERVAL)
+        elapsed = int(time.monotonic() - start)
+
+        try:
+            job = await bot.client.get_job(job_id)
+        except Exception as exc:
+            await status_msg.edit(content=f"Lost contact with agent: {exc}")
+            return
+
+        job_status = job.get("status", "unknown")
+        phase = job.get("phase", "")
+        label = _PHASE_LABELS.get(phase, phase or "Working")
+
+        if job_status == "done":
+            summary = job.get("summary") or "(task complete)"
+            files = job.get("files_created", [])
+            task_type = job.get("task_type", "")
+
+            lines = [f"**Done** [{task_type}] · {elapsed}s\n", summary]
+            if files:
+                file_lines = "\n".join(f"  `{f}`" for f in files[:10])
+                lines.append(f"\n**Files created/modified:**\n{file_lines}")
+            lines.append(
+                "\n`!result` — prose response  ·  `!files` — file list  ·  `!show <path>` — view a file"
+            )
+            await status_msg.edit(content=_truncate("\n".join(lines)))
+            return
+
+        elif job_status == "failed":
+            error = (job.get("error") or "unknown error")[:400]
+            await status_msg.edit(content=f"**Task failed** after {elapsed}s:\n```\n{error}\n```")
+            return
+
+        elif job_status == "cancelled":
+            await status_msg.edit(content=f"Task cancelled after {elapsed}s.")
+            return
+
         else:
-            error = result.get("error", "Unknown error")
-            await ctx.send(f"❌ Error: {error}")
-            
-    except Exception as e:
-        await ctx.send(f"❌ Exception: {str(e)}")
+            await status_msg.edit(content=f"{label}… ({elapsed}s elapsed)")
+
+
+# ---------------------------------------------------------------------------
+# Commands
+# ---------------------------------------------------------------------------
+
+@bot.command(name="ask")
+async def ask(ctx: commands.Context, *, task: str):
+    """Submit a task. The agent works in the background — this message updates live."""
+    user_id = str(ctx.author.id)
+    session_id = bot.user_sessions.get(user_id, user_id)
+
+    status_msg = await ctx.send("Submitting…")
+
+    try:
+        resp = await bot.client.start_task(task, session_id)
+    except Exception as exc:
+        await status_msg.edit(content=f"Could not reach agent: {exc}")
+        return
+
+    job_id = resp.get("job_id")
+    if not job_id:
+        await status_msg.edit(content=f"No job ID returned: {resp}")
+        return
+
+    bot.user_sessions[user_id] = resp.get("session_id", session_id)
+    bot.user_jobs[user_id] = job_id
+
+    task_type = resp.get("task_type", "")
+    await status_msg.edit(content=f"Got it [{task_type}] — working on it…")
+    asyncio.create_task(_poll_job(ctx, status_msg, job_id))
+
+
+@bot.command(name="status")
+async def status(ctx: commands.Context):
+    """Show the status of your current background job."""
+    user_id = str(ctx.author.id)
+    job_id = bot.user_jobs.get(user_id)
+    if not job_id:
+        await ctx.send("No active job. Use `!ask <task>` to start one.")
+        return
+    try:
+        job = await bot.client.get_job(job_id)
+    except Exception as exc:
+        await ctx.send(f"Could not fetch status: {exc}")
+        return
+
+    s = job.get("status", "?")
+    phase = job.get("phase", "")
+    task_preview = (job.get("task") or "")[:80]
+    await ctx.send(
+        f"**Job:** `{job_id}`\n**Status:** {s} [{phase}]\n**Task:** {task_preview}…"
+    )
+
+
+@bot.command(name="cancel")
+async def cancel(ctx: commands.Context):
+    """Cancel your current running job."""
+    user_id = str(ctx.author.id)
+    job_id = bot.user_jobs.get(user_id)
+    if not job_id:
+        await ctx.send("No active job to cancel.")
+        return
+    try:
+        await bot.client.cancel_job(job_id)
+        await ctx.send(f"Cancellation requested for `{job_id}`.")
+    except Exception as exc:
+        await ctx.send(f"Could not cancel: {exc}")
+
+
+@bot.command(name="result")
+async def result(ctx: commands.Context):
+    """Show the agent's prose response from the last job (code blocks stripped)."""
+    user_id = str(ctx.author.id)
+    job_id = bot.user_jobs.get(user_id)
+    if not job_id:
+        await ctx.send("No recent job. Use `!ask <task>` first.")
+        return
+    try:
+        data = await bot.client.get_job_result(job_id)
+    except Exception as exc:
+        await ctx.send(f"Could not fetch result: {exc}")
+        return
+
+    if data.get("status") != "done":
+        await ctx.send(f"Job not done yet (status: {data.get('status')}). Try again shortly.")
+        return
+
+    full = data.get("result") or "(empty response)"
+    clean = strip_code_blocks(full).strip()
+
+    if not clean:
+        await ctx.send(
+            "The response was all code. Use `!files` to see what was created, "
+            "then `!show <path>` to view a file."
+        )
+        return
+
+    for chunk in _chunk(clean):
+        await ctx.send(chunk)
+
+
+@bot.command(name="files")
+async def files(ctx: commands.Context):
+    """List files created or modified by the last task."""
+    user_id = str(ctx.author.id)
+    job_id = bot.user_jobs.get(user_id)
+    if not job_id:
+        await ctx.send("No recent job. Use `!ask <task>` first.")
+        return
+    try:
+        job = await bot.client.get_job(job_id)
+    except Exception as exc:
+        await ctx.send(f"Could not fetch job: {exc}")
+        return
+
+    created = job.get("files_created", [])
+    if not created:
+        await ctx.send("No files were created or modified in the last task.")
+        return
+
+    lines = ["**Files from last task:**"] + [f"  `{f}`" for f in created]
+    lines.append("\nUse `!show <path>` to view any of these.")
+    await ctx.send("\n".join(lines))
+
+
+@bot.command(name="show")
+async def show(ctx: commands.Context, *, path: str):
+    """View a workspace file. Small files inline, large files as attachment."""
+    try:
+        data = await bot.client.get_file(path.strip())
+    except httpx.HTTPStatusError as exc:
+        if exc.response.status_code == 404:
+            await ctx.send(f"File not found: `{path}`")
+        else:
+            await ctx.send(f"Error {exc.response.status_code}: {exc.response.text[:200]}")
+        return
+    except Exception as exc:
+        await ctx.send(f"Could not read file: {exc}")
+        return
+
+    if "error" in data:
+        await ctx.send(f"Error: {data['error']}")
+        return
+
+    content = data.get("content", "")
+    if not content:
+        await ctx.send(f"`{path}` is empty.")
+        return
+
+    lines_count = data.get("lines", len(content.splitlines()))
+    ext = path.rsplit(".", 1)[-1] if "." in path else ""
+    filename = path.replace("\\", "/").split("/")[-1]
+
+    if len(content) <= 1800:
+        await ctx.send(f"**`{path}`** ({lines_count} lines)\n```{ext}\n{content}\n```")
+    else:
+        await ctx.send(
+            f"**`{path}`** ({lines_count} lines):",
+            file=File(io.BytesIO(content.encode("utf-8")), filename=filename),
+        )
 
 
 @bot.command(name="history")
-async def history(ctx):
-    """Show conversation history for this user"""
-    session_id = str(ctx.author.id)
-    result = bot.agent_client.get_session_history(session_id)
-    
-    if "error" in result:
-        await ctx.send(f"❌ Error: {result['error']}")
+async def history(ctx: commands.Context):
+    """Show the last 5 messages in your session (code stripped)."""
+    user_id = str(ctx.author.id)
+    session_id = bot.user_sessions.get(user_id, user_id)
+    try:
+        data = await bot.client.get_session_history(session_id)
+    except Exception as exc:
+        await ctx.send(f"Error: {exc}")
         return
-    
-    history = result.get("history", [])
-    
-    if not history:
-        await ctx.send("No conversation history found.")
+
+    messages = data.get("history", [])
+    if not messages:
+        await ctx.send("No conversation history yet.")
         return
-    
-    await ctx.send(f"📋 Found {len(history)} messages:")
-    
-    for msg in history[-5:]:
-        role = msg.get("role", "unknown")
-        content = msg.get("content", "")[:100]
-        await ctx.send(f"**{role}**: {content}...")
+
+    lines = [f"**{len(messages)} messages in session:**"]
+    for msg in messages[-5:]:
+        role = msg.get("role", "?")
+        preview = strip_code_blocks(msg.get("content", ""))[:120].replace("\n", " ")
+        lines.append(f"**{role}:** {preview}…")
+    await ctx.send("\n".join(lines))
 
 
 @bot.command(name="sessions")
-async def list_sessions(ctx):
-    """List all sessions"""
-    result = bot.agent_client.list_sessions()
-    
-    if "error" in result:
-        await ctx.send(f"❌ Error: {result['error']}")
+async def list_sessions(ctx: commands.Context):
+    """List all sessions."""
+    try:
+        data = await bot.client.list_sessions()
+    except Exception as exc:
+        await ctx.send(f"Error: {exc}")
         return
-    
-    sessions = result.get("sessions", [])
-    
+
+    sessions = data.get("sessions", [])
     if not sessions:
         await ctx.send("No sessions found.")
         return
-    
-    await ctx.send(f"📋 Found {len(sessions)} sessions:")
-    for s in sessions[:5]:
-        sid = s.get("session_id", "unknown")
+
+    lines = [f"**{len(sessions)} sessions:**"]
+    for s in sessions[:8]:
+        sid = s.get("session_id", "?")
         count = s.get("message_count", 0)
-        await ctx.send(f"  - {sid}: {count} messages")
-
-
-@bot.command(name="helpme")
-async def help_command(ctx):
-    """Show available commands"""
-    help_text = """
-🤖 **Agent Commands**
-
-**Core:**
-- `!ask <question>` - Ask the coding agent anything
-
-**Code:**
-- `!explain <code>` - Explain what code does
-- `!test <code>` - Generate tests for code
-- `!refactor <code>` - Refactor/improve code
-- `!review` - Review last shared code
-
-**Git:**
-- `!git <command>` - Run git (status, log, diff, branch)
-
-**Docs & Info:**
-- `!docs <topic>` - Get documentation on a topic
-- `!session` - Show current session info
-
-**Workspace:**
-- `!workspace` - Show current workspace & contents
-- `!cd <path>` - Change workspace directory
-
-**Screenshots:**
-- `!screenshot [url]` - Take screenshot of localhost:8080 or custom URL
-
-**History:**
-- `!history` - Show conversation history
-- `!clear` - Clear your conversation
-- `!sessions` - List all sessions
-- `!helpme` - Show this help
-"""
-    await ctx.send(help_text)
-
-
-@bot.command(name="explain")
-async def explain_code(ctx, *, code: str):
-    """Explain what code does"""
-    await ctx.send("🤔 Analyzing code...")
-    
-    session_id = str(ctx.author.id)
-    task = f"Explain this code in simple terms:\n```{code}```"
-    
-    result = bot.agent_client.send_task(task, session_id)
-    
-    if result.get("success"):
-        response = result.get("response", "No response")
-        await ctx.send(response[:2000] if len(response) > 2000 else response)
-    else:
-        await ctx.send(f"❌ Error: {result.get('error', 'Unknown')}")
-
-
-@bot.command(name="test")
-async def generate_tests(ctx, *, code: str):
-    """Generate tests for code"""
-    await ctx.send("🧪 Generating tests...")
-    
-    session_id = str(ctx.author.id)
-    task = f"Generate unit tests (pytest) for this code:\n```{code}```\n\nWrite only the test code, no explanations."
-    
-    result = bot.agent_client.send_task(task, session_id)
-    
-    if result.get("success"):
-        response = result.get("response", "No response")
-        await ctx.send(f"```python\n{response[:1800]}\n```")
-    else:
-        await ctx.send(f"❌ Error: {result.get('error', 'Unknown')}")
-
-
-@bot.command(name="refactor")
-async def refactor_code(ctx, *, code: str):
-    """Refactor/improve code"""
-    await ctx.send("🔧 Refactoring code...")
-    
-    session_id = str(ctx.author.id)
-    task = f"Refactor and improve this code. Keep it in the same language:\n```{code}```\n\nReturn only the improved code with brief explanation."
-    
-    result = bot.agent_client.send_task(task, session_id)
-    
-    if result.get("success"):
-        response = result.get("response", "No response")
-        await ctx.send(response[:2000])
-    else:
-        await ctx.send(f"❌ Error: {result.get('error', 'Unknown')}")
-
-
-@bot.command(name="review")
-async def review_code(ctx):
-    """Review last shared code"""
-    await ctx.send("🔍 Looking for recent code...")
-    
-    session_id = str(ctx.author.id)
-    history = bot.agent_client.get_session_history(session_id)
-    
-    code_msg = None
-    if "history" in history:
-        for msg in reversed(history["history"][-5:]):
-            content = msg.get("content", "")
-            if "```" in content:
-                code_msg = content
-                break
-    
-    if not code_msg:
-        await ctx.send("No code found in recent conversation. Use `!explain <code>` or `!test <code>` first.")
-        return
-    
-    session_id = str(ctx.author.id)
-    task = f"Review this code for issues, improvements, and best practices:\n{code_msg}"
-    
-    result = bot.agent_client.send_task(task, session_id)
-    
-    if result.get("success"):
-        response = result.get("response", "No response")
-        await ctx.send(response[:2000])
-    else:
-        await ctx.send(f"❌ Error: {result.get('error', 'Unknown')}")
-
-
-@bot.command(name="git")
-async def git_command(ctx, *, args: str):
-    """Run git commands"""
-    import subprocess
-    
-    valid_cmds = ["status", "log", "diff", "branch", "log --oneline -5", "status --porcelain"]
-    
-    if args.strip() not in valid_cmds and not any(args.strip().startswith(v.split()[0]) for v in valid_cmds):
-        await ctx.send(f"❌ Only these commands allowed: {', '.join(valid_cmds)}")
-        return
-    
-    try:
-        result = subprocess.run(f"git {args}", capture_output=True, text=True, shell=True)
-        output = result.stdout or result.stderr
-        
-        if not output:
-            output = "No output"
-            
-        await ctx.send(f"```\n{output[:1800]}\n```")
-    except Exception as e:
-        await ctx.send(f"❌ Error: {str(e)}")
-
-
-@bot.command(name="docs")
-async def get_docs(ctx, *, topic: str):
-    """Get documentation on a topic"""
-    await ctx.send("📚 Fetching docs...")
-    
-    session_id = str(ctx.author.id)
-    task = f"Give me a concise summary and key points about: {topic}\n\nInclude code examples if relevant."
-    
-    result = bot.agent_client.send_task(task, session_id)
-    
-    if result.get("success"):
-        response = result.get("response", "No response")
-        await ctx.send(response[:2000])
-    else:
-        await ctx.send(f"❌ Error: {result.get('error', 'Unknown')}")
-
-
-@bot.command(name="session")
-async def show_session(ctx):
-    """Show current session info"""
-    session_id = str(ctx.author.id)
-    history = bot.agent_client.get_session_history(session_id)
-    
-    if "error" in history:
-        await ctx.send(f"❌ Error: {history['error']}")
-        return
-    
-    msg_count = len(history.get("history", []))
-    
-    await ctx.send(f"📋 **Session Info**\n- Session ID: `{session_id}`\n- Messages: {msg_count}")
-
-
-@bot.command(name="load")
-async def load_session(ctx, *, session_id: str):
-    """Load a specific session by ID"""
-    history = bot.agent_client.get_session_history(session_id)
-    
-    if "error" in history:
-        await ctx.send(f"❌ Error: {history['error']}")
-        return
-    
-    messages = history.get("history", [])
-    
-    if not messages:
-        await ctx.send(f"⚠️ No messages found in session: {session_id}")
-        return
-    
-    await ctx.send(f"✅ Loaded session: `{session_id}` ({len(messages)} messages)")
-    
-    # Show last few messages
-    for msg in messages[-3:]:
-        role = msg.get("role", "unknown")
-        content = msg.get("content", "")[:150]
-        await ctx.send(f"**{role}**: {content}...")
+        lines.append(f"  `{sid}` — {count} messages")
+    await ctx.send("\n".join(lines))
 
 
 @bot.command(name="clear")
-async def clear_history(ctx):
-    """Clear conversation history"""
-    session_id = str(ctx.author.id)
-    
+async def clear(ctx: commands.Context):
+    """Clear your conversation history."""
+    user_id = str(ctx.author.id)
+    session_id = bot.user_sessions.get(user_id, user_id)
     try:
-        result = bot.agent_client.delete_session(session_id)
-        
-        if result.get("success") or "error" not in result:
-            await ctx.send("✅ Conversation history cleared!")
-        else:
-            await ctx.send(f"❌ Error: {result.get('error', 'Unknown')}")
-    except Exception as e:
-        await ctx.send(f"❌ Error: {str(e)}")
+        await bot.client.delete_session(session_id)
+        bot.user_jobs.pop(user_id, None)
+        await ctx.send("Conversation cleared.")
+    except Exception as exc:
+        await ctx.send(f"Could not clear session: {exc}")
+
+
+@bot.command(name="session")
+async def session_info(ctx: commands.Context):
+    """Show your current session ID and last job ID."""
+    user_id = str(ctx.author.id)
+    session_id = bot.user_sessions.get(user_id, user_id)
+    job_id = bot.user_jobs.get(user_id, "none")
+    await ctx.send(f"**Session:** `{session_id}`\n**Last job:** `{job_id}`")
 
 
 @bot.command(name="workspace")
-async def show_workspace(ctx):
-    """Show current workspace"""
+async def workspace(ctx: commands.Context):
+    """Show the current workspace path and its top-level contents."""
     try:
-        response = _session.get(f"{bot.agent_client.api_url}/workspace", timeout=10)
-        data = response.json()
-        
-        await ctx.send(f"📁 **Current Workspace:**\n{data.get('workspace', 'Unknown')}")
-        
-        # Also show contents
-        dirs_response = _session.get(f"{bot.agent_client.api_url}/workspace/directories", timeout=10)
-        dirs_data = dirs_response.json()
-        
-        if "items" in dirs_data:
-            items = dirs_data["items"]
-            if items:
-                msg = "**Contents:**\n"
-                for item in items[:10]:
-                    emoji = "📁" if item["type"] == "directory" else "📄"
-                    msg += f"{emoji} {item['name']}\n"
-                await ctx.send(msg)
-    except Exception as e:
-        await ctx.send(f"❌ Error: {str(e)}")
+        r1 = _requests.get(f"{API_URL}/workspace", timeout=10)
+        data = r1.json()
+        await ctx.send(f"**Workspace:** `{data.get('workspace', 'unknown')}`")
+
+        r2 = _requests.get(f"{API_URL}/workspace/directories", timeout=10)
+        items = r2.json().get("items", [])
+        if items:
+            lines = ["**Contents:**"]
+            for item in items[:12]:
+                icon = "📁" if item["type"] == "directory" else "📄"
+                lines.append(f"{icon} `{item['name']}`")
+            await ctx.send("\n".join(lines))
+    except Exception as exc:
+        await ctx.send(f"Error: {exc}")
 
 
-@bot.command(name="cd")
-async def change_workspace(ctx, *, path: str):
-    """Change workspace directory"""
+@bot.command(name="git")
+async def git_cmd(ctx: commands.Context, *, args: str):
+    """Run a safe read-only git command: status, log, diff, branch."""
+    import subprocess
+
+    allowed = {"status", "log", "diff", "branch"}
+    first = args.strip().split()[0].lower()
+    if first not in allowed:
+        await ctx.send(f"Only allowed: `{', '.join(sorted(allowed))}`")
+        return
     try:
-        response = _session.post(
-            f"{bot.agent_client.api_url}/workspace",
-            json={"path": path},
-            timeout=120
+        out = subprocess.run(
+            f"git {args}", capture_output=True, text=True, shell=True, timeout=15
         )
-        data = response.json()
-        
-        if response.status_code == 200:
-            await ctx.send(f"✅ Workspace changed to: {data.get('workspace')}")
-        else:
-            await ctx.send(f"❌ Error: {data.get('detail', 'Unknown error')}")
-    except Exception as e:
-        await ctx.send(f"❌ Error: {str(e)}")
+        text = (out.stdout or out.stderr or "No output")[:1800]
+        await ctx.send(f"```\n{text}\n```")
+    except Exception as exc:
+        await ctx.send(f"Error: {exc}")
 
 
-@bot.command(name="screenshot")
-async def take_screenshot(ctx, url: str = "http://localhost:8080"):
-    """Take a screenshot of a URL and upload to Discord"""
-    await ctx.send("📸 Taking screenshot...")
-    
-    try:
-        response = _session.post(
-            f"{bot.agent_client.api_url}/screenshot",
-            json={"url": url},
-            timeout=60
-        )
-        
-        if response.status_code == 200:
-            result = response.json()
-            if result.get("success"):
-                path = result.get("path")
-                await ctx.send(f"✅ Screenshot saved to: {path}")
-                # Try to upload the file to Discord
-                try:
-                    import os
-                    if os.path.exists(path):
-                        await ctx.send(file=discord.File(path))
-                    else:
-                        await ctx.send(f"⚠️ File not found at: {path}")
-                except Exception as e:
-                    await ctx.send(f"⚠️ Could not upload file: {str(e)}")
-            else:
-                await ctx.send(f"❌ Screenshot failed: {result.get('error', 'Unknown')}")
-        else:
-            await ctx.send(f"❌ Error: {response.text}")
-    except Exception as e:
-        await ctx.send(f"❌ Error: {str(e)}")
+@bot.command(name="helpme")
+async def helpme(ctx: commands.Context):
+    """Show available commands."""
+    help_text = (
+        "**Agent Commands**\n\n"
+        "**Core workflow:**\n"
+        "`!ask <task>` — Submit a task. Agent works in background; this message updates live.\n"
+        "`!status` — Check your current job's status and phase\n"
+        "`!cancel` — Cancel your running job\n\n"
+        "**Viewing results:**\n"
+        "`!result` — Show prose response (code blocks stripped)\n"
+        "`!files` — List files created/modified in the last task\n"
+        "`!show <path>` — View a workspace file (attachment for large files)\n\n"
+        "**Session:**\n"
+        "`!history` — Last 5 messages in your session\n"
+        "`!session` — Your session ID and last job ID\n"
+        "`!clear` — Clear conversation history\n"
+        "`!sessions` — List all sessions\n\n"
+        "**Workspace:**\n"
+        "`!workspace` — Show workspace path and top-level contents\n\n"
+        "**Utilities:**\n"
+        "`!git <status|log|diff|branch>` — Safe read-only git commands\n"
+        "`!helpme` — This help text\n"
+    )
+    await ctx.send(help_text)
 
+
+# ---------------------------------------------------------------------------
+# Entry point
+# ---------------------------------------------------------------------------
 
 def run_bot(token: str):
     if not token:
-        print("ERROR: Discord bot token not set. Set DISCORD_BOT_TOKEN environment variable.")
+        print("ERROR: DISCORD_BOT_TOKEN is not set.")
         return
-    
-    print(f"Starting Discord bot, connecting to API at {API_URL}")
+    print(f"[bot] Starting — API: {API_URL}")
     bot.run(token)
 
 
 if __name__ == "__main__":
-    import os
     token = os.getenv("DISCORD_BOT_TOKEN")
     run_bot(token)

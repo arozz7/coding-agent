@@ -2,6 +2,19 @@ from typing import Dict, Any, Optional, List
 import re
 from agent.agents.base_agent import AgentRole
 
+# Only fenced blocks explicitly marked as shell/bash/cmd/sh/powershell are
+# treated as commands to run.  Inline backticks are never executed.
+_SHELL_BLOCK_RE = re.compile(
+    r'```(?:shell|bash|sh|cmd|powershell|ps1)\n(.*?)```',
+    re.DOTALL | re.IGNORECASE,
+)
+
+# Screenshot is triggered only when the task explicitly requests a browser capture.
+_SCREENSHOT_RE = re.compile(
+    r'\b(take\s+a?\s*screenshot|capture\s+(?:a\s+)?screenshot|screenshot\s+of)\b',
+    re.IGNORECASE,
+)
+
 
 class DeveloperRole(AgentRole):
     def __init__(self, file_system_tool=None, shell_tool=None, browser_tool=None):
@@ -108,24 +121,27 @@ FILE:
                 except Exception as e:
                     self.logger.error("file_write_failed", path=file_path, error=str(e))
 
-        shell_output = None
+        shell_outputs: list[str] = []
         if tool_executor:
-            cmd_matches = re.findall(r'`([^`]+)`', response)
-            for cmd in cmd_matches:
-                try:
-                    shell_output = await tool_executor.execute("shell", {"command": cmd})
-                    self.logger.info("shell_output", cmd=cmd)
-                except Exception as e:
-                    self.logger.error("shell_failed", cmd=cmd, error=str(e))
+            for block in _SHELL_BLOCK_RE.finditer(response):
+                for line in block.group(1).strip().splitlines():
+                    cmd = line.strip()
+                    if not cmd or cmd.startswith("#"):
+                        continue
+                    try:
+                        out = await tool_executor.execute("shell", {"command": cmd})
+                        shell_outputs.append(f"$ {cmd}\n{out}")
+                        self.logger.info("shell_executed", cmd=cmd)
+                    except Exception as e:
+                        self.logger.error("shell_failed", cmd=cmd, error=str(e))
+                        shell_outputs.append(f"$ {cmd}\nError: {e}")
 
-        if shell_output:
-            response += f"\n\n**Shell Output:**\n```\n{shell_output}\n```"
+        if shell_outputs:
+            combined = "\n\n".join(shell_outputs)
+            response += f"\n\n**Shell Output:**\n```\n{combined}\n```"
 
         screenshot_path = None
-        if tool_executor and (
-            re.search(r'screenshot', task, re.IGNORECASE)
-            or re.search(r'run_and_screenshot|capture', response, re.IGNORECASE)
-        ):
+        if tool_executor and _SCREENSHOT_RE.search(task):
             try:
                 screenshot_path = await tool_executor.execute("screenshot", {})
                 response += f"\n\nScreenshot captured: {screenshot_path}"

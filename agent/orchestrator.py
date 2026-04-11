@@ -12,6 +12,8 @@ from agent.agents.developer_agent import DeveloperAgent
 from agent.agents.tester_agent import TesterAgent
 from agent.agents.reviewer_agent import ReviewerAgent
 from agent.agents.architect_agent import ArchitectAgent
+from agent.agents.chat_agent import ChatAgent
+from agent.agents.research_agent import ResearchAgent
 from agent.skills.skill_loader import SkillManager
 from agent.skills.wiki_manager import WikiManager
 from agent.skills.skill_executor import SkillExecutor
@@ -86,6 +88,14 @@ class AgentOrchestrator:
             code_analyzer=self.code_analyzer,
         )
         
+        self.chat_agent = ChatAgent(model_router)
+        self.research_agent = ResearchAgent(
+            model_router,
+            tools=[self.fs_tool, self.code_analyzer],
+            file_system_tool=self.fs_tool,
+            code_analyzer=self.code_analyzer,
+        )
+
         # Subagent management
         self.subagents: dict[str, "SubagentSession"] = {}
         
@@ -135,6 +145,10 @@ class AgentOrchestrator:
             agent = self.reviewer_agent
         elif role == "architect":
             agent = self.architect_agent
+        elif role == "researcher":
+            agent = self.research_agent
+        elif role == "chat":
+            agent = self.chat_agent
         else:
             agent = self.developer_agent
         
@@ -238,18 +252,74 @@ class AgentOrchestrator:
         ]
     
     def _detect_task_type(self, task: str) -> str:
-        task_lower = task.lower()
-        
-        if any(kw in task_lower for kw in ["review", "critique", "analyze code", "check for bugs", "security"]):
-            return "review"
-        if any(kw in task_lower for kw in ["test", "spec", "unit test", "pytest", "fixture"]):
-            return "test"
-        if any(kw in task_lower for kw in ["architect", "design", "architecture", "adr", "structure", "high-level"]):
-            return "architect"
-        if any(kw in task_lower for kw in ["write code", "implement", "create file", "make function", "build", "create", "generate code"]):
+        """Return the most appropriate agent role for this task.
+
+        Priority (highest first):
+          1. Explicit coding — output is new/modified source files
+          2. Review / security audit
+          3. Testing — write or run tests
+          4. Architecture / ADR
+          5. Research — investigate the existing codebase
+          6. Chat — everything else (conversation, general questions)
+        """
+        t = task.lower()
+
+        # 1. Explicit development: output is code/files
+        _DEVELOP = [
+            "implement", "refactor", "write a function", "write a class",
+            "write a script", "write the code", "write code",
+            "create a file", "create the file",
+            "build a ", "build the ", "develop a ",
+            "add feature", "add a feature",
+            "fix the bug", "fix this bug", "fix the error", "fix this error",
+            "fix the issue", "fix this issue",
+            "update the code", "update the function", "update the class",
+            "generate code", "generate a script",
+            "create an api", "create a server", "create a bot", "create a cli",
+            "make an app", "make a server", "make a bot", "make a script",
+            "make a function", "make a class",
+        ]
+        if any(kw in t for kw in _DEVELOP):
             return "develop"
-        
-        return "general"
+
+        # 2. Code review / security audit
+        if any(kw in t for kw in [
+            "review the code", "code review", "critique", "check for bugs",
+            "security audit", "security review", "analyze this code",
+            "review this file", "review this function",
+        ]):
+            return "review"
+
+        # 3. Tests
+        if any(kw in t for kw in [
+            "write tests", "write unit tests", "add tests", "create tests",
+            "generate tests", "unit test", "pytest", "test suite", "test case",
+            "run the tests", "run tests",
+        ]):
+            return "test"
+
+        # 4. Architecture
+        if any(kw in t for kw in [
+            "system design", "design the architecture", "architecture for",
+            "write an adr", "create an adr", "architect the", "high-level design",
+            "design pattern for", "design a system",
+        ]):
+            return "architect"
+
+        # 5. Research: codebase investigation (read-only)
+        if any(kw in t for kw in [
+            "where is ", "where are ", "find the ", "find where",
+            "locate ", "which file", "what file",
+            "trace ", "how does the existing", "how is ", "how does ",
+            "what does the code", "show me where",
+            "search the codebase", "look for ", "search for ",
+            "what files", "investigate", "explore the code",
+            "explain this code", "explain the code", "explain this file",
+        ]):
+            return "research"
+
+        # 6. Default: chat (general questions, explanations, conversation)
+        return "chat"
     
     # Keyword → skill name mapping for pre/post phase detection
     _PRE_TRIGGERS: dict[str, list[str]] = {
@@ -339,8 +409,12 @@ class AgentOrchestrator:
             return await self.tester_agent.run(task, context)
         elif task_type == "architect":
             return await self.architect_agent.run(task, context)
+        elif task_type == "research":
+            return await self.research_agent.run(task, context)
+        elif task_type == "chat":
+            return await self.chat_agent.run(task, context)
         else:
-            # "develop" and "general" both go to developer agent
+            # "develop" and unrecognised types go to the developer agent
             return await self.developer_agent.run(task, context)
 
     def _build_context_from_events(self, session_id: str) -> str:
