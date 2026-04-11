@@ -14,12 +14,12 @@ import asyncio
 import io
 import os
 import re
+import subprocess
 import time
 from typing import Optional
 
 import discord
 import httpx
-import requests as _requests
 from discord import Intents, Message, File
 from discord.ext import commands
 
@@ -116,10 +116,11 @@ class AgentClient:
     async def delete_session(self, session_id: str) -> dict:
         return await self._delete(f"/sessions/{session_id}")
 
-    # Sync health probe used at startup
+    # Sync health probe — only called before the event loop starts
     def is_reachable(self) -> bool:
+        import requests as _req
         try:
-            _requests.get(f"{self.api_url}/health", timeout=5).raise_for_status()
+            _req.get(f"{self.api_url}/health", timeout=5).raise_for_status()
             return True
         except Exception:
             return False
@@ -450,12 +451,11 @@ async def session_info(ctx: commands.Context):
 async def workspace(ctx: commands.Context):
     """Show the current workspace path and its top-level contents."""
     try:
-        r1 = _requests.get(f"{API_URL}/workspace", timeout=10)
-        data = r1.json()
+        data = await bot.client._get("/workspace")
         await ctx.send(f"**Workspace:** `{data.get('workspace', 'unknown')}`")
 
-        r2 = _requests.get(f"{API_URL}/workspace/directories", timeout=10)
-        items = r2.json().get("items", [])
+        dirs = await bot.client._get("/workspace/directories")
+        items = dirs.get("items", [])
         if items:
             lines = ["**Contents:**"]
             for item in items[:12]:
@@ -469,16 +469,17 @@ async def workspace(ctx: commands.Context):
 @bot.command(name="git")
 async def git_cmd(ctx: commands.Context, *, args: str):
     """Run a safe read-only git command: status, log, diff, branch."""
-    import subprocess
-
     allowed = {"status", "log", "diff", "branch"}
     first = args.strip().split()[0].lower()
     if first not in allowed:
         await ctx.send(f"Only allowed: `{', '.join(sorted(allowed))}`")
         return
     try:
-        out = subprocess.run(
-            f"git {args}", capture_output=True, text=True, shell=True, timeout=15
+        # Run in a thread so the event loop (and Discord heartbeat) stay free
+        out = await asyncio.to_thread(
+            subprocess.run,
+            f"git {args}",
+            capture_output=True, text=True, shell=True, timeout=15,
         )
         text = (out.stdout or out.stderr or "No output")[:1800]
         await ctx.send(f"```\n{text}\n```")
