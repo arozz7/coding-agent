@@ -6,6 +6,7 @@ import structlog
 
 from llm import ModelRouter
 from agent.memory import SessionMemory, CodebaseMemory
+from agent.memory.memory_wiki import MemoryWiki
 from agent.tools import FileSystemTool, PytestTool, CodeAnalyzer
 from agent.agents.developer_agent import DeveloperAgent
 from agent.agents.tester_agent import TesterAgent
@@ -50,6 +51,7 @@ class AgentOrchestrator:
         self.skill_manager = SkillManager("skills")
         self.wiki_manager = WikiManager(workspace_path)
         self.skill_executor = SkillExecutor(self.wiki_manager, self.skill_manager)
+        self.memory_wiki = MemoryWiki(project_id=Path(workspace_path).name)
 
         # Create MCP server for tool exposure
         from mcp.server import create_mcp_server
@@ -109,13 +111,19 @@ class AgentOrchestrator:
         subagent_id = f"subagent_{uuid.uuid4().hex[:8]}"
         
         self.logger.info("spawning_subagent", subagent_id=subagent_id, role=role, task=task[:100])
-        
+
+        # Ensure session exists before creating executor (EventEmittingExecutor requires it)
+        self.session_memory.get_or_create_session(subagent_id, self.workspace_path)
+        enriched_context = await self._build_enriched_context(task)
+
         # Create isolated context for subagent
         isolated_context = {
             "session_id": subagent_id,
             "parent_session_id": parent_session_id,
             "workspace_path": self.workspace_path,
             "model_router": self.model_router,
+            "tool_executor": self._create_session_executor(subagent_id),
+            "enriched_context": enriched_context,
             "context_limits": context_limits or {},
             "is_subagent": True,
         }
@@ -482,10 +490,63 @@ class AgentOrchestrator:
         }
 
     def index_workspace(self, project_id: str = None) -> dict:
-        """Index all files in the workspace for RAG."""
+        """Index all files in the workspace for RAG and populate the MemoryWiki graph."""
         if project_id is None:
             project_id = Path(self.workspace_path).name
-        return self.codebase_memory.index_workspace(self.workspace_path, project_id)
+
+        rag_result = self.codebase_memory.index_workspace(self.workspace_path, project_id)
+
+        # Populate MemoryWiki from static analysis of Python files
+        self.memory_wiki.clear()
+        py_files = list(Path(self.workspace_path).rglob("*.py"))
+        wiki_errors = 0
+        for py_file in py_files:
+            rel_path = str(py_file.relative_to(self.workspace_path))
+            try:
+                analysis = self.code_analyzer.analyze_file(str(py_file))
+                if not analysis.get("success"):
+                    continue
+
+                self.memory_wiki.add_file(rel_path, file_type="source", language="python")
+
+                for fn in analysis.get("functions", []):
+                    self.memory_wiki.add_function(
+                        file_path=rel_path,
+                        function_name=fn["name"],
+                        signature=fn["name"],
+                        line_start=fn["line_start"],
+                        line_end=fn["line_end"],
+                    )
+
+                for cls in analysis.get("classes", []):
+                    self.memory_wiki.add_class(
+                        file_path=rel_path,
+                        class_name=cls["name"],
+                        line_start=cls["line_start"],
+                        line_end=cls["line_end"],
+                        methods=[m["name"] for m in cls.get("methods", [])],
+                    )
+
+                for imp in analysis.get("imports", []):
+                    module = imp.get("module") or ""
+                    names = imp.get("names") or []
+                    if module:
+                        self.memory_wiki.add_import(rel_path, module, names)
+
+            except Exception as e:
+                wiki_errors += 1
+                self.logger.warning("wiki_index_error", file=rel_path, error=str(e))
+
+        wiki_stats = self.memory_wiki.get_statistics()
+        self.logger.info(
+            "wiki_indexed",
+            files=wiki_stats["files"],
+            functions=wiki_stats["functions"],
+            classes=wiki_stats["classes"],
+            errors=wiki_errors,
+        )
+
+        return {**rag_result, "wiki": wiki_stats}
 
     async def run_stream(
         self, task: str, session_id: Optional[str] = None, include_history: bool = True

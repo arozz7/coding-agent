@@ -1,7 +1,8 @@
-from fastapi import FastAPI, HTTPException, BackgroundTasks
+from fastapi import FastAPI, HTTPException, BackgroundTasks, Response
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from typing import Optional, List
+from prometheus_client import generate_latest, CONTENT_TYPE_LATEST
 import asyncio
 import structlog
 
@@ -549,6 +550,12 @@ async def get_llm_health():
         "rate_limiter": rate_status,
         "cost": cost_summary,
     }
+
+
+@app.get("/metrics", include_in_schema=False)
+async def metrics():
+    """Prometheus scrape endpoint."""
+    return Response(content=generate_latest(), media_type=CONTENT_TYPE_LATEST)
 
 
 if __name__ == "__main__":

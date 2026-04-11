@@ -4,6 +4,12 @@ from typing import Dict, List
 from collections import defaultdict
 import structlog
 
+try:
+    import tiktoken as _tiktoken
+    _ENCODING = _tiktoken.get_encoding("cl100k_base")
+except Exception:  # tiktoken not installed or encoding unavailable
+    _ENCODING = None
+
 logger = structlog.get_logger()
 
 
@@ -30,6 +36,8 @@ class CostTracker:
         self.logger = logger.bind(component="cost_tracker")
 
     def estimate_tokens(self, text: str) -> int:
+        if _ENCODING is not None:
+            return len(_ENCODING.encode(text))
         return len(text) // 4
 
     def track_usage(
