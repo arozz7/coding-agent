@@ -8,7 +8,8 @@ from .ollama_client import OllamaClient
 from .cloud_api_client import CloudAPIClient
 from .cost_tracker import CostTracker
 from .rate_limiter import RateLimiter, RateLimitExceeded
-from .health import HealthChecker, CircuitBreakerOpenError
+from .health import HealthChecker
+from .circuit_breaker import CircuitBreakerOpenError
 
 logger = structlog.get_logger()
 

@@ -17,6 +17,10 @@ class CircuitBreakerError(Exception):
     pass
 
 
+# Alias so callers that expect CircuitBreakerOpenError work without change
+CircuitBreakerOpenError = CircuitBreakerError
+
+
 class CircuitBreaker:
     def __init__(
         self,

@@ -42,36 +42,36 @@ class ModelHealthStatus:
 class OllamaModelManager:
     def __init__(self, endpoint: str = "http://127.0.0.1:11434"):
         self.endpoint = endpoint
-        self._client = httpx.Client(timeout=10.0)
         self.logger = logger.bind(component="ollama_manager")
-    
-    def _make_request(self, method: str, path: str, **kwargs) -> Dict[str, Any]:
+
+    async def _make_request(self, method: str, path: str, **kwargs) -> Dict[str, Any]:
         url = f"{self.endpoint}{path}"
         try:
-            response = self._client.request(method, url, **kwargs)
-            response.raise_for_status()
-            return response.json() if response.text else {}
+            async with httpx.AsyncClient(timeout=10.0) as client:
+                response = await client.request(method, url, **kwargs)
+                response.raise_for_status()
+                return response.json() if response.text else {}
         except httpx.HTTPStatusError as e:
             self.logger.error("ollama_http_error", status=e.response.status_code, detail=e.response.text)
             raise
         except Exception as e:
             self.logger.error("ollama_request_error", error=str(e))
             raise
-    
-    def list_models(self) -> List[Dict[str, Any]]:
+
+    async def list_models(self) -> List[Dict[str, Any]]:
         try:
-            result = self._make_request("GET", "/api/tags")
+            result = await self._make_request("GET", "/api/tags")
             return result.get("models", [])
         except Exception:
             return []
-    
-    def get_model_status(self, model_name: str) -> ModelHealthStatus:
+
+    async def get_model_status(self, model_name: str) -> ModelHealthStatus:
         start_time = time.time()
-        
+
         try:
-            result = self._make_request("POST", "/api/show", json={"name": model_name})
+            result = await self._make_request("POST", "/api/show", json={"name": model_name})
             latency = (time.time() - start_time) * 1000
-            
+
             return ModelHealthStatus(
                 model_name=model_name,
                 status=ModelStatus.AVAILABLE,
@@ -80,11 +80,11 @@ class OllamaModelManager:
                 latency_ms=round(latency, 2),
                 metadata=result,
             )
-            
+
         except httpx.HTTPStatusError as e:
             error_text = e.response.text.lower()
             latency = (time.time() - start_time) * 1000
-            
+
             if "not found" in error_text:
                 return ModelHealthStatus(
                     model_name=model_name,
@@ -94,7 +94,7 @@ class OllamaModelManager:
                     latency_ms=round(latency, 2),
                     error_message=f"Model not found - may be offloaded: {e.response.status_code}",
                 )
-            
+
             return ModelHealthStatus(
                 model_name=model_name,
                 status=ModelStatus.ERROR,
@@ -103,10 +103,10 @@ class OllamaModelManager:
                 latency_ms=round(latency, 2),
                 error_message=str(e),
             )
-            
+
         except Exception as e:
             latency = (time.time() - start_time) * 1000
-            
+
             return ModelHealthStatus(
                 model_name=model_name,
                 status=ModelStatus.UNKNOWN,
@@ -115,29 +115,25 @@ class OllamaModelManager:
                 latency_ms=round(latency, 2),
                 error_message=str(e),
             )
-    
-    def is_model_available(self, model_name: str) -> bool:
-        status = self.get_model_status(model_name)
-        return status.is_available
-    
-    def load_model(self, model_name: str) -> bool:
+
+    async def load_model(self, model_name: str) -> bool:
         try:
-            self._make_request("POST", "/api/generate", json={"model": model_name, "prompt": "", "stream": False})
+            await self._make_request("POST", "/api/generate", json={"model": model_name, "prompt": "", "stream": False})
             return True
         except Exception as e:
             self.logger.error("load_model_failed", model=model_name, error=str(e))
             return False
-    
-    def check_ollama_running(self) -> bool:
+
+    async def check_ollama_running(self) -> bool:
         try:
-            self._make_request("GET", "/")
+            await self._make_request("GET", "/")
             return True
         except Exception:
             return False
-    
-    def get_server_status(self) -> Dict[str, Any]:
-        is_running = self.check_ollama_running()
-        
+
+    async def get_server_status(self) -> Dict[str, Any]:
+        is_running = await self.check_ollama_running()
+
         return {
             "server_available": is_running,
             "endpoint": self.endpoint,
@@ -238,65 +234,65 @@ class ModelResilienceManager:
         self._model_status_cache: Dict[str, ModelHealthStatus] = {}
         self._cache_ttl_seconds = 30
     
-    def check_model_health(self, model_name: str, force_refresh: bool = False) -> ModelHealthStatus:
+    async def check_model_health(self, model_name: str, force_refresh: bool = False) -> ModelHealthStatus:
         if not force_refresh and model_name in self._model_status_cache:
             cached = self._model_status_cache[model_name]
             age = (datetime.utcnow() - cached.last_checked).total_seconds()
             if age < self._cache_ttl_seconds:
                 return cached
-        
-        status = self.ollama_manager.get_model_status(model_name)
+
+        status = await self.ollama_manager.get_model_status(model_name)
         self._model_status_cache[model_name] = status
-        
+
         return status
-    
-    def is_model_available(self, model_name: str) -> bool:
-        status = self.check_model_health(model_name)
+
+    async def is_model_available(self, model_name: str) -> bool:
+        status = await self.check_model_health(model_name)
         return status.is_available
-    
-    def find_available_model(self, preferred_models: List[str]) -> Optional[str]:
+
+    async def find_available_model(self, preferred_models: List[str]) -> Optional[str]:
         for model in preferred_models:
-            if self.is_model_available(model):
+            if await self.is_model_available(model):
                 return model
-        
+
         for model in self.fallback_models:
-            if self.is_model_available(model):
+            if await self.is_model_available(model):
                 return model
-        
-        all_models = self.ollama_manager.list_models()
+
+        all_models = await self.ollama_manager.list_models()
         for model_info in all_models:
             model_name = model_info.get("name", "")
-            if self.is_model_available(model_name):
+            if await self.is_model_available(model_name):
                 return model_name
-        
+
         return None
-    
-    def find_working_fallback(
+
+    async def find_working_fallback(
         self,
         primary_model: str,
         cloud_models: Optional[List[str]] = None,
     ) -> tuple[Optional[str], Optional[str]]:
-        local_available = self.is_model_available(primary_model)
-        
+        local_available = await self.is_model_available(primary_model)
+
         if local_available:
             return primary_model, "local"
-        
+
         self.logger.warning(
             "primary_model_unavailable",
             model=primary_model,
             status=self._model_status_cache.get(primary_model),
         )
-        
+
         if cloud_models:
             for cloud_model in cloud_models:
                 if not self.rate_limit_handler.is_rate_limited(cloud_model):
                     return cloud_model, "cloud"
-        
+
         if self.fallback_models:
-            fallback = self.find_available_model(self.fallback_models)
+            fallback = await self.find_available_model(self.fallback_models)
             if fallback:
                 return fallback, "local"
-        
+
         return None, None
     
     def handle_request_error(
@@ -350,8 +346,8 @@ class ModelResilienceManager:
             "message": str(error),
         }
     
-    def get_diagnostics(self) -> Dict[str, Any]:
-        ollama_status = self.ollama_manager.get_server_status()
+    async def get_diagnostics(self) -> Dict[str, Any]:
+        ollama_status = await self.ollama_manager.get_server_status()
         rate_limit_status = self.rate_limit_handler.get_status()
         
         cached_models = {

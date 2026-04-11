@@ -538,7 +538,7 @@ async def get_llm_health():
         ollama_endpoint=config.endpoint if config and config.type == "local" else "http://127.0.0.1:11434"
     )
 
-    diagnostics = resilience.get_diagnostics()
+    diagnostics = await resilience.get_diagnostics()
     cost_summary = router.get_cost_summary()
     rate_status = {}
     if config:

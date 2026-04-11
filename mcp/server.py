@@ -47,6 +47,13 @@ def create_mcp_server(workspace_path: str, repo_path: Optional[str] = None) -> M
     server = MCPServer("local-coding-agent")
     fs_server = FileSystemMCPServer(workspace_path)
 
+    # Auto-detect git repo when repo_path not explicitly provided
+    if repo_path is None:
+        from pathlib import Path as _Path
+        if (_Path(workspace_path) / ".git").exists():
+            repo_path = workspace_path
+            logger.info("git_repo_detected", path=workspace_path)
+
     server.register_tool(
         name="read_file",
         description="Read contents of a file",
