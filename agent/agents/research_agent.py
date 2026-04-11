@@ -5,9 +5,17 @@ from agent.agents.base_agent import AgentRole
 from agent.tools.web_tool import extract_urls
 
 _DOCUMENT_EXTS = {".pdf", ".docx", ".doc", ".xlsx", ".xls", ".csv", ".tsv"}
+
+# Patterns that always warrant a web search in the research agent.
 _SEARCH_TRIGGERS = re.compile(
-    r"\b(search\s+(for|the\s+web|online)|look\s+up|find\s+online|google|"
-    r"what('s|\s+is)\s+the\s+latest|current\s+version|recent\s+news)\b",
+    r"\b("
+    r"search\s+(for|the\s+web|online)|look\s+up|find\s+online|google|"
+    r"what('s|\s+is)\s+the\s+(latest|current|news)|current\s+version|"
+    r"recent\s+news|last\s+night|yesterday|today|latest|recent(ly)?|"
+    r"score|scores|weather|stock|price|market|news|headline|"
+    r"who\s+(won|lost|is)|what\s+happened|"
+    r"released|launched|announced"
+    r")\b",
     re.IGNORECASE,
 )
 
@@ -87,11 +95,19 @@ Format your findings as:
                 except Exception as e:
                     self.logger.warning("web_fetch_failed", url=url, error=str(e))
 
-            # 5. Web search if the task implies looking things up online
-            if _SEARCH_TRIGGERS.search(task):
+            # 5. Web search:
+            #    a) explicit trigger keywords
+            #    b) fallback: no local files were found — task is likely about external info
+            local_content_found = any(
+                g.startswith("---") or g.startswith("[PDF") or g.startswith("[DOCX")
+                for g in gathered[1:]  # skip the workspace listing
+            )
+            if _SEARCH_TRIGGERS.search(task) or not local_content_found:
                 try:
-                    search_results = await tool_executor.execute("web_search", {"query": task[:200]})
-                    if search_results:
+                    search_results = await tool_executor.execute(
+                        "web_search", {"query": task[:200], "max_results": 5}
+                    )
+                    if search_results and not search_results.startswith("Error"):
                         gathered.append(search_results[:3000])
                 except Exception as e:
                     self.logger.warning("web_search_failed", error=str(e))
