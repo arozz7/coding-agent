@@ -173,8 +173,15 @@ _PHASE_LABELS: dict[str, str] = {
 
 
 async def _poll_job(ctx: commands.Context, status_msg: discord.Message, job_id: str):
-    """Edit *status_msg* until the job finishes, then post a summary."""
+    """Edit *status_msg* until the job finishes, then post the result.
+
+    Chat and research jobs stream the full response inline (chunked).
+    All other job types (develop, review, test, architect) show a short
+    summary and point the user to ``!result`` / ``!files``.
+    """
     start = time.monotonic()
+    # Task types whose full response should be shown inline in the channel.
+    _INLINE_TYPES = {"chat", "research"}
 
     while True:
         await asyncio.sleep(POLL_INTERVAL)
@@ -191,18 +198,40 @@ async def _poll_job(ctx: commands.Context, status_msg: discord.Message, job_id: 
         label = _PHASE_LABELS.get(phase, phase or "Working")
 
         if job_status == "done":
-            summary = job.get("summary") or "(task complete)"
-            files = job.get("files_created", [])
             task_type = job.get("task_type", "")
+            files = job.get("files_created", [])
 
-            lines = [f"**Done** [{task_type}] · {elapsed}s\n", summary]
-            if files:
-                file_lines = "\n".join(f"  `{f}`" for f in files[:10])
-                lines.append(f"\n**Files created/modified:**\n{file_lines}")
-            lines.append(
-                "\n`!result` — prose response  ·  `!files` — file list  ·  `!show <path>` — view a file"
-            )
-            await status_msg.edit(content=_truncate("\n".join(lines)))
+            if task_type in _INLINE_TYPES:
+                # Fetch and stream the full response for conversational tasks.
+                try:
+                    result_data = await bot.client.get_job_result(job_id)
+                    full = (result_data.get("result") or "").strip()
+                except Exception as exc:
+                    full = ""
+                    await status_msg.edit(content=f"Done [{task_type}] · {elapsed}s (could not fetch result: {exc})")
+                    return
+
+                if not full:
+                    await status_msg.edit(content=f"Done [{task_type}] · {elapsed}s — (empty response)")
+                    return
+
+                # Edit the status message to a short header, then send chunks.
+                await status_msg.edit(content=f"**Done** [{task_type}] · {elapsed}s")
+                chunks = _chunk(full)
+                for chunk in chunks:
+                    await ctx.send(chunk)
+
+            else:
+                # Summarise-only for file-producing tasks.
+                summary = job.get("summary") or "(task complete)"
+                lines = [f"**Done** [{task_type}] · {elapsed}s\n", summary]
+                if files:
+                    file_lines = "\n".join(f"  `{f}`" for f in files[:10])
+                    lines.append(f"\n**Files created/modified:**\n{file_lines}")
+                lines.append(
+                    "\n`!result` — full response  ·  `!files` — file list  ·  `!show <path>` — view a file"
+                )
+                await status_msg.edit(content=_truncate("\n".join(lines)))
             return
 
         elif job_status == "failed":
