@@ -377,11 +377,70 @@ async def list_models():
     if not _orchestrator:
         raise HTTPException(status_code=503, detail="Agent not initialized")
 
+    router = _orchestrator.model_router
+    active = router.get_active_model_name()
     return {
+        "active_model": active,
         "models": [
-            {"name": c.name, "type": c.type, "coding_optimized": c.is_coding_optimized}
-            for c in _orchestrator.model_router.configs
-        ]
+            {
+                "name": c.name,
+                "type": c.type,
+                "endpoint": c.endpoint,
+                "coding_optimized": c.is_coding_optimized,
+                "context_window": c.context_window,
+                "is_active": c.name == active,
+            }
+            for c in router.configs
+        ],
+    }
+
+
+@app.get("/models/active")
+async def get_active_model():
+    """Return the currently active model."""
+    if not _orchestrator:
+        raise HTTPException(status_code=503, detail="Agent not initialized")
+
+    router = _orchestrator.model_router
+    name = router.get_active_model_name()
+    config = router.get_model("coding")
+    if not config:
+        raise HTTPException(status_code=404, detail="No models configured")
+
+    return {
+        "active_model": name,
+        "effective_model": config.name,
+        "type": config.type,
+        "endpoint": config.endpoint,
+        "context_window": config.context_window,
+    }
+
+
+@app.post("/models/active")
+async def set_active_model(body: dict):
+    """Switch the active model by name. Pass {\"model\": \"<name>\"}.
+    Pass {\"model\": null} to revert to the default from models.yaml."""
+    if not _orchestrator:
+        raise HTTPException(status_code=503, detail="Agent not initialized")
+
+    router = _orchestrator.model_router
+    name = body.get("model")
+
+    if name is None:
+        router.clear_active_model()
+        effective = router.get_active_model_name()
+        return {"active_model": effective, "message": "Reverted to default"}
+
+    try:
+        config = router.set_active_model(name)
+    except ValueError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+
+    return {
+        "active_model": config.name,
+        "type": config.type,
+        "endpoint": config.endpoint,
+        "message": f"Switched to {config.name}",
     }
 
 

@@ -24,6 +24,8 @@ class ModelRouter:
         self.rate_limiter = RateLimiter()
         self.health_checker = HealthChecker(self)
         self.logger = logger.bind(component="model_router")
+        self._defaults: dict = {}
+        self._active_model_name: Optional[str] = None
         self._load_configs(config_path)
 
     def _configure_ollama_endpoint(self, config: ModelConfig) -> None:
@@ -38,14 +40,24 @@ class ModelRouter:
     def _load_configs(self, path: str) -> None:
         config_file = Path(path)
         if not config_file.exists():
-            self.logger.warning("config_not_found", path=path)
+            self.logger.error(
+                "config_not_found",
+                path=str(config_file.resolve()),
+                hint="Check that config/models.yaml exists at the project root",
+            )
             return
 
         with open(config_file) as f:
             data = yaml.safe_load(f)
 
+        self._defaults = data.get("defaults", {})
+
         for m in data.get("models", []):
-            config = ModelConfig(**m)
+            try:
+                config = ModelConfig(**m)
+            except Exception as e:
+                self.logger.error("model_config_invalid", entry=m, error=str(e))
+                continue
             if config.api_key_env:
                 import os
                 config.api_key = os.environ.get(config.api_key_env)
@@ -55,17 +67,75 @@ class ModelRouter:
             if config.type == "local" and config.endpoint:
                 self._configure_ollama_endpoint(config)
 
-        self.logger.info("configs_loaded", count=len(self.configs))
+        # Honour the defaults.coding_model setting as the initial active model
+        default_name = self._defaults.get("coding_model")
+        if default_name and default_name in self.config_by_name:
+            self._active_model_name = default_name
+
+        self.logger.info(
+            "configs_loaded",
+            count=len(self.configs),
+            active=self._active_model_name,
+            path=str(config_file.resolve()),
+        )
 
     def get_model(self, purpose: str = "general") -> Optional[ModelConfig]:
+        """Return the model to use for *purpose*.
+
+        Priority:
+          1. Explicitly set active model (_active_model_name)
+          2. Default from models.yaml [defaults] section for this purpose
+          3. First model with is_coding_optimized = true (for coding purposes)
+          4. First model in the list
+        """
+        if not self.configs:
+            return None
+
+        # 1. Explicit active model
+        if self._active_model_name and self._active_model_name in self.config_by_name:
+            return self.config_by_name[self._active_model_name]
+
+        # 2. Purpose-specific default from YAML
+        purpose_key = f"{purpose}_model"
+        default_name = self._defaults.get(purpose_key)
+        if default_name and default_name in self.config_by_name:
+            return self.config_by_name[default_name]
+
+        # 3. First coding-optimized model for coding purposes
         if purpose == "coding":
             for config in self.configs:
                 if config.is_coding_optimized:
                     return config
-        return self.configs[0] if self.configs else None
+
+        # 4. First available
+        return self.configs[0]
 
     def get_config(self, name: str) -> Optional[ModelConfig]:
         return self.config_by_name.get(name)
+
+    def set_active_model(self, name: str) -> ModelConfig:
+        """Set the model that will be used for all requests until changed.
+
+        Raises ValueError if *name* is not in the loaded config.
+        """
+        if name not in self.config_by_name:
+            available = list(self.config_by_name.keys())
+            raise ValueError(f"Unknown model '{name}'. Available: {available}")
+        self._active_model_name = name
+        config = self.config_by_name[name]
+        if config.type == "local" and config.endpoint:
+            self._configure_ollama_endpoint(config)
+        self.logger.info("active_model_changed", model=name)
+        return config
+
+    def get_active_model_name(self) -> Optional[str]:
+        """Return the name of the currently active model, or None if using defaults."""
+        return self._active_model_name
+
+    def clear_active_model(self) -> None:
+        """Revert to the default model selection from models.yaml."""
+        self._active_model_name = self._defaults.get("coding_model")
+        self.logger.info("active_model_reset", model=self._active_model_name)
 
     async def generate(
         self,

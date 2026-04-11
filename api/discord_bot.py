@@ -487,6 +487,73 @@ async def git_cmd(ctx: commands.Context, *, args: str):
         await ctx.send(f"Error: {exc}")
 
 
+@bot.command(name="models")
+async def list_models(ctx: commands.Context):
+    """List all configured models and show which one is active."""
+    try:
+        data = await bot.client._get("/models")
+    except Exception as exc:
+        await ctx.send(f"Error: {exc}")
+        return
+
+    active = data.get("active_model") or "(default)"
+    lines = [f"**Models** · active: `{active}`\n"]
+    for m in data.get("models", []):
+        marker = "**[active]**" if m.get("is_active") else "       "
+        name = m["name"]
+        mtype = m.get("type", "?")
+        ctx_k = m.get("context_window", 0) // 1000
+        lines.append(f"{marker} `{name}` — {mtype} · {ctx_k}k ctx")
+    lines.append("\nUse `!model <name>` to switch · `!model reset` to restore default")
+    await ctx.send("\n".join(lines))
+
+
+@bot.command(name="model")
+async def switch_model(ctx: commands.Context, *, name: str = ""):
+    """Switch the active model. `!model` shows current. `!model reset` restores default."""
+    name = name.strip()
+
+    if not name:
+        # Show current
+        try:
+            data = await bot.client._get("/models/active")
+        except Exception as exc:
+            await ctx.send(f"Error: {exc}")
+            return
+        effective = data.get("effective_model", "?")
+        active = data.get("active_model") or "(yaml default)"
+        await ctx.send(
+            f"**Current model:** `{effective}`\n"
+            f"**Active override:** {active}\n"
+            f"Use `!models` to list all · `!model <name>` to switch"
+        )
+        return
+
+    # Reset to default
+    if name.lower() == "reset":
+        try:
+            data = await bot.client._post("/models/active", {"model": None})
+        except Exception as exc:
+            await ctx.send(f"Error: {exc}")
+            return
+        await ctx.send(f"Model reset to default: `{data.get('active_model', '?')}`")
+        return
+
+    # Switch to named model
+    try:
+        data = await bot.client._post("/models/active", {"model": name})
+    except httpx.HTTPStatusError as exc:
+        body = exc.response.json() if exc.response.content else {}
+        detail = body.get("detail", exc.response.text[:200])
+        await ctx.send(f"Could not switch model: {detail}")
+        return
+    except Exception as exc:
+        await ctx.send(f"Error: {exc}")
+        return
+
+    await ctx.send(f"Switched to `{data.get('active_model', name)}` — {data.get('message', '')}")
+
+
 @bot.command(name="helpme")
 async def helpme(ctx: commands.Context):
     """Show available commands."""
@@ -507,6 +574,11 @@ async def helpme(ctx: commands.Context):
         "`!sessions` — List all sessions\n\n"
         "**Workspace:**\n"
         "`!workspace` — Show workspace path and top-level contents\n\n"
+        "**Models:**\n"
+        "`!models` — List all configured models\n"
+        "`!model` — Show active model\n"
+        "`!model <name>` — Switch to a different model\n"
+        "`!model reset` — Revert to the default from models.yaml\n\n"
         "**Utilities:**\n"
         "`!git <status|log|diff|branch>` — Safe read-only git commands\n"
         "`!helpme` — This help text\n"
