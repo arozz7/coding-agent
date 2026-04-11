@@ -1,0 +1,89 @@
+# ============================================================
+# External Tool Registry
+# ============================================================
+# Maps tool names to their expected locations per OS.
+# Each tool can be overridden by setting the env_override
+# environment variable — that always wins over auto-detection.
+#
+# The EnvironmentProbe class reads this file at startup and
+# caches resolved paths to data/environment.json.
+# Delete data/environment.json to force a re-probe.
+# ============================================================
+
+tools:
+
+  playwright_chromium:
+    description: "Playwright Chromium browser for headless web browsing"
+    env_override: PLAYWRIGHT_BROWSERS_PATH
+    # No binary to find — probe checks for the directory
+    is_directory: true
+    search_paths:
+      windows:
+        - "{LOCALAPPDATA}/ms-playwright"
+        - "{APPDATA}/ms-playwright"
+      darwin:
+        - "~/Library/Caches/ms-playwright"
+      linux:
+        - "~/.cache/ms-playwright"
+
+  git:
+    description: "Git version control system"
+    env_override: GIT_PATH
+    binary: git
+    search_paths:
+      windows:
+        - "C:/Program Files/Git/bin"
+        - "C:/Program Files (x86)/Git/bin"
+        - "{LOCALAPPDATA}/Programs/Git/bin"
+      darwin:
+        - "/usr/bin"
+        - "/opt/homebrew/bin"
+        - "/usr/local/bin"
+      linux:
+        - "/usr/bin"
+        - "/usr/local/bin"
+
+  node:
+    description: "Node.js runtime (optional — used by some MCP tools)"
+    env_override: NODE_PATH
+    binary: node
+    required: false
+    search_paths:
+      windows:
+        - "{PROGRAMFILES}/nodejs"
+        - "{LOCALAPPDATA}/Programs/nodejs"
+      darwin:
+        - "/opt/homebrew/bin"
+        - "/usr/local/bin"
+        - "/usr/bin"
+      linux:
+        - "/usr/bin"
+        - "/usr/local/bin"
+        - "~/.nvm/versions/node"
+
+  python:
+    description: "Python interpreter"
+    env_override: PYTHON_PATH
+    binary: python
+    search_paths:
+      windows:
+        - "{LOCALAPPDATA}/Programs/Python"
+      darwin:
+        - "/opt/homebrew/bin"
+        - "/usr/bin"
+        - "/usr/local/bin"
+      linux:
+        - "/usr/bin"
+        - "/usr/local/bin"
+
+# ------------------------------------------------------------
+# Remote skills registry
+# ------------------------------------------------------------
+# Source for !skills fetch. Points to a public GitHub repo.
+# The fetch downloads any SKILL.md files found under skills_path.
+# Set SKILLS_REPO_URL env var to override.
+skills_registry:
+  repo: anthropics/anthropic-quickstarts
+  branch: main
+  skills_path: computer-use-demo/computer_use_demo
+  env_override: SKILLS_REPO_URL

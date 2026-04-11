@@ -1,4 +1,4 @@
-from typing import TypedDict, Annotated, List, Optional
+from typing import TypedDict, Annotated, List, Optional, Callable
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -166,14 +166,33 @@ class AgentOrchestrator:
                 "status": "completed" if result.get("success") else "failed",
             }
             
-            # Optionally aggregate result back to parent
+            # Aggregate result back to parent session
             if parent_session_id:
                 self.session_memory.save_message(
                     parent_session_id,
                     "subagent",
                     f"[{role}] {task[:50]}... -> {result.get('response', '')[:200]}",
                 )
-            
+
+            # Merge any files the subagent created back into the RAG index
+            # so future searches in the parent session can find them.
+            files_created = result.get("files_created", [])
+            if files_created and result.get("success"):
+                project_id = Path(self.workspace_path).name
+                for rel_path in files_created:
+                    abs_path = Path(self.workspace_path) / rel_path
+                    if abs_path.exists() and abs_path.is_file():
+                        try:
+                            self.codebase_memory.index_files(
+                                [str(abs_path)], project_id
+                            )
+                        except Exception as index_err:
+                            self.logger.warning(
+                                "subagent_rag_merge_failed",
+                                file=rel_path,
+                                error=str(index_err),
+                            )
+
             self.logger.info("subagent_completed", subagent_id=subagent_id, status=self.subagents[subagent_id]["status"])
             
             return {
@@ -507,8 +526,29 @@ class AgentOrchestrator:
         return self._build_context_from_events(session_id)
 
     async def run_task(
-        self, task: str, session_id: Optional[str] = None, include_history: bool = True
+        self,
+        task: str,
+        session_id: Optional[str] = None,
+        include_history: bool = True,
+        on_phase: Optional[Callable[[str], None]] = None,
     ) -> dict:
+        """Run a task and return the agent result.
+
+        Args:
+            task: The user task string.
+            session_id: Existing session to continue, or None to create one.
+            include_history: Whether to include conversation history.
+            on_phase: Optional callback fired with a phase label string at
+                key milestones. Used by the background job API to push live
+                progress updates into the job store without polling.
+        """
+        def _emit_phase(label: str) -> None:
+            if on_phase:
+                try:
+                    on_phase(label)
+                except Exception:
+                    pass
+
         if not session_id:
             session_id = f"session_{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}"
 
@@ -524,9 +564,29 @@ class AgentOrchestrator:
             }
 
         self.agent_logger.log_task_start("agent", {"task": task})
-        task_type = await self._detect_task_type(task)
+
+        # Run LLM classifier and context building in parallel to save wall time.
+        _emit_phase("preparing")
+        import asyncio as _asyncio
+        task_type, _ = await _asyncio.gather(
+            self._detect_task_type(task),
+            self._build_enriched_context(task),  # warm the RAG cache
+        )
+        # Re-build properly below (we discard the result here; context is
+        # re-built inside _run_specialized_agent to pass it correctly).
+
         self.logger.info("task_type_detected", task_type=task_type)
         self.session_memory.emit_event(session_id, "status", {"phase": "start", "task_type": task_type})
+
+        _phase_labels = {
+            "develop": "developing",
+            "review": "reviewing",
+            "test": "testing",
+            "architect": "designing",
+            "research": "researching",
+            "chat": "thinking",
+        }
+        _emit_phase(_phase_labels.get(task_type, "working"))
 
         try:
             result = await self._run_specialized_agent(task, task_type, session_id)

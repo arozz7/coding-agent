@@ -5,6 +5,9 @@ Loads skills from the skills/ directory based on:
 - Keyword triggers (from skill description)
 - User invocation (explicit skill name)
 - Pre/post execution hooks
+
+Remote fetch (fetch_remote) downloads SKILL.md files from a public GitHub
+repository declared in config/environment.yaml under skills_registry.
 """
 import re
 from pathlib import Path
@@ -144,6 +147,128 @@ class SkillManager:
             }
             for s in self.skills.values()
         ]
+
+
+    def fetch_remote(self) -> dict:
+        """Download skills from the remote registry into the local skills dir.
+
+        Registry is configured in config/environment.yaml under skills_registry.
+        Uses the GitHub Contents API (no auth required for public repos).
+        Already-current files are skipped (compared by content hash).
+
+        Returns a dict with keys: fetched, skipped, errors, skills.
+        """
+        import hashlib
+        import urllib.request
+
+        # Load environment config for registry settings
+        try:
+            from local_coding_agent import _PROJECT_ROOT
+            env_cfg_path = _PROJECT_ROOT / "config" / "environment.yaml"
+            with open(env_cfg_path, encoding="utf-8") as fh:
+                env_cfg = yaml.safe_load(fh) or {}
+        except Exception as e:
+            self.logger.error("skills_fetch_env_config_failed", error=str(e))
+            return {"fetched": 0, "skipped": 0, "errors": [str(e)], "skills": []}
+
+        registry = env_cfg.get("skills_registry", {})
+        import os
+        repo = os.environ.get(
+            registry.get("env_override", "SKILLS_REPO_URL"),
+            f"{registry.get('repo', 'anthropics/anthropic-quickstarts')}",
+        )
+        branch = registry.get("branch", "main")
+        skills_path = registry.get("skills_path", "")
+
+        # GitHub Contents API URL
+        api_url = f"https://api.github.com/repos/{repo}/contents/{skills_path}?ref={branch}"
+        self.logger.info("skills_fetch_start", repo=repo, branch=branch, path=skills_path)
+
+        fetched, skipped, errors, fetched_names = 0, 0, [], []
+
+        try:
+            req = urllib.request.Request(
+                api_url,
+                headers={"Accept": "application/vnd.github.v3+json",
+                         "User-Agent": "local-coding-agent/1.0"},
+            )
+            with urllib.request.urlopen(req, timeout=15) as resp:
+                import json
+                contents = json.loads(resp.read().decode("utf-8"))
+        except Exception as e:
+            self.logger.error("skills_fetch_listing_failed", error=str(e))
+            return {"fetched": 0, "skipped": 0, "errors": [str(e)], "skills": []}
+
+        # Look for SKILL.md files (direct or one level deep)
+        skill_files = []
+        for item in (contents if isinstance(contents, list) else []):
+            if item.get("type") == "file" and item["name"].upper() == "SKILL.MD":
+                skill_files.append(item)
+            elif item.get("type") == "dir":
+                # Recurse one level
+                try:
+                    sub_url = item["url"]
+                    sub_req = urllib.request.Request(
+                        sub_url,
+                        headers={"Accept": "application/vnd.github.v3+json",
+                                 "User-Agent": "local-coding-agent/1.0"},
+                    )
+                    with urllib.request.urlopen(sub_req, timeout=10) as sr:
+                        sub_contents = json.loads(sr.read().decode("utf-8"))
+                    for sub_item in (sub_contents if isinstance(sub_contents, list) else []):
+                        if sub_item.get("type") == "file" and sub_item["name"].upper() == "SKILL.MD":
+                            skill_files.append(sub_item)
+                except Exception:
+                    pass
+
+        for skill_file in skill_files:
+            try:
+                download_url = skill_file.get("download_url", "")
+                if not download_url:
+                    continue
+
+                # Determine local path: skills/<parent-dir>/SKILL.md
+                parts = skill_file["path"].split("/")
+                skill_dir_name = parts[-2] if len(parts) >= 2 else "remote-skill"
+                local_dir = self.skills_dir / skill_dir_name
+                local_path = local_dir / "SKILL.md"
+
+                # Download content
+                dl_req = urllib.request.Request(
+                    download_url,
+                    headers={"User-Agent": "local-coding-agent/1.0"},
+                )
+                with urllib.request.urlopen(dl_req, timeout=15) as dl:
+                    remote_content = dl.read().decode("utf-8")
+
+                # Skip if identical to local version
+                if local_path.exists():
+                    local_hash = hashlib.sha256(local_path.read_bytes()).hexdigest()
+                    remote_hash = hashlib.sha256(remote_content.encode("utf-8")).hexdigest()
+                    if local_hash == remote_hash:
+                        skipped += 1
+                        continue
+
+                local_dir.mkdir(parents=True, exist_ok=True)
+                local_path.write_text(remote_content, encoding="utf-8")
+                fetched += 1
+                fetched_names.append(skill_dir_name)
+                self.logger.info("skill_fetched", name=skill_dir_name)
+
+            except Exception as e:
+                errors.append(str(e))
+                self.logger.error("skill_fetch_item_failed", error=str(e))
+
+        # Reload skills after fetch
+        if fetched > 0:
+            self.discover_skills()
+
+        return {
+            "fetched": fetched,
+            "skipped": skipped,
+            "errors": errors,
+            "skills": fetched_names,
+        }
 
 
 __all__ = ["SkillManager", "Skill"]

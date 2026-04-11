@@ -1,3 +1,5 @@
+import os
+import re
 from typing import Optional, List, AsyncIterator
 from pathlib import Path
 import yaml
@@ -37,6 +39,21 @@ class ModelRouter:
                 url=config.endpoint,
             )
 
+    @staticmethod
+    def _expand_env(value: Optional[str]) -> Optional[str]:
+        """Expand ${VAR} references in a string using os.environ.
+
+        Unknown variables are left as-is so misconfigured names are visible
+        in logs rather than silently becoming empty strings.
+        """
+        if not value or "${" not in value:
+            return value
+        return re.sub(
+            r"\$\{([^}]+)\}",
+            lambda m: os.environ.get(m.group(1), m.group(0)),
+            value,
+        )
+
     def _load_configs(self, path: str) -> None:
         config_file = Path(path)
         if not config_file.exists():
@@ -54,12 +71,16 @@ class ModelRouter:
 
         for m in data.get("models", []):
             try:
-                config = ModelConfig(**m)
+                # Expand ${ENV_VAR} references before constructing the config
+                m_expanded = {
+                    k: (self._expand_env(v) if isinstance(v, str) else v)
+                    for k, v in m.items()
+                }
+                config = ModelConfig(**m_expanded)
             except Exception as e:
                 self.logger.error("model_config_invalid", entry=m, error=str(e))
                 continue
             if config.api_key_env:
-                import os
                 config.api_key = os.environ.get(config.api_key_env)
             self.configs.append(config)
             self.config_by_name[config.name] = config

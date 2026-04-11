@@ -1,7 +1,8 @@
 models:
   - name: qwen3.5-35b-a3b
     type: local
-    endpoint: http://127.0.0.1:1234
+    # ${LM_STUDIO_URL} is read from .env (default: http://127.0.0.1:1234)
+    endpoint: ${LM_STUDIO_URL}
     context_window: 262144
     is_coding_optimized: true
     recommended_for: [coding, code_review, test_generation, planning, research]
@@ -9,7 +10,7 @@ models:
 
   - name: google_gemma-4-31b-it
     type: local
-    endpoint: http://127.0.0.1:1234
+    endpoint: ${LM_STUDIO_URL}
     context_window: 262144
     is_coding_optimized: true
     recommended_for: [coding, code_review, test_generation, planning, research]

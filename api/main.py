@@ -59,6 +59,18 @@ app = FastAPI(
     version="0.1.0",
 )
 
+# Per-route request count, latency histogram, and in-flight gauge.
+# Metrics are exposed via the existing /metrics endpoint (generate_latest()).
+try:
+    from prometheus_fastapi_instrumentator import Instrumentator
+    Instrumentator(
+        should_group_status_codes=True,
+        should_ignore_untemplated=True,
+        excluded_handlers=["/metrics", "/health"],
+    ).instrument(app)
+except ImportError:
+    pass  # Optional dependency — degrades gracefully if not installed
+
 # CORS: default to localhost only; override via CORS_ORIGINS env var
 # (comma-separated list of allowed origins).
 # Never use allow_origins=["*"] with allow_credentials=True — that is
@@ -192,17 +204,18 @@ async def start_task_background(request: TaskRequest):
     job_id = f"job_{uuid.uuid4().hex[:12]}"
     session_id = request.session_id or f"session_{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}"
 
-    # Detect task type early so the Discord bot can show a meaningful phase label.
-    # _detect_task_type is now async (tries LLM first, keyword fallback on failure).
-    task_type = await _orchestrator._detect_task_type(request.task)
-    _phase_label = {
+    # Use keyword classifier for instant response (0 ms) — the LLM classifier
+    # runs later inside run_task() in parallel with context building.
+    task_type = _orchestrator._detect_task_type_keyword(request.task)
+    _phase_labels = {
         "develop": "developing",
         "review": "reviewing",
         "test": "testing",
         "architect": "designing",
         "research": "researching",
         "chat": "thinking",
-    }.get(task_type, "working")
+    }
+    _phase_label = _phase_labels.get(task_type, "working")
 
     _job_store.create(
         job_id=job_id,
@@ -212,6 +225,10 @@ async def start_task_background(request: TaskRequest):
         phase=_phase_label,
     )
 
+    def _on_phase(label: str) -> None:
+        """Callback fired by run_task() at each milestone to update job phase."""
+        _job_store.update(job_id, phase=label)
+
     async def _run():
         _job_store.update(job_id, status="running")
         try:
@@ -219,6 +236,7 @@ async def start_task_background(request: TaskRequest):
                 task=request.task,
                 session_id=session_id,
                 include_history=request.include_history,
+                on_phase=_on_phase,
             )
             if result.get("success"):
                 inner = result.get("result", {})
@@ -681,13 +699,19 @@ async def search_codebase(q: str, limit: int = 5):
 
 @app.get("/memory/stats")
 async def get_memory_stats():
-    """Get statistics about the vector store."""
+    """Get statistics about the vector store and MemoryWiki graph (with lint results)."""
     if not _orchestrator:
         raise HTTPException(status_code=503, detail="Agent not initialized")
-    
+
     try:
-        stats = _orchestrator.codebase_memory.get_stats()
-        return stats
+        rag_stats = _orchestrator.codebase_memory.get_stats()
+        wiki_stats = _orchestrator.memory_wiki.get_statistics()
+        lint_results = _orchestrator.memory_wiki.lint()
+        return {
+            "rag": rag_stats,
+            "wiki": wiki_stats,
+            "lint": lint_results,
+        }
     except Exception as e:
         logger.error("stats_failed", error=str(e))
         raise HTTPException(status_code=500, detail=str(e))
@@ -766,8 +790,47 @@ async def get_llm_health():
 
 @app.get("/metrics", include_in_schema=False)
 async def metrics():
-    """Prometheus scrape endpoint."""
+    """Prometheus scrape endpoint (includes FastAPI instrumentation metrics)."""
     return Response(content=generate_latest(), media_type=CONTENT_TYPE_LATEST)
+
+
+@app.get("/environment")
+async def get_environment():
+    """Return detected paths for all external tools (git, Playwright, Node, etc.)."""
+    from agent.tools.environment_probe import get_environment_probe
+    probe = get_environment_probe()
+    return {"platform": probe._platform, "tools": probe.get_all()}
+
+
+@app.post("/environment/reprobe")
+async def reprobe_environment():
+    """Force a fresh tool detection (ignores cached data/environment.json)."""
+    from agent.tools.environment_probe import get_environment_probe
+    probe = get_environment_probe()
+    await asyncio.to_thread(probe.reprobe)
+    return {"tools": probe.get_all()}
+
+
+@app.get("/skills")
+async def list_skills():
+    """List all locally loaded skills."""
+    if not _orchestrator:
+        raise HTTPException(status_code=503, detail="Agent not initialized")
+    skills = _orchestrator.skill_manager.list_skills()
+    return {"skills": skills, "count": len(skills)}
+
+
+@app.post("/skills/fetch")
+async def fetch_remote_skills():
+    """Download skills from the configured remote registry into skills/."""
+    if not _orchestrator:
+        raise HTTPException(status_code=503, detail="Agent not initialized")
+    try:
+        result = await asyncio.to_thread(_orchestrator.skill_manager.fetch_remote)
+        return result
+    except Exception as e:
+        logger.error("skills_fetch_failed", error=str(e))
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 if __name__ == "__main__":

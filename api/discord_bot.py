@@ -371,11 +371,31 @@ async def files(ctx: commands.Context):
     await ctx.send("\n".join(lines))
 
 
+_BINARY_EXTENSIONS = {
+    "png", "jpg", "jpeg", "gif", "bmp", "ico", "svg", "webp",
+    "pdf", "zip", "tar", "gz", "bz2", "7z", "rar",
+    "exe", "dll", "so", "dylib", "bin", "whl",
+    "mp3", "mp4", "wav", "ogg", "avi", "mov",
+    "db", "sqlite", "sqlite3",
+}
+_MAX_ATTACHMENT_BYTES = 7 * 1024 * 1024  # 7 MB (Discord cap is 8 MB)
+
+
 @bot.command(name="show")
 async def show(ctx: commands.Context, *, path: str):
     """View a workspace file. Small files inline, large files as attachment."""
+    path = path.strip()
+
+    # Reject known binary extensions before even fetching
+    ext = path.rsplit(".", 1)[-1].lower() if "." in path else ""
+    if ext in _BINARY_EXTENSIONS:
+        await ctx.send(
+            f"**`{path}`** is a binary file (`{ext}`) and cannot be displayed in Discord."
+        )
+        return
+
     try:
-        data = await bot.client.get_file(path.strip())
+        data = await bot.client.get_file(path)
     except httpx.HTTPStatusError as exc:
         if exc.response.status_code == 404:
             await ctx.send(f"File not found: `{path}`")
@@ -395,8 +415,16 @@ async def show(ctx: commands.Context, *, path: str):
         await ctx.send(f"`{path}` is empty.")
         return
 
+    size_bytes = data.get("size", len(content.encode("utf-8", errors="replace")))
+    if size_bytes > _MAX_ATTACHMENT_BYTES:
+        mb = size_bytes / 1024 / 1024
+        await ctx.send(
+            f"**`{path}`** is too large to upload ({mb:.1f} MB — Discord limit is 8 MB). "
+            f"Access it directly from the workspace."
+        )
+        return
+
     lines_count = data.get("lines", len(content.splitlines()))
-    ext = path.rsplit(".", 1)[-1] if "." in path else ""
     filename = path.replace("\\", "/").split("/")[-1]
 
     if len(content) <= 1800:
@@ -583,6 +611,86 @@ async def switch_model(ctx: commands.Context, *, name: str = ""):
     await ctx.send(f"Switched to `{data.get('active_model', name)}` — {data.get('message', '')}")
 
 
+@bot.command(name="jobs")
+async def list_jobs(ctx: commands.Context, limit: int = 10):
+    """List your recent jobs (newest first). Optionally pass a number: !jobs 20"""
+    from datetime import datetime, timezone
+    try:
+        data = await bot.client._get("/jobs", limit=min(limit, 50))
+    except Exception as exc:
+        await ctx.send(f"Error: {exc}")
+        return
+
+    jobs = data.get("jobs", [])
+    if not jobs:
+        await ctx.send("No jobs found yet. Use `!ask <task>` to start one.")
+        return
+
+    now = datetime.now(timezone.utc)
+    _status_icon = {"done": "✅", "failed": "❌", "running": "⏳",
+                    "cancelled": "🚫", "pending": "⏸️"}
+
+    lines = [f"**Recent jobs** ({len(jobs)}):\n"]
+    for job in jobs:
+        job_id   = job.get("job_id", "?")
+        status   = job.get("status", "?")
+        ttype    = job.get("task_type", "?")
+        preview  = (job.get("task") or "")[:55].replace("\n", " ")
+        created  = job.get("created_at", "")
+        icon     = _status_icon.get(status, "❔")
+
+        age = ""
+        if created:
+            try:
+                dt = datetime.fromisoformat(created.replace("Z", "+00:00"))
+                mins = int((now - dt).total_seconds() // 60)
+                age = f"{mins}m ago" if mins < 60 else f"{mins // 60}h ago"
+            except Exception:
+                pass
+
+        lines.append(f"{icon} `{job_id}` [{ttype}] {age}\n   {preview}…")
+
+    for chunk in _chunk("\n".join(lines)):
+        await ctx.send(chunk)
+
+
+@bot.command(name="skills")
+async def skills_cmd(ctx: commands.Context, action: str = "list"):
+    """Manage agent skills. Usage: !skills  |  !skills fetch"""
+    if action == "fetch":
+        msg = await ctx.send("Fetching skills from remote registry…")
+        try:
+            data = await bot.client._post("/skills/fetch", {}, timeout=30.0)
+            fetched = data.get("fetched", 0)
+            skipped = data.get("skipped", 0)
+            await msg.edit(
+                content=f"Skills updated — {fetched} fetched, {skipped} already current."
+            )
+        except Exception as exc:
+            await msg.edit(content=f"Fetch failed: {exc}")
+        return
+
+    # Default: list loaded skills
+    try:
+        data = await bot.client._get("/skills")
+    except Exception as exc:
+        await ctx.send(f"Error: {exc}")
+        return
+
+    skills = data.get("skills", [])
+    if not skills:
+        await ctx.send(
+            "No skills loaded. Run `!skills fetch` to download from the remote registry."
+        )
+        return
+
+    lines = [f"**{len(skills)} skill(s) loaded:**"]
+    for s in skills:
+        lines.append(f"  `{s['name']}` — {(s.get('description') or '')[:70]}")
+    lines.append("\nUse `!skills fetch` to update from remote.")
+    await ctx.send("\n".join(lines))
+
+
 @bot.command(name="helpme")
 async def helpme(ctx: commands.Context):
     """Show available commands."""
@@ -608,6 +716,12 @@ async def helpme(ctx: commands.Context):
         "`!model` — Show active model\n"
         "`!model <name>` — Switch to a different model\n"
         "`!model reset` — Revert to the default from models.yaml\n\n"
+        "**Jobs:**\n"
+        "`!jobs` — List recent jobs (newest first)\n"
+        "`!jobs 20` — List up to 20 recent jobs\n\n"
+        "**Skills:**\n"
+        "`!skills` — List loaded agent skills\n"
+        "`!skills fetch` — Download latest skills from remote registry\n\n"
         "**Utilities:**\n"
         "`!git <status|log|diff|branch>` — Safe read-only git commands\n"
         "`!helpme` — This help text\n"

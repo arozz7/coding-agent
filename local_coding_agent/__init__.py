@@ -10,6 +10,25 @@ __version__ = "0.1.0"
 _PROJECT_ROOT = Path(__file__).parent.parent
 
 
+def _load_env() -> None:
+    """Load .env from the project root if present.
+
+    Uses python-dotenv so that every ${VAR} reference in config files
+    resolves correctly regardless of how the process was launched.
+    Missing .env is silently ignored — production envs set vars directly.
+    """
+    try:
+        from dotenv import load_dotenv
+        env_path = _PROJECT_ROOT / ".env"
+        load_dotenv(dotenv_path=env_path, override=False)
+    except ImportError:
+        pass  # python-dotenv not installed; rely on the shell environment
+
+
+# Load at import time so env vars are present before any config reads.
+_load_env()
+
+
 def create_agent(
     workspace_path: str = "./workspace",
     config_path: str = "config/models.yaml",
