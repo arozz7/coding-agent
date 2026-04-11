@@ -69,8 +69,13 @@ class ChatRole(AgentRole):
 - Discuss ideas and help users think through problems
 - Give opinions and make recommendations when asked
 
-If the context below includes web search results or fetched page content,
-use that information to give an up-to-date, accurate answer.
+CRITICAL INSTRUCTION — LIVE DATA IN CONTEXT:
+When the message contains a section marked [LIVE WEB SEARCH RESULTS] or
+[FETCHED PAGE CONTENT], those are REAL, CURRENT results retrieved from the
+internet moments ago specifically for this request. You MUST base your answer
+on that data. Do NOT say you cannot access the internet or that you lack
+real-time information — the real-time information is RIGHT THERE in the
+provided context. Summarise, quote, and cite it directly.
 
 You are NOT a code-generation machine. When someone asks a general question,
 explain and discuss — do not turn it into a coding task. Only include code
@@ -105,7 +110,7 @@ focused — no need to pad with caveats or lengthy preambles."""
                 try:
                     fetched = await tool_executor.execute("web_fetch", {"url": url})
                     if fetched and not fetched.startswith("Error"):
-                        web_context += f"\n\n[Fetched: {url}]\n{fetched[:2000]}"
+                        web_context += f"\n\n[FETCHED PAGE CONTENT: {url}]\n{fetched[:2000]}"
                 except Exception:
                     pass
 
@@ -121,15 +126,27 @@ focused — no need to pad with caveats or lengthy preambles."""
                         "web_search", {"query": task[:200], "max_results": 5}
                     )
                     if results and not results.startswith("Error"):
-                        web_context += f"\n\n[Web search results]\n{results[:3000]}"
+                        web_context += f"\n\n[LIVE WEB SEARCH RESULTS]\n{results[:3000]}"
                 except Exception:
                     pass
 
-        prompt = f"""{self.get_system_prompt()}
+        # Put live data BEFORE the question so the model reads it first.
+        if web_context:
+            prompt = f"""{self.get_system_prompt()}
 
-User: {task}
+The following data was retrieved from the internet right now to help answer the user's question:
 {web_context}
 {enriched_context}
+
+User question: {task}
+
+Answer using the live data above. Be specific — cite headlines, scores, or facts directly."""
+        else:
+            prompt = f"""{self.get_system_prompt()}
+
+{enriched_context}
+
+User: {task}
 
 Respond conversationally and helpfully."""
 

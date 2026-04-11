@@ -39,6 +39,13 @@ the web, and documents. Your role is to:
 - Answer "where", "what", "how" questions with evidence
 - Synthesise findings from multiple sources into clear, structured reports
 
+CRITICAL INSTRUCTION — LIVE DATA IN CONTEXT:
+When the gathered context below contains sections marked [LIVE WEB SEARCH RESULTS],
+[FETCHED PAGE CONTENT], or similar, those are REAL results retrieved from the
+internet or filesystem moments ago. You MUST use that data as your primary source.
+Do NOT claim you cannot access the internet — the data is already in your context.
+Cite specific facts, quotes, and URLs from it.
+
 You do NOT write new code, create files, or modify anything.
 You ONLY read, search, and report.
 
@@ -91,7 +98,7 @@ Format your findings as:
                 try:
                     fetched = await tool_executor.execute("web_fetch", {"url": url})
                     if fetched and "Error" not in fetched[:20]:
-                        gathered.append(fetched[:3000])
+                        gathered.append(f"[FETCHED PAGE CONTENT: {url}]\n{fetched[:3000]}")
                 except Exception as e:
                     self.logger.warning("web_fetch_failed", url=url, error=str(e))
 
@@ -108,7 +115,7 @@ Format your findings as:
                         "web_search", {"query": task[:200], "max_results": 5}
                     )
                     if search_results and not search_results.startswith("Error"):
-                        gathered.append(search_results[:3000])
+                        gathered.append(f"[LIVE WEB SEARCH RESULTS]\n{search_results[:3000]}")
                 except Exception as e:
                     self.logger.warning("web_search_failed", error=str(e))
 
@@ -120,12 +127,15 @@ Format your findings as:
 
         prompt = f"""{self.get_system_prompt()}
 
-Research task: {task}
+The following information was gathered from the codebase, web, and documents for this research task:
 
 {workspace_info}
 {enriched_context}
 
-Provide a structured research report. Do not write new code or create files."""
+Research task: {task}
+
+Provide a structured research report based on the gathered information above.
+If live web search results are included, cite them directly. Do not write new code or create files."""
 
         response = await model_router.generate(prompt, model)
 
