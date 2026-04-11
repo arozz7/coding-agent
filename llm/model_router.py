@@ -41,18 +41,26 @@ class ModelRouter:
 
     @staticmethod
     def _expand_env(value: Optional[str]) -> Optional[str]:
-        """Expand ${VAR} references in a string using os.environ.
+        """Expand ${VAR} and ${VAR:-default} references using os.environ.
 
-        Unknown variables are left as-is so misconfigured names are visible
-        in logs rather than silently becoming empty strings.
+        Syntax:
+          ${VAR}          — replaced by env value; left as-is if unset
+          ${VAR:-default} — replaced by env value; falls back to *default* if unset
+
+        Using ${VAR:-default} in config files means the system works with no
+        .env file — the explicit default is used and no URL stays unexpanded.
         """
         if not value or "${" not in value:
             return value
-        return re.sub(
-            r"\$\{([^}]+)\}",
-            lambda m: os.environ.get(m.group(1), m.group(0)),
-            value,
-        )
+
+        def _replacer(m: re.Match) -> str:
+            spec = m.group(1)
+            if ":-" in spec:
+                var, default = spec.split(":-", 1)
+                return os.environ.get(var.strip(), default)
+            return os.environ.get(spec, m.group(0))  # leave placeholder if unset
+
+        return re.sub(r"\$\{([^}]+)\}", _replacer, value)
 
     def _load_configs(self, path: str) -> None:
         config_file = Path(path)
