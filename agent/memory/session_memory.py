@@ -151,6 +151,77 @@ class SessionMemory:
             for r, c, t, m, ts in messages
         ]
 
+    def get_events(
+        self, session_id: str, offset: int = 0, limit: int = 100
+    ) -> List[dict]:
+        """Query events by offset/limit for external session access.
+        
+        This enables the 'brain' to programmatically interrogate context
+        without stuffing all history into the context window.
+        
+        Example:
+            - get_events(id, 0, 50) - first 50 events
+            - get_events(id, 100, 50) - events 100-149
+            - get_events(id, -50, None) - last 50 events
+        """
+        cursor = self.conn.cursor()
+        
+        if offset < 0:
+            cursor.execute(
+                """
+                SELECT role, content, tokens_used, model_name, timestamp, tool_calls
+                FROM messages
+                WHERE session_id = ?
+                ORDER BY timestamp DESC
+                LIMIT ?
+            """,
+                (session_id, abs(offset)),
+            )
+            rows = cursor.fetchall()
+            return list(reversed([
+                {
+                    "role": r,
+                    "content": c,
+                    "tokens": t,
+                    "model": m,
+                    "timestamp": ts,
+                    "tool_calls": json.loads(tc) if tc else None,
+                }
+                for r, c, t, m, ts, tc in rows
+            ]))
+        else:
+            cursor.execute(
+                """
+                SELECT role, content, tokens_used, model_name, timestamp, tool_calls
+                FROM messages
+                WHERE session_id = ?
+                ORDER BY timestamp ASC
+                LIMIT ? OFFSET ?
+            """,
+                (session_id, limit, offset),
+            )
+            rows = cursor.fetchall()
+            return [
+                {
+                    "role": r,
+                    "content": c,
+                    "tokens": t,
+                    "model": m,
+                    "timestamp": ts,
+                    "tool_calls": json.loads(tc) if tc else None,
+                }
+                for r, c, t, m, ts, tc in rows
+            ]
+
+    def get_event_count(self, session_id: str) -> int:
+        """Get total number of events in a session."""
+        cursor = self.conn.cursor()
+        cursor.execute(
+            "SELECT COUNT(*) FROM messages WHERE session_id = ?",
+            (session_id,),
+        )
+        return cursor.fetchone()[0]
+
     def update_task_status(
         self,
         session_id: str,
@@ -287,6 +358,43 @@ class SessionMemory:
             (status, session_id),
         )
         self.conn.commit()
+
+    def emit_event(self, session_id: str, event_type: str, data: dict) -> None:
+        """Persist a structured execution event for observability and crash recovery.
+
+        Follows the Anthropic Managed Agents emitEvent(id, event) pattern.
+        Events are stored in the messages table with role='event:<type>' so that
+        get_events() returns them in chronological order alongside user/assistant turns.
+
+        Args:
+            session_id:  The active session.
+            event_type:  One of 'tool_call', 'tool_result', 'file_write',
+                         'shell_run', 'status'.
+            data:        Arbitrary dict serialised to JSON as the content.
+        """
+        self.save_message(
+            session_id=session_id,
+            role=f"event:{event_type}",
+            content=json.dumps(data),
+        )
+
+    def delete_session(self, session_id: str) -> bool:
+        """Delete a session and all its messages and tasks.
+
+        Returns True if the session existed and was removed, False otherwise.
+        """
+        cursor = self.conn.cursor()
+        cursor.execute("SELECT id FROM sessions WHERE id = ?", (session_id,))
+        if not cursor.fetchone():
+            self.logger.warning("delete_session_not_found", session_id=session_id)
+            return False
+
+        cursor.execute("DELETE FROM messages WHERE session_id = ?", (session_id,))
+        cursor.execute("DELETE FROM tasks WHERE session_id = ?", (session_id,))
+        cursor.execute("DELETE FROM sessions WHERE id = ?", (session_id,))
+        self.conn.commit()
+        self.logger.info("session_deleted", session_id=session_id)
+        return True
 
     def close(self) -> None:
         self.conn.close()

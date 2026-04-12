@@ -22,3 +22,6 @@ build/
 
 # Claude worktrees (embedded repos)
 .claude/worktrees/
+
+# Agent runtime workspace (generated code, not source)
+workspace/

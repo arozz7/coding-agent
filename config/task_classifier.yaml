@@ -1,0 +1,31 @@
+# Task type classifier configuration.
+# The prompt is sent to the active LLM with a 3-second timeout.
+# On timeout or any error the keyword fallback is used instead.
+
+valid_types:
+  - plan      # User wants a plan/blueprint BEFORE any code is written
+  - develop   # Write, create, fix, or modify source code / files
+  - review    # Code review, security audit, critique
+  - test      # Write or run tests (pytest, unit tests)
+  - architect # System design, architecture decisions, ADRs
+  - research  # Read-only investigation of the codebase or web
+  - chat      # General questions, explanations, conversation
+
+timeout_seconds: 3
+
+prompt: |
+  Classify the following task into exactly one of these task types:
+
+    plan      - User explicitly wants a plan, blueprint, or outline FIRST before any code is written
+                (phrases: "plan first", "solid plan", "show me a plan", "want to plan", "planning phase",
+                "let's plan", "before we build", "roadmap", "outline the approach")
+    develop   - Write, create, fix, update, implement, or refactor source code or files
+    review    - Review code, perform a security audit, or critique existing code
+    test      - Write or run tests (unit tests, pytest, test suites)
+    architect - High-level system design, create ADRs, design patterns
+    research  - Read-only investigation of the codebase, explain how code works, search for something
+    chat      - General questions, explanations, conversation, anything else
+
+  Task: {task}
+
+  Reply with ONLY the task type name (one word, lowercase). No explanation.

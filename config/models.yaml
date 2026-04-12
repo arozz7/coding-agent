@@ -1,11 +1,68 @@
 models:
   - name: qwen3.5-35b-a3b
     type: local
-    endpoint: http://127.0.0.1:1234
+    # Set LM_STUDIO_URL in .env to override; falls back to localhost:1234
+    endpoint: ${LM_STUDIO_URL:-http://127.0.0.1:1234}
     context_window: 262144
     is_coding_optimized: true
-    recommended_for: [coding, code_review, test_generation, planning]
+    recommended_for: [coding, code_review, test_generation, planning, research]
     rate_limit_rpm: 120
+
+  - name: google_gemma-4-31b-it
+    type: local
+    endpoint: ${LM_STUDIO_URL:-http://127.0.0.1:1234}
+    context_window: 262144
+    is_coding_optimized: true
+    recommended_for: [coding, code_review, test_generation, planning, research]
+    rate_limit_rpm: 120
+
+  # ---- OpenRouter models (set OPENROUTER_API_KEY in .env to activate) ----
+  # OpenRouter speaks the OpenAI-compatible /v1/chat/completions API.
+  # Use any model slug from https://openrouter.ai/models as the `name`.
+  - name: google/gemma-4-31b-it:free
+    type: remote
+    endpoint: https://openrouter.ai/api/v1
+    api_key_env: OPENROUTER_API_KEY
+    context_window: 262144
+    is_coding_optimized: true
+    recommended_for: [coding, code_review, planning, research, chat]
+    rate_limit_rpm: 60
+
+  - name: google/gemma-4-26b-a4b-it:free
+    type: remote
+    endpoint: https://openrouter.ai/api/v1
+    api_key_env: OPENROUTER_API_KEY
+    context_window: 262144
+    is_coding_optimized: true
+    recommended_for: [coding, code_review, planning, research, chat]
+    rate_limit_rpm: 60
+
+  - name: openai/gpt-oss-120b:free
+    type: remote
+    endpoint: https://openrouter.ai/api/v1
+    api_key_env: OPENROUTER_API_KEY
+    context_window: 131100
+    is_coding_optimized: true
+    recommended_for: [coding, code_review, planning, research, chat]
+    rate_limit_rpm: 60
+    
+  - name: minimax/minimax-m2.5:free
+    type: remote
+    endpoint: https://openrouter.ai/api/v1
+    api_key_env: OPENROUTER_API_KEY
+    context_window: 196000
+    is_coding_optimized: true
+    recommended_for: [coding, code_review, planning, research, chat]
+    rate_limit_rpm: 60
+
+  - name: openrouter/free
+    type: remote
+    endpoint: https://openrouter.ai/api/v1
+    api_key_env: OPENROUTER_API_KEY
+    context_window: 200000
+    is_coding_optimized: true
+    recommended_for: [coding, code_review, planning, research, chat]
+    rate_limit_rpm: 60
 
 rate_limiting:
   global_rpm: 100
@@ -16,4 +73,4 @@ rate_limiting:
 defaults:
   coding_model: qwen3.5-35b-a3b
   planning_model: qwen3.5-35b-a3b
-  fallback_model: qwen3.5-35b-a3b
+  fallback_model: google/gemma-4-31b-it:free

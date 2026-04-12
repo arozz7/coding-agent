@@ -79,11 +79,28 @@ models:
 
 ### Remote API Configuration
 
-For cloud APIs, add your API key via environment:
+For cloud APIs, add keys to your `.env` file (copy `.env.example` to get started):
 
-```powershell
-$env:ANTHROPIC_API_KEY = "your-key-here"
-$env:OPENAI_API_KEY = "your-key-here"
+```dotenv
+# OpenRouter — access 200+ cloud models via a single key
+OPENROUTER_API_KEY=sk-or-...
+
+# Brave Search — primary web search (2 000 free queries/month)
+BRAVE_SEARCH_API_KEY=BSAx...
+
+# Google Custom Search — last resort (deprecated for full-web as of Jan 2026)
+# GOOGLE_SEARCH_API_KEY=
+# GOOGLE_SEARCH_CX=
+```
+
+Then reference keys from `config/models.yaml` using the `api_key_env` field:
+
+```yaml
+models:
+  - name: google/gemma-4-31b-it:free
+    type: remote
+    endpoint: https://openrouter.ai/api/v1
+    api_key_env: OPENROUTER_API_KEY
 ```
 
 ---
@@ -307,9 +324,24 @@ List branches.
    curl http://127.0.0.1:1234/v1/models
    ```
 
-#### "Rate limit exceeded"
+#### "Rate limit exceeded" (cloud models)
 
-**Solution:** Wait a moment, or adjust `rate_limit_rpm` in config.
+The agent automatically falls back to your local model when a cloud provider returns
+429. No action needed — the fallback is logged as `using_local_fallback`.
+To reduce rate limiting, adjust `rate_limit_rpm` in `config/models.yaml`.
+
+#### Web search returns no results or wrong results
+
+The search chain tries providers in order: **Brave → DuckDuckGo → Playwright Google → Google CSE**.
+
+- **Brave key invalid / quota exhausted** — falls back automatically to DuckDuckGo.
+- **DuckDuckGo blocked** — falls back to Playwright Google (uses your Chromium install).
+- **Search gives outdated results for "last night" / "today" queries** — the agent
+  automatically appends the current date to relative-date queries. Confirm the
+  server was restarted after the latest update.
+- **Google CSE 403** — Google deprecated full-web search for Programmable Search Engine
+  as of January 2026. Existing "Search entire web" engines work until January 2027.
+  Switch to Brave Search API for a long-term solution.
 
 #### "Session not found"
 
@@ -383,4 +415,4 @@ For issues or feature requests, check:
 
 ---
 
-*Last updated: 2026-04-10*
+*Last updated: 2026-04-12*

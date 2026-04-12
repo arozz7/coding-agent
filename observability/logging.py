@@ -54,11 +54,16 @@ class AgentLogger:
         response_length: int,
         latency_ms: float,
     ) -> None:
+        # prompt_length / response_length may arrive as character counts (int)
+        # or as pre-computed token counts. Estimate tokens only from strings.
+        def _to_tokens(val: int) -> int:
+            return val // 4 if isinstance(val, int) else len(str(val)) // 4
+
         self.logger.info(
             "llm_call",
             model=model,
-            prompt_tokens=prompt_length // 4,
-            response_tokens=response_length // 4,
+            prompt_tokens=_to_tokens(prompt_length),
+            response_tokens=_to_tokens(response_length),
             latency_ms=round(latency_ms, 2),
         )
 

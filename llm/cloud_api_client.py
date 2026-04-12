@@ -9,25 +9,51 @@ if TYPE_CHECKING:
 logger = structlog.get_logger()
 
 
+_OPENROUTER_BASE = "https://openrouter.ai/api/v1"
+_OPENROUTER_REFERER = "http://localhost"  # satisfies OpenRouter's HTTP-Referer requirement
+_OPENROUTER_TITLE = "local-coding-agent"
+
+
+class _OpenRouterRateLimitError(Exception):
+    """Raised when OpenRouter responds with 429. Carries retry_after seconds."""
+    def __init__(self, retry_after: int = 0):
+        self.retry_after = retry_after
+        super().__init__(f"429 Too Many Requests (retry after {retry_after}s)")
+
+
 class CloudAPIClient:
     def __init__(self):
         self.logger = logger.bind(component="cloud_api_client")
 
+    def _endpoint_type(self, config: "ModelConfig") -> str:
+        ep = (config.endpoint or "").lower()
+        if "anthropic" in ep:
+            return "anthropic"
+        if "openrouter.ai" in ep:
+            return "openrouter"
+        if "openai" in ep:
+            return "openai"
+        return "openai"  # default to OpenAI-compatible for unknown endpoints
+
     async def generate(self, prompt: str, config: "ModelConfig") -> str:
-        if "anthropic" in (config.endpoint or ""):
+        kind = self._endpoint_type(config)
+        if kind == "anthropic":
             return await self._anthropic_generate(prompt, config)
-        elif "openai" in (config.endpoint or ""):
-            return await self._openai_generate(prompt, config)
-        else:
-            raise ValueError(f"Unsupported cloud API: {config.endpoint}")
+        if kind == "openrouter":
+            return await self._openrouter_generate(prompt, config)
+        return await self._openai_generate(prompt, config)
 
     async def stream_generate(
         self, prompt: str, config: "ModelConfig"
     ) -> AsyncIterator[str]:
-        if "anthropic" in (config.endpoint or ""):
+        kind = self._endpoint_type(config)
+        if kind == "anthropic":
             async for chunk in self._anthropic_stream(prompt, config):
                 yield chunk
-        elif "openai" in (config.endpoint or ""):
+        elif kind == "openrouter":
+            async for chunk in self._openrouter_stream(prompt, config):
+                yield chunk
+        else:
             async for chunk in self._openai_stream(prompt, config):
                 yield chunk
 
@@ -135,6 +161,65 @@ class CloudAPIClient:
                             "content"
                         ):
                             yield content
+
+    async def _openrouter_generate(self, prompt: str, config: "ModelConfig") -> str:
+        headers = {
+            "Authorization": f"Bearer {config.api_key or ''}",
+            "HTTP-Referer": _OPENROUTER_REFERER,
+            "X-Title": _OPENROUTER_TITLE,
+            "content-type": "application/json",
+        }
+        payload = {
+            "model": config.name,
+            "messages": [{"role": "user", "content": prompt}],
+        }
+
+        async with httpx.AsyncClient(timeout=120.0) as client:
+            response = await client.post(
+                f"{_OPENROUTER_BASE}/chat/completions",
+                headers=headers,
+                json=payload,
+            )
+            if response.status_code == 429:
+                retry_after = int(response.headers.get("retry-after", 0))
+                raise _OpenRouterRateLimitError(retry_after=retry_after)
+            response.raise_for_status()
+            data = response.json()
+            return data["choices"][0]["message"]["content"]
+
+    async def _openrouter_stream(
+        self, prompt: str, config: "ModelConfig"
+    ) -> AsyncIterator[str]:
+        headers = {
+            "Authorization": f"Bearer {config.api_key or ''}",
+            "HTTP-Referer": _OPENROUTER_REFERER,
+            "X-Title": _OPENROUTER_TITLE,
+            "content-type": "application/json",
+        }
+        payload = {
+            "model": config.name,
+            "messages": [{"role": "user", "content": prompt}],
+            "stream": True,
+        }
+
+        async with httpx.AsyncClient(timeout=120.0) as client:
+            async with client.stream(
+                "POST",
+                f"{_OPENROUTER_BASE}/chat/completions",
+                headers=headers,
+                json=payload,
+            ) as response:
+                response.raise_for_status()
+                async for line in response.aiter_lines():
+                    if line.startswith("data:"):
+                        if line.strip() == "data: [DONE]":
+                            break
+                        try:
+                            data = json.loads(line[5:])
+                            if content := data["choices"][0].get("delta", {}).get("content"):
+                                yield content
+                        except (json.JSONDecodeError, KeyError, IndexError):
+                            pass
 
     async def health_check(self, endpoint: str) -> bool:
         try:

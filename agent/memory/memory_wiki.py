@@ -252,6 +252,94 @@ class MemoryWiki:
             "statistics": self.get_statistics(),
         }
 
+    def lint(self) -> dict:
+        """Analyse the graph for structural issues.
+
+        Checks performed:
+          1. Orphan nodes — nodes with no edges (neither imported nor containing anything).
+          2. Duplicate function names — same bare name defined in multiple *unrelated* files.
+          3. Duplicate class names — same bare name defined in multiple *unrelated* files.
+
+        Two files are considered "related" if either imports the other (import edge exists).
+
+        Returns a dict with ``issues`` list and summary counts.
+        """
+        from collections import defaultdict
+
+        issues: list[dict] = []
+
+        # 1. Orphan nodes
+        for node in self.graph.nodes():
+            if self.graph.degree(node) == 0:
+                issues.append({"type": "orphan", "node": node})
+
+        # 2 & 3. Duplicate names across unrelated files
+        func_by_name: dict[str, list[dict]] = defaultdict(list)
+        class_by_name: dict[str, list[dict]] = defaultdict(list)
+
+        for node_id, data in self.graph.nodes(data=True):
+            ntype = data.get("type")
+            if ntype == "function":
+                bare = node_id.split(":")[-1]
+                func_by_name[bare].append({"node_id": node_id, "file": data.get("file_path", "")})
+            elif ntype == "class":
+                bare = node_id.split(":")[-1]
+                class_by_name[bare].append({"node_id": node_id, "file": data.get("file_path", "")})
+
+        for name, occurrences in func_by_name.items():
+            if len(occurrences) < 2:
+                continue
+            files = [o["file"] for o in occurrences]
+            if not self._files_are_related(files):
+                issues.append({
+                    "type": "duplicate_function",
+                    "name": name,
+                    "files": files,
+                    "message": f"Function '{name}' defined in {len(files)} unrelated files",
+                })
+
+        for name, occurrences in class_by_name.items():
+            if len(occurrences) < 2:
+                continue
+            files = [o["file"] for o in occurrences]
+            if not self._files_are_related(files):
+                issues.append({
+                    "type": "duplicate_class",
+                    "name": name,
+                    "files": files,
+                    "message": f"Class '{name}' defined in {len(files)} unrelated files",
+                })
+
+        return {
+            "issues": issues,
+            "issue_count": len(issues),
+            "orphans": sum(1 for i in issues if i["type"] == "orphan"),
+            "duplicate_functions": sum(1 for i in issues if i["type"] == "duplicate_function"),
+            "duplicate_classes": sum(1 for i in issues if i["type"] == "duplicate_class"),
+        }
+
+    def _files_are_related(self, files: list) -> bool:
+        """Return True if any pair of files has a direct import relationship."""
+        for i, f1 in enumerate(files):
+            for f2 in files[i + 1:]:
+                # Check import nodes: f1→import→f2 or f2→import→f1
+                for node in self.graph.successors(f1):
+                    nd = self.graph.nodes.get(node, {})
+                    if nd.get("type") == "import":
+                        module = nd.get("to_module", "")
+                        # Normalise: a/b/c.py → a.b.c
+                        f2_module = f2.replace("\\", "/").replace("/", ".").rstrip(".py")
+                        if module and (f2_module.endswith(module) or module.endswith(f2_module)):
+                            return True
+                for node in self.graph.successors(f2):
+                    nd = self.graph.nodes.get(node, {})
+                    if nd.get("type") == "import":
+                        module = nd.get("to_module", "")
+                        f1_module = f1.replace("\\", "/").replace("/", ".").rstrip(".py")
+                        if module and (f1_module.endswith(module) or module.endswith(f1_module)):
+                            return True
+        return False
+
     def clear(self) -> None:
         self.graph.clear()
         self._file_nodes.clear()

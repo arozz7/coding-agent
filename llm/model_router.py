@@ -1,3 +1,5 @@
+import os
+import re
 from typing import Optional, List, AsyncIterator
 from pathlib import Path
 import yaml
@@ -5,10 +7,11 @@ import structlog
 
 from .config import ModelConfig
 from .ollama_client import OllamaClient
-from .cloud_api_client import CloudAPIClient
+from .cloud_api_client import CloudAPIClient, _OpenRouterRateLimitError
 from .cost_tracker import CostTracker
 from .rate_limiter import RateLimiter, RateLimitExceeded
-from .health import HealthChecker, CircuitBreakerOpenError
+from .health import HealthChecker
+from .circuit_breaker import CircuitBreakerOpenError
 
 logger = structlog.get_logger()
 
@@ -23,6 +26,8 @@ class ModelRouter:
         self.rate_limiter = RateLimiter()
         self.health_checker = HealthChecker(self)
         self.logger = logger.bind(component="model_router")
+        self._defaults: dict = {}
+        self._active_model_name: Optional[str] = None
         self._load_configs(config_path)
 
     def _configure_ollama_endpoint(self, config: ModelConfig) -> None:
@@ -34,19 +39,56 @@ class ModelRouter:
                 url=config.endpoint,
             )
 
+    @staticmethod
+    def _expand_env(value: Optional[str]) -> Optional[str]:
+        """Expand ${VAR} and ${VAR:-default} references using os.environ.
+
+        Syntax:
+          ${VAR}          — replaced by env value; left as-is if unset
+          ${VAR:-default} — replaced by env value; falls back to *default* if unset
+
+        Using ${VAR:-default} in config files means the system works with no
+        .env file — the explicit default is used and no URL stays unexpanded.
+        """
+        if not value or "${" not in value:
+            return value
+
+        def _replacer(m: re.Match) -> str:
+            spec = m.group(1)
+            if ":-" in spec:
+                var, default = spec.split(":-", 1)
+                return os.environ.get(var.strip(), default)
+            return os.environ.get(spec, m.group(0))  # leave placeholder if unset
+
+        return re.sub(r"\$\{([^}]+)\}", _replacer, value)
+
     def _load_configs(self, path: str) -> None:
         config_file = Path(path)
         if not config_file.exists():
-            self.logger.warning("config_not_found", path=path)
+            self.logger.error(
+                "config_not_found",
+                path=str(config_file.resolve()),
+                hint="Check that config/models.yaml exists at the project root",
+            )
             return
 
         with open(config_file) as f:
             data = yaml.safe_load(f)
 
+        self._defaults = data.get("defaults", {})
+
         for m in data.get("models", []):
-            config = ModelConfig(**m)
+            try:
+                # Expand ${ENV_VAR} references before constructing the config
+                m_expanded = {
+                    k: (self._expand_env(v) if isinstance(v, str) else v)
+                    for k, v in m.items()
+                }
+                config = ModelConfig(**m_expanded)
+            except Exception as e:
+                self.logger.error("model_config_invalid", entry=m, error=str(e))
+                continue
             if config.api_key_env:
-                import os
                 config.api_key = os.environ.get(config.api_key_env)
             self.configs.append(config)
             self.config_by_name[config.name] = config
@@ -54,23 +96,99 @@ class ModelRouter:
             if config.type == "local" and config.endpoint:
                 self._configure_ollama_endpoint(config)
 
-        self.logger.info("configs_loaded", count=len(self.configs))
+        # Honour the defaults.coding_model setting as the initial active model
+        default_name = self._defaults.get("coding_model")
+        if default_name and default_name in self.config_by_name:
+            self._active_model_name = default_name
+
+        self.logger.info(
+            "configs_loaded",
+            count=len(self.configs),
+            active=self._active_model_name,
+            path=str(config_file.resolve()),
+        )
 
     def get_model(self, purpose: str = "general") -> Optional[ModelConfig]:
+        """Return the model to use for *purpose*.
+
+        Priority:
+          1. Explicitly set active model (_active_model_name)
+          2. Default from models.yaml [defaults] section for this purpose
+          3. First model with is_coding_optimized = true (for coding purposes)
+          4. First model in the list
+        """
+        if not self.configs:
+            return None
+
+        # 1. Explicit active model
+        if self._active_model_name and self._active_model_name in self.config_by_name:
+            return self.config_by_name[self._active_model_name]
+
+        # 2. Purpose-specific default from YAML
+        purpose_key = f"{purpose}_model"
+        default_name = self._defaults.get(purpose_key)
+        if default_name and default_name in self.config_by_name:
+            return self.config_by_name[default_name]
+
+        # 3. First coding-optimized model for coding purposes
         if purpose == "coding":
             for config in self.configs:
                 if config.is_coding_optimized:
                     return config
-        return self.configs[0] if self.configs else None
+
+        # 4. First available
+        return self.configs[0]
 
     def get_config(self, name: str) -> Optional[ModelConfig]:
         return self.config_by_name.get(name)
+
+    def set_active_model(self, name: str) -> ModelConfig:
+        """Set the model that will be used for all requests until changed.
+
+        Raises ValueError if *name* is not in the loaded config.
+        """
+        if name not in self.config_by_name:
+            available = list(self.config_by_name.keys())
+            raise ValueError(f"Unknown model '{name}'. Available: {available}")
+        self._active_model_name = name
+        config = self.config_by_name[name]
+        if config.type == "local" and config.endpoint:
+            self._configure_ollama_endpoint(config)
+        self.logger.info("active_model_changed", model=name)
+        return config
+
+    def get_active_model_name(self) -> Optional[str]:
+        """Return the name of the currently active model, or None if using defaults."""
+        return self._active_model_name
+
+    def clear_active_model(self) -> None:
+        """Revert to the default model selection from models.yaml."""
+        self._active_model_name = self._defaults.get("coding_model")
+        self.logger.info("active_model_reset", model=self._active_model_name)
+
+    def _get_local_fallback(self, exclude_name: str) -> Optional[ModelConfig]:
+        """Return the first healthy local model that is not *exclude_name*."""
+        for cfg in self.configs:
+            if cfg.type == "local" and cfg.name != exclude_name:
+                return cfg
+        # If nothing else, use any local model (even the same name — better than failing)
+        for cfg in self.configs:
+            if cfg.type == "local":
+                return cfg
+        return None
+
+    @staticmethod
+    def _is_rate_limit_error(exc: Exception) -> bool:
+        """Return True if *exc* is a 429 response from a remote API."""
+        msg = str(exc)
+        return "429" in msg and ("Too Many Requests" in msg or "rate" in msg.lower())
 
     async def generate(
         self,
         prompt: str,
         config: ModelConfig,
         max_retries: int = 3,
+        _is_fallback: bool = False,
     ) -> str:
         await self.rate_limiter.acquire(config.name)
 
@@ -100,7 +218,36 @@ class ModelRouter:
                 self.logger.warning("circuit_breaker_open", model=config.name)
                 raise
 
+            except _OpenRouterRateLimitError as e:
+                # OpenRouter 429 — respect Retry-After, then fall back to local
+                self.logger.warning(
+                    "openrouter_rate_limited",
+                    model=config.name,
+                    retry_after=e.retry_after,
+                )
+                self.health_checker.record_rate_limit(config.name)
+                if not _is_fallback:
+                    fallback = self._get_local_fallback(config.name)
+                    if fallback:
+                        self.logger.info("using_local_fallback", fallback=fallback.name)
+                        return await self.generate(prompt, fallback, max_retries=max_retries, _is_fallback=True)
+                raise LLMError(f"OpenRouter model {config.name!r} is rate-limited and no local fallback available") from e
+
             except Exception as e:
+                # Generic 429 string match (other remote providers)
+                if self._is_rate_limit_error(e) and config.type != "local" and not _is_fallback:
+                    self.logger.warning(
+                        "remote_rate_limited_falling_back",
+                        model=config.name,
+                        error=str(e)[:120],
+                    )
+                    self.health_checker.record_rate_limit(config.name)
+                    fallback = self._get_local_fallback(config.name)
+                    if fallback:
+                        self.logger.info("using_local_fallback", fallback=fallback.name)
+                        return await self.generate(prompt, fallback, max_retries=max_retries, _is_fallback=True)
+                    raise LLMError(f"Remote model {config.name!r} is rate-limited and no local fallback available") from e
+
                 self.logger.error(
                     "llm_error",
                     model=config.name,

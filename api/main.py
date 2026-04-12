@@ -1,14 +1,57 @@
-from fastapi import FastAPI, HTTPException, BackgroundTasks
+from fastapi import FastAPI, HTTPException, BackgroundTasks, Response
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-from typing import Optional, List
+from typing import Optional, List, Dict
+from prometheus_client import generate_latest, CONTENT_TYPE_LATEST
+import uuid
+import re
+from datetime import datetime
 import asyncio
 import structlog
 
 from llm import ModelRouter
 from agent.orchestrator import AgentOrchestrator
+from api.job_store import JobStore
 
 logger = structlog.get_logger()
+
+# Environment variables
+import os
+from pathlib import Path
+
+WORKSPACE_PATH = os.getenv("WORKSPACE_PATH", os.path.abspath("./workspace"))
+
+# Security: Disallowed paths (critical system folders)
+DISALLOWED_PATHS = [
+    "C:\\Windows",
+    "C:\\Program Files",
+    "C:\\Program Files (x86)",
+    "C:\\ProgramData",
+    "C:\\System32",
+    "C:\\SysWOW64",
+    "C:\\Users\\Public",
+    "/Windows",
+    "/System",
+    "/Library",
+    "/System32",
+    "/usr/bin",
+    "/usr/local/bin",
+    "/bin",
+    "/sbin",
+]
+
+def _is_path_allowed(path: str) -> bool:
+    """Check if path is not a critical system folder"""
+    abs_path = str(Path(path).resolve())  # lgtm[py/path-injection]
+    
+    for disallowed in DISALLOWED_PATHS:
+        if abs_path.lower().startswith(disallowed.lower()):
+            return False
+    return True
+
+# Ensure workspace exists
+Path(WORKSPACE_PATH).mkdir(parents=True, exist_ok=True)
+
 
 app = FastAPI(
     title="Local Coding Agent API",
@@ -16,12 +59,43 @@ app = FastAPI(
     version="0.1.0",
 )
 
+# Per-route request count, latency histogram, and in-flight gauge.
+# Metrics are exposed via the existing /metrics endpoint (generate_latest()).
+try:
+    from prometheus_fastapi_instrumentator import Instrumentator
+    Instrumentator(
+        should_group_status_codes=True,
+        should_ignore_untemplated=True,
+        excluded_handlers=["/metrics", "/health"],
+    ).instrument(app)
+except ImportError:
+    pass  # Optional dependency — degrades gracefully if not installed
+
+# CORS: default to localhost only; override via CORS_ORIGINS env var
+# (comma-separated list of allowed origins).
+# Never use allow_origins=["*"] with allow_credentials=True — that is
+# an invalid combination that enables CSRF on permissive clients.
+_default_origins = [
+    "http://localhost:3000",
+    "http://localhost:5005",
+    "http://localhost:8080",
+    "http://127.0.0.1:3000",
+    "http://127.0.0.1:5005",
+    "http://127.0.0.1:8080",
+]
+_cors_origins_env = os.getenv("CORS_ORIGINS", "")
+CORS_ORIGINS = (
+    [o.strip() for o in _cors_origins_env.split(",") if o.strip()]
+    if _cors_origins_env
+    else _default_origins
+)
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_origins=CORS_ORIGINS,
+    allow_credentials=False,
+    allow_methods=["GET", "POST", "DELETE", "OPTIONS"],
+    allow_headers=["Content-Type", "Authorization"],
 )
 
 
@@ -47,17 +121,33 @@ class SessionInfo(BaseModel):
 
 _model_router: Optional[ModelRouter] = None
 _orchestrator: Optional[AgentOrchestrator] = None
+_current_workspace: str = WORKSPACE_PATH
+
+# SQLite-backed job store (write-through, in-memory hot cache)
+_job_store: JobStore = JobStore("data/jobs.db")
+
+
+def _summarize_response(text: str, max_chars: int = 500) -> str:
+    """Strip fenced code blocks and return a short prose summary."""
+    prose = re.sub(r'```[\s\S]*?```', '', text).strip()
+    prose = re.sub(r'\n{3,}', '\n\n', prose)
+    if len(prose) > max_chars:
+        return prose[:max_chars].rstrip() + "…"
+    return prose or "(task completed)"
 
 
 @app.on_event("startup")
 async def startup_event():
-    global _model_router, _orchestrator
+    global _model_router, _orchestrator, _current_workspace
     from local_coding_agent import create_agent
-    
-    logger.info("starting_api", component="api")
-    
+
+    logger.info("starting_api", component="api", workspace=WORKSPACE_PATH)
+
+    # Restore persisted jobs; mark stale running jobs as failed
+    _job_store.load()
+
     try:
-        _orchestrator = create_agent("./workspace", "config/models.yaml")
+        _orchestrator = create_agent(WORKSPACE_PATH, "config/models.yaml")
         logger.info("agent_initialized")
     except Exception as e:
         logger.error("agent_init_failed", error=str(e))
@@ -100,8 +190,151 @@ async def run_task(request: TaskRequest):
         )
         
     except Exception as e:
-        logger.error("task_failed", error=str(e))
+        import traceback
+        logger.error("task_failed", error=str(e), traceback=traceback.format_exc())
         raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/task/start")
+async def start_task_background(request: TaskRequest):
+    """Submit a task and return a job_id immediately. Poll GET /task/{job_id} for status."""
+    if not _orchestrator:
+        raise HTTPException(status_code=503, detail="Agent not initialized")
+
+    job_id = f"job_{uuid.uuid4().hex[:12]}"
+    session_id = request.session_id or f"session_{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}"
+
+    # Use keyword classifier for instant response (0 ms) — the LLM classifier
+    # runs later inside run_task() in parallel with context building.
+    task_type = _orchestrator._detect_task_type_keyword(request.task)
+    _phase_labels = {
+        "develop": "developing",
+        "review": "reviewing",
+        "test": "testing",
+        "architect": "designing",
+        "research": "researching",
+        "chat": "thinking",
+    }
+    _phase_label = _phase_labels.get(task_type, "working")
+
+    _job_store.create(
+        job_id=job_id,
+        session_id=session_id,
+        task=request.task,
+        task_type=task_type,
+        phase=_phase_label,
+    )
+
+    def _on_phase(label: str) -> None:
+        """Callback fired by run_task() at each milestone to update job phase."""
+        _job_store.update(job_id, phase=label)
+
+    async def _run():
+        _job_store.update(job_id, status="running")
+        try:
+            result = await _orchestrator.run_task(
+                task=request.task,
+                session_id=session_id,
+                include_history=request.include_history,
+                on_phase=_on_phase,
+            )
+            if result.get("success"):
+                inner = result.get("result", {})
+                full_response = inner.get("response", "")
+                _job_store.update(
+                    job_id,
+                    status="done",
+                    phase="complete",
+                    task_type=inner.get("task_type", task_type),
+                    files_created=inner.get("files_created", []),
+                    summary=_summarize_response(full_response),
+                    _full_response=full_response,
+                )
+            else:
+                _job_store.update(
+                    job_id,
+                    status="failed",
+                    error=result.get("error", "Unknown error"),
+                )
+        except Exception as e:
+            import traceback
+            logger.error("background_job_failed", job_id=job_id, error=str(e),
+                         traceback=traceback.format_exc())
+            _job_store.update(job_id, status="failed", error=str(e))
+
+    asyncio.create_task(_run())
+    return {"job_id": job_id, "session_id": session_id, "task_type": task_type}
+
+
+@app.get("/jobs")
+async def list_jobs(limit: int = 50, offset: int = 0):
+    """List all jobs ordered by creation time descending (no full_response)."""
+    return {"jobs": _job_store.list_jobs(limit=limit, offset=offset)}
+
+
+@app.get("/task/{job_id}")
+async def get_job_status(job_id: str):
+    """Poll a background job for its current status and summary."""
+    job = _job_store.get(job_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail=f"Job '{job_id}' not found")
+    # Never expose the full response here — use /task/{job_id}/result for that
+    return {k: v for k, v in job.items() if k != "_full_response"}
+
+
+@app.get("/task/{job_id}/result")
+async def get_job_result(job_id: str):
+    """Retrieve the full agent response for a completed job."""
+    job = _job_store.get(job_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail=f"Job '{job_id}' not found")
+    if job["status"] != "done":
+        return {"status": job["status"], "result": None}
+    return {"status": "done", "result": job.get("_full_response", "")}
+
+
+@app.delete("/task/{job_id}")
+async def cancel_job(job_id: str):
+    """Request cancellation of a pending or running job."""
+    job = _job_store.get(job_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail=f"Job '{job_id}' not found")
+    if job["status"] in ("pending", "running"):
+        _job_store.update(job_id, status="cancelled", phase="cancelled")
+        job = _job_store.get(job_id)
+    return {"cancelled": True, "job_id": job_id, "status": job["status"]}
+
+
+@app.get("/workspace/file")
+async def read_workspace_file(path: str):
+    """Read a file from the workspace by relative path."""
+    workspace = Path(_current_workspace).resolve()  # lgtm[py/path-injection]
+    try:
+        target = (workspace / path).resolve()  # lgtm[py/path-injection]
+        # Security: prevent path traversal — raises ValueError if target escapes workspace
+        target.relative_to(workspace)
+    except ValueError:
+        raise HTTPException(status_code=403, detail="Path is outside workspace")
+    except Exception:
+        logger.warning("workspace_file_path_error", path=path)
+        raise HTTPException(status_code=400, detail="Invalid path")
+
+    if not target.exists():
+        raise HTTPException(status_code=404, detail=f"File not found: {path}")
+    if not target.is_file():
+        raise HTTPException(status_code=400, detail=f"Not a file: {path}")
+
+    try:
+        content = target.read_text(encoding="utf-8", errors="replace")
+        return {
+            "path": path,
+            "content": content,
+            "lines": len(content.splitlines()),
+            "size": len(content),
+        }
+    except Exception as e:
+        logger.error("workspace_file_read_error", path=path, error=str(e))
+        raise HTTPException(status_code=500, detail="Could not read file")
 
 
 @app.post("/task/stream")
@@ -148,31 +381,485 @@ async def get_session(session_id: str):
 async def delete_session(session_id: str):
     if not _orchestrator:
         raise HTTPException(status_code=503, detail="Agent not initialized")
-    
-    from agent.memory import SessionMemory
-    
-    try:
-        memory = SessionMemory("data/memory.db")
-        memory.delete_session(session_id)
-        return {"success": True, "session_id": session_id}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+
+    deleted = _orchestrator.session_memory.delete_session(session_id)
+    if not deleted:
+        raise HTTPException(status_code=404, detail="Session not found")
+    return {"success": True, "session_id": session_id}
+
+
+@app.post("/wake/{session_id}")
+async def wake_session(session_id: str):
+    """Resume an interrupted session (Anthropic Managed Agents wake pattern)."""
+    if not _orchestrator:
+        raise HTTPException(status_code=503, detail="Agent not initialized")
+
+    result = await _orchestrator.wake(session_id)
+    if not result.get("success"):
+        raise HTTPException(status_code=404, detail=result.get("error", "Session not found"))
+    return result
 
 
 @app.get("/models")
 async def list_models():
     if not _orchestrator:
         raise HTTPException(status_code=503, detail="Agent not initialized")
+
+    router = _orchestrator.model_router
+    active = router.get_active_model_name()
+    return {
+        "active_model": active,
+        "models": [
+            {
+                "name": c.name,
+                "type": c.type,
+                "endpoint": c.endpoint,
+                "coding_optimized": c.is_coding_optimized,
+                "context_window": c.context_window,
+                "is_active": c.name == active,
+            }
+            for c in router.configs
+        ],
+    }
+
+
+@app.get("/models/active")
+async def get_active_model():
+    """Return the currently active model."""
+    if not _orchestrator:
+        raise HTTPException(status_code=503, detail="Agent not initialized")
+
+    router = _orchestrator.model_router
+    name = router.get_active_model_name()
+    config = router.get_model("coding")
+    if not config:
+        raise HTTPException(status_code=404, detail="No models configured")
+
+    return {
+        "active_model": name,
+        "effective_model": config.name,
+        "type": config.type,
+        "endpoint": config.endpoint,
+        "context_window": config.context_window,
+    }
+
+
+@app.post("/models/active")
+async def set_active_model(body: dict):
+    """Switch the active model by name. Pass {\"model\": \"<name>\"}.
+    Pass {\"model\": null} to revert to the default from models.yaml."""
+    if not _orchestrator:
+        raise HTTPException(status_code=503, detail="Agent not initialized")
+
+    router = _orchestrator.model_router
+    name = body.get("model")
+
+    if name is None:
+        router.clear_active_model()
+        effective = router.get_active_model_name()
+        return {"active_model": effective, "message": "Reverted to default"}
+
+    try:
+        config = router.set_active_model(name)
+    except ValueError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+
+    return {
+        "active_model": config.name,
+        "type": config.type,
+        "endpoint": config.endpoint,
+        "message": f"Switched to {config.name}",
+    }
+
+
+@app.get("/workspace")
+async def get_workspace():
+    """Get current workspace path"""
+    return {
+        "workspace": _current_workspace,
+        "exists": Path(_current_workspace).exists()
+    }
+
+
+@app.get("/workspace/directories")
+async def list_workspace_directories():
+    """List available directories in workspace"""
+    # _current_workspace is validated via _is_path_allowed() before it is set.
+    workspace = Path(_current_workspace).resolve()  # lgtm[py/path-injection]
+    if not workspace.exists():
+        return {"error": "Workspace does not exist"}
+
+    try:
+        items = []
+        for item in workspace.iterdir():  # lgtm[py/path-injection]
+            items.append({
+                "name": item.name,
+                "type": "directory" if item.is_dir() else "file",
+                "path": str(item),
+            })
+        return {"workspace": str(workspace), "items": items}
+    except Exception as e:
+        logger.error("workspace_list_failed", error=str(e))
+        raise HTTPException(status_code=500, detail="Could not list workspace")
+
+
+@app.post("/workspace")
+async def set_workspace(request: dict):
+    """Set new workspace path"""
+    global _current_workspace, _orchestrator
     
-    from llm.config import load_models
+    new_path = request.get("path")
+    if not new_path:
+        raise HTTPException(status_code=400, detail="path is required")
     
-    models = load_models("config/models.yaml")
-    return {"models": [m.name for m in models]}
+    # Security: Check if path is allowed
+    if not _is_path_allowed(new_path):
+        raise HTTPException(status_code=403, detail="Cannot set workspace to system folder")
+    
+    # Validate path exists and is a directory
+    # _is_path_allowed() checked above; resolve() + second check below prevent symlink escapes.
+    path = Path(new_path).resolve()  # lgtm[py/path-injection]
+    if not path.exists():
+        raise HTTPException(status_code=404, detail="Path does not exist")
+    if not path.is_dir():
+        raise HTTPException(status_code=400, detail="Path is not a directory")
+
+    # Double-check after resolve (catches symlink traversal)
+    if not _is_path_allowed(str(path)):
+        raise HTTPException(status_code=403, detail="Cannot set workspace to system folder")
+
+    _current_workspace = str(path)
+    
+    # Recreate orchestrator with new workspace
+    from local_coding_agent import create_agent
+    _orchestrator = create_agent(_current_workspace, "config/models.yaml")
+    
+    return {
+        "success": True,
+        "workspace": _current_workspace
+    }
+
+
+@app.post("/screenshot")
+async def take_screenshot(request: dict):
+    """Take a screenshot of a running dev server"""
+    if not _orchestrator:
+        raise HTTPException(status_code=503, detail="Agent not initialized")
+    
+    url = request.get("url", "http://localhost:8080")
+    workspace_root = Path(_current_workspace).resolve()
+
+    # User may supply a sub-directory of the workspace; default to workspace root.
+    raw_workspace = request.get("workspace")
+    if raw_workspace:
+        candidate = Path(raw_workspace).resolve()
+        # Security: must be inside the current workspace and not a system path
+        try:
+            candidate.relative_to(workspace_root)
+        except ValueError:
+            raise HTTPException(status_code=403, detail="Workspace path is outside the allowed workspace root")
+        if not _is_path_allowed(str(candidate)):
+            raise HTTPException(status_code=403, detail="Workspace path is not allowed")
+        workspace = str(candidate)
+    else:
+        # Auto-detect project sub-directory only within workspace_root
+        workspace = str(workspace_root)
+        game_path = workspace_root / "space-adventure"
+        if game_path.exists() and (game_path / "package.json").exists():
+            workspace = str(game_path)
+
+    from agent.tools.browser_tool import BrowserTool
+    browser = BrowserTool(workspace)  # lgtm[py/path-injection]
+
+    try:
+        import asyncio
+        result = asyncio.run(browser.run_and_screenshot())
+        return result
+    except Exception as e:
+        logger.error("screenshot_failed", error=str(e))
+        raise HTTPException(status_code=500, detail="Screenshot capture failed")
+
+
+@app.get("/mcp/tools")
+async def list_mcp_tools():
+    """List available MCP tools"""
+    if not _orchestrator:
+        raise HTTPException(status_code=503, detail="Agent not initialized")
+    
+    from mcp.server import create_mcp_server
+    mcp_server = create_mcp_server(_current_workspace)
+    
+    return {"tools": mcp_server.list_tools()}
+
+
+@app.post("/mcp/tools/{tool_name}")
+async def call_mcp_tool(tool_name: str, arguments: dict = None):
+    """Call an MCP tool by name"""
+    if not _orchestrator:
+        raise HTTPException(status_code=503, detail="Agent not initialized")
+    
+    from mcp.server import create_mcp_server
+    mcp_server = create_mcp_server(_current_workspace)
+    
+    try:
+        result = await mcp_server.call_tool(tool_name, arguments or {})
+        return {"success": True, "result": result}
+    except ValueError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    except Exception as e:
+        logger.error("mcp_tool_failed", tool=tool_name, error=str(e))
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/subagent/spawn")
+async def spawn_subagent(request: dict):
+    """Spawn a subagent with isolated context."""
+    if not _orchestrator:
+        raise HTTPException(status_code=503, detail="Agent not initialized")
+    
+    task = request.get("task")
+    role = request.get("role", "developer")
+    parent_session_id = request.get("parent_session_id")
+    context_limits = request.get("context_limits")
+    
+    if not task:
+        raise HTTPException(status_code=400, detail="task is required")
+    
+    try:
+        result = await _orchestrator.spawn_subagent(
+            task=task,
+            role=role,
+            parent_session_id=parent_session_id,
+            context_limits=context_limits,
+        )
+        # Sanitize: internal exception strings must not flow into the HTTP response.
+        if "error" in result and not result.get("success"):
+            logger.error("subagent_internal_error", error=result.get("error"), subagent_id=result.get("subagent_id"))
+            result = {k: v for k, v in result.items() if k != "error"}
+            result["error"] = "Subagent execution failed"
+        return result
+    except Exception as e:
+        logger.error("subagent_spawn_failed", error=str(e))
+        raise HTTPException(status_code=500, detail="Subagent spawn failed")
+
+
+@app.post("/subagent/spawn-batch")
+async def spawn_subagent_batch(request: dict):
+    """Spawn multiple subagents in parallel."""
+    if not _orchestrator:
+        raise HTTPException(status_code=503, detail="Agent not initialized")
+    
+    tasks = request.get("tasks", [])
+    roles = request.get("roles")
+    parent_session_id = request.get("parent_session_id")
+    
+    if not tasks:
+        raise HTTPException(status_code=400, detail="tasks is required")
+    
+    try:
+        results = await _orchestrator.spawn_multiple_subagents(
+            tasks=tasks,
+            roles=roles,
+            parent_session_id=parent_session_id,
+        )
+        return {"results": results}
+    except Exception as e:
+        logger.error("subagent_batch_failed", error=str(e))
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/subagent")
+async def list_subagents():
+    """List all subagent sessions."""
+    if not _orchestrator:
+        raise HTTPException(status_code=503, detail="Agent not initialized")
+    
+    return {"subagents": _orchestrator.list_subagents()}
+
+
+@app.get("/subagent/{subagent_id}")
+async def get_subagent(subagent_id: str):
+    """Get result from a specific subagent."""
+    if not _orchestrator:
+        raise HTTPException(status_code=503, detail="Agent not initialized")
+    
+    result = _orchestrator.get_subagent_result(subagent_id)
+    if "error" in result and result["error"] == "Subagent not found":
+        raise HTTPException(status_code=404, detail="Subagent not found")
+    
+    return result
+
+
+@app.post("/index")
+async def index_workspace(request: dict = None):
+    """Index all files in the workspace for RAG search."""
+    if not _orchestrator:
+        raise HTTPException(status_code=503, detail="Agent not initialized")
+    
+    project_id = request.get("project_id") if request else None
+    
+    try:
+        result = _orchestrator.index_workspace(project_id)
+        return {"success": True, "result": result}
+    except Exception as e:
+        logger.error("index_failed", error=str(e))
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/search")
+async def search_codebase(q: str, limit: int = 5):
+    """Search the codebase using vector similarity."""
+    if not _orchestrator:
+        raise HTTPException(status_code=503, detail="Agent not initialized")
+    
+    try:
+        project_id = Path(_current_workspace).name
+        results = _orchestrator.codebase_memory.search_files(q, n_results=limit)
+        return {"query": q, "results": results}
+    except Exception as e:
+        logger.error("search_failed", error=str(e))
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/memory/stats")
+async def get_memory_stats():
+    """Get statistics about the vector store and MemoryWiki graph (with lint results)."""
+    if not _orchestrator:
+        raise HTTPException(status_code=503, detail="Agent not initialized")
+
+    try:
+        rag_stats = _orchestrator.codebase_memory.get_stats()
+        wiki_stats = _orchestrator.memory_wiki.get_statistics()
+        lint_results = _orchestrator.memory_wiki.lint()
+        return {
+            "rag": rag_stats,
+            "wiki": wiki_stats,
+            "lint": lint_results,
+        }
+    except Exception as e:
+        logger.error("stats_failed", error=str(e))
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/ready")
+async def readiness_check():
+    """Readiness check — verifies model availability before accepting traffic."""
+    if not _orchestrator:
+        return {"ready": False, "reason": "agent_not_initialized"}
+
+    config = _orchestrator.model_router.get_model("coding")
+    if not config:
+        return {"ready": False, "reason": "no_model_configured"}
+
+    try:
+        model_ok = await _orchestrator.model_router.health_check(config)
+        healthy_models = _orchestrator.model_router.get_healthy_models()
+        return {
+            "ready": model_ok,
+            "primary_model": config.name,
+            "model_type": config.type,
+            "healthy_models": healthy_models,
+        }
+    except Exception as e:
+        logger.error("readiness_check_failed", error=str(e))
+        return {"ready": False, "reason": "Readiness check failed"}
+
+
+@app.get("/stats")
+async def get_stats():
+    """Agent statistics including cost tracking and session counts."""
+    if not _orchestrator:
+        raise HTTPException(status_code=503, detail="Agent not initialized")
+
+    cost_summary = _orchestrator.model_router.get_cost_summary()
+    sessions = _orchestrator.list_sessions(limit=100)
+
+    return {
+        "sessions": {
+            "total": len(sessions),
+            "recent": sessions[:5],
+        },
+        "cost": cost_summary,
+        "healthy_models": _orchestrator.model_router.get_healthy_models(),
+    }
+
+
+@app.get("/llm/health")
+async def get_llm_health():
+    """Detailed LLM health status including circuit breaker states."""
+    if not _orchestrator:
+        raise HTTPException(status_code=503, detail="Agent not initialized")
+
+    from llm.model_resilience import create_resilience_manager
+
+    router = _orchestrator.model_router
+    config = router.get_model("coding")
+
+    resilience = create_resilience_manager(
+        ollama_endpoint=config.endpoint if config and config.type == "local" else "http://127.0.0.1:11434"
+    )
+
+    diagnostics = await resilience.get_diagnostics()
+    cost_summary = router.get_cost_summary()
+    rate_status = {}
+    if config:
+        rate_status = router.rate_limiter.get_status(config.name)
+
+    return {
+        "resilience": diagnostics,
+        "rate_limiter": rate_status,
+        "cost": cost_summary,
+    }
+
+
+@app.get("/metrics", include_in_schema=False)
+async def metrics():
+    """Prometheus scrape endpoint (includes FastAPI instrumentation metrics)."""
+    return Response(content=generate_latest(), media_type=CONTENT_TYPE_LATEST)
+
+
+@app.get("/environment")
+async def get_environment():
+    """Return detected paths for all external tools (git, Playwright, Node, etc.)."""
+    from agent.tools.environment_probe import get_environment_probe
+    probe = get_environment_probe()
+    return {"platform": probe._platform, "tools": probe.get_all()}
+
+
+@app.post("/environment/reprobe")
+async def reprobe_environment():
+    """Force a fresh tool detection (ignores cached data/environment.json)."""
+    from agent.tools.environment_probe import get_environment_probe
+    probe = get_environment_probe()
+    await asyncio.to_thread(probe.reprobe)
+    return {"tools": probe.get_all()}
+
+
+@app.get("/skills")
+async def list_skills():
+    """List all locally loaded skills."""
+    if not _orchestrator:
+        raise HTTPException(status_code=503, detail="Agent not initialized")
+    skills = _orchestrator.skill_manager.list_skills()
+    return {"skills": skills, "count": len(skills)}
+
+
+@app.post("/skills/fetch")
+async def fetch_remote_skills():
+    """Download skills from the configured remote registry into skills/."""
+    if not _orchestrator:
+        raise HTTPException(status_code=503, detail="Agent not initialized")
+    try:
+        result = await asyncio.to_thread(_orchestrator.skill_manager.fetch_remote)
+        return result
+    except Exception as e:
+        logger.error("skills_fetch_failed", error=str(e))
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 if __name__ == "__main__":
     import uvicorn
     import os
-    
+
     port = int(os.getenv("PORT", "5005"))
     uvicorn.run(app, host="0.0.0.0", port=port)

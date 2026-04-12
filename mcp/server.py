@@ -47,6 +47,14 @@ def create_mcp_server(workspace_path: str, repo_path: Optional[str] = None) -> M
     server = MCPServer("local-coding-agent")
     fs_server = FileSystemMCPServer(workspace_path)
 
+    # Auto-detect git repo when repo_path not explicitly provided
+    if repo_path is None:
+        from pathlib import Path as _Path
+        # workspace_path comes from WORKSPACE_PATH env var / server config, not user HTTP input.
+        if (_Path(workspace_path) / ".git").exists():  # lgtm[py/path-injection]
+            repo_path = workspace_path
+            logger.info("git_repo_detected", path=workspace_path)
+
     server.register_tool(
         name="read_file",
         description="Read contents of a file",
@@ -224,7 +232,70 @@ def create_mcp_server(workspace_path: str, repo_path: Optional[str] = None) -> M
                 },
                 "required": ["files"],
             },
-            handler=git_server.add,
+                handler=git_server.add,
         )
-
+    
+    # Add shell execution tool
+    from agent.tools.shell_tool import ShellTool
+    shell_tool = ShellTool(workspace_path)
+    
+    async def run_shell(command: str) -> dict:
+        result = shell_tool.run(command)
+        return result
+    
+    server.register_tool(
+        name="run_shell",
+        description="Run a shell command in the workspace",
+        input_schema={
+            "type": "object",
+            "properties": {
+                "command": {"type": "string", "description": "Command to execute"},
+            },
+            "required": ["command"],
+        },
+        handler=run_shell,
+    )
+    
+    # Add test runner tool
+    from agent.tools.test_runner_tool import PytestTool
+    pytest_tool = PytestTool(workspace_path)
+    
+    async def run_tests(path: Optional[str] = None, verbose: bool = False) -> dict:
+        result = pytest_tool.run(path=path, verbose=verbose)
+        return result
+    
+    server.register_tool(
+        name="run_tests",
+        description="Run pytest test suite",
+        input_schema={
+            "type": "object",
+            "properties": {
+                "path": {"type": "string", "description": "Test file or directory path"},
+                "verbose": {"type": "boolean", "description": "Verbose output", "default": False},
+            },
+        },
+        handler=run_tests,
+    )
+    
+    # Add code analysis tool
+    from agent.tools.code_analysis_tool import CodeAnalyzer
+    code_analyzer = CodeAnalyzer()
+    
+    async def analyze_code(file_path: str) -> dict:
+        result = code_analyzer.analyze_file(file_path)
+        return result
+    
+    server.register_tool(
+        name="analyze_code",
+        description="Analyze code file for structure, functions, classes",
+        input_schema={
+            "type": "object",
+            "properties": {
+                "file_path": {"type": "string", "description": "Path to code file"},
+            },
+            "required": ["file_path"],
+        },
+        handler=analyze_code,
+    )
+    
     return server
