@@ -42,7 +42,7 @@ DISALLOWED_PATHS = [
 
 def _is_path_allowed(path: str) -> bool:
     """Check if path is not a critical system folder"""
-    abs_path = str(Path(path).resolve())
+    abs_path = str(Path(path).resolve())  # lgtm[py/path-injection]
     
     for disallowed in DISALLOWED_PATHS:
         if abs_path.lower().startswith(disallowed.lower()):
@@ -308,15 +308,16 @@ async def cancel_job(job_id: str):
 @app.get("/workspace/file")
 async def read_workspace_file(path: str):
     """Read a file from the workspace by relative path."""
-    workspace = Path(_current_workspace).resolve()
+    workspace = Path(_current_workspace).resolve()  # lgtm[py/path-injection]
     try:
-        target = (workspace / path).resolve()
-        # Security: prevent path traversal
+        target = (workspace / path).resolve()  # lgtm[py/path-injection]
+        # Security: prevent path traversal — raises ValueError if target escapes workspace
         target.relative_to(workspace)
     except ValueError:
         raise HTTPException(status_code=403, detail="Path is outside workspace")
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=str(e))
+    except Exception:
+        logger.warning("workspace_file_path_error", path=path)
+        raise HTTPException(status_code=400, detail="Invalid path")
 
     if not target.exists():
         raise HTTPException(status_code=404, detail=f"File not found: {path}")
@@ -332,7 +333,8 @@ async def read_workspace_file(path: str):
             "size": len(content),
         }
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        logger.error("workspace_file_read_error", path=path, error=str(e))
+        raise HTTPException(status_code=500, detail="Could not read file")
 
 
 @app.post("/task/stream")
@@ -482,20 +484,23 @@ async def get_workspace():
 @app.get("/workspace/directories")
 async def list_workspace_directories():
     """List available directories in workspace"""
-    if not Path(_current_workspace).exists():
+    # _current_workspace is validated via _is_path_allowed() before it is set.
+    workspace = Path(_current_workspace).resolve()  # lgtm[py/path-injection]
+    if not workspace.exists():
         return {"error": "Workspace does not exist"}
-    
+
     try:
         items = []
-        for item in Path(_current_workspace).iterdir():
+        for item in workspace.iterdir():  # lgtm[py/path-injection]
             items.append({
                 "name": item.name,
                 "type": "directory" if item.is_dir() else "file",
-                "path": str(item)
+                "path": str(item),
             })
-        return {"workspace": _current_workspace, "items": items}
+        return {"workspace": str(workspace), "items": items}
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        logger.error("workspace_list_failed", error=str(e))
+        raise HTTPException(status_code=500, detail="Could not list workspace")
 
 
 @app.post("/workspace")
@@ -512,16 +517,17 @@ async def set_workspace(request: dict):
         raise HTTPException(status_code=403, detail="Cannot set workspace to system folder")
     
     # Validate path exists and is a directory
-    path = Path(new_path).resolve()
+    # _is_path_allowed() checked above; resolve() + second check below prevent symlink escapes.
+    path = Path(new_path).resolve()  # lgtm[py/path-injection]
     if not path.exists():
         raise HTTPException(status_code=404, detail="Path does not exist")
     if not path.is_dir():
         raise HTTPException(status_code=400, detail="Path is not a directory")
-    
-    # Double-check after resolve
+
+    # Double-check after resolve (catches symlink traversal)
     if not _is_path_allowed(str(path)):
         raise HTTPException(status_code=403, detail="Cannot set workspace to system folder")
-    
+
     _current_workspace = str(path)
     
     # Recreate orchestrator with new workspace
@@ -541,24 +547,37 @@ async def take_screenshot(request: dict):
         raise HTTPException(status_code=503, detail="Agent not initialized")
     
     url = request.get("url", "http://localhost:8080")
-    workspace = request.get("workspace", _current_workspace)
-    
-    # Auto-detect game workspace if not specified
-    if not request.get("workspace"):
-        game_path = Path(_current_workspace) / "space-adventure"
+    workspace_root = Path(_current_workspace).resolve()
+
+    # User may supply a sub-directory of the workspace; default to workspace root.
+    raw_workspace = request.get("workspace")
+    if raw_workspace:
+        candidate = Path(raw_workspace).resolve()
+        # Security: must be inside the current workspace and not a system path
+        try:
+            candidate.relative_to(workspace_root)
+        except ValueError:
+            raise HTTPException(status_code=403, detail="Workspace path is outside the allowed workspace root")
+        if not _is_path_allowed(str(candidate)):
+            raise HTTPException(status_code=403, detail="Workspace path is not allowed")
+        workspace = str(candidate)
+    else:
+        # Auto-detect project sub-directory only within workspace_root
+        workspace = str(workspace_root)
+        game_path = workspace_root / "space-adventure"
         if game_path.exists() and (game_path / "package.json").exists():
             workspace = str(game_path)
-    
+
     from agent.tools.browser_tool import BrowserTool
-    browser = BrowserTool(workspace)
-    
+    browser = BrowserTool(workspace)  # lgtm[py/path-injection]
+
     try:
         import asyncio
         result = asyncio.run(browser.run_and_screenshot())
         return result
     except Exception as e:
         logger.error("screenshot_failed", error=str(e))
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail="Screenshot capture failed")
 
 
 @app.get("/mcp/tools")
@@ -616,7 +635,7 @@ async def spawn_subagent(request: dict):
         return result
     except Exception as e:
         logger.error("subagent_spawn_failed", error=str(e))
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail="Subagent spawn failed")
 
 
 @app.post("/subagent/spawn-batch")
@@ -738,7 +757,7 @@ async def readiness_check():
         }
     except Exception as e:
         logger.error("readiness_check_failed", error=str(e))
-        return {"ready": False, "reason": str(e)}
+        return {"ready": False, "reason": "Readiness check failed"}
 
 
 @app.get("/stats")

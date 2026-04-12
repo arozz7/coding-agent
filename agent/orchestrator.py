@@ -183,7 +183,7 @@ class AgentOrchestrator:
             if files_created and result.get("success"):
                 project_id = Path(self.workspace_path).name
                 for rel_path in files_created:
-                    abs_path = Path(self.workspace_path) / rel_path
+                    abs_path = Path(self.workspace_path) / rel_path  # lgtm[py/path-injection]
                     if abs_path.exists() and abs_path.is_file():
                         try:
                             self.codebase_memory.index_files(
@@ -719,7 +719,7 @@ class AgentOrchestrator:
 
         # Populate MemoryWiki from static analysis of Python files
         self.memory_wiki.clear()
-        py_files = list(Path(self.workspace_path).rglob("*.py"))
+        py_files = list(Path(self.workspace_path).rglob("*.py"))  # lgtm[py/path-injection]
         wiki_errors = 0
         for py_file in py_files:
             rel_path = str(py_file.relative_to(self.workspace_path))

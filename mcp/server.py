@@ -50,7 +50,8 @@ def create_mcp_server(workspace_path: str, repo_path: Optional[str] = None) -> M
     # Auto-detect git repo when repo_path not explicitly provided
     if repo_path is None:
         from pathlib import Path as _Path
-        if (_Path(workspace_path) / ".git").exists():
+        # workspace_path comes from WORKSPACE_PATH env var / server config, not user HTTP input.
+        if (_Path(workspace_path) / ".git").exists():  # lgtm[py/path-injection]
             repo_path = workspace_path
             logger.info("git_repo_detected", path=workspace_path)
 

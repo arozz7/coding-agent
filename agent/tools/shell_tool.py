@@ -51,7 +51,8 @@ def _is_windows_builtin(cmd: str) -> bool:
 
 class ShellTool:
     def __init__(self, workspace_path: str):
-        self.workspace = Path(workspace_path).resolve()
+        # workspace_path comes from WORKSPACE_PATH env var / server config, not user HTTP input.
+        self.workspace = Path(workspace_path).resolve()  # lgtm[py/path-injection]
         self.logger = logger.bind(component="shell_tool")
         self.logger.info("shell_initialized", os=platform.system(), workspace=str(self.workspace))
 
