@@ -632,6 +632,11 @@ async def spawn_subagent(request: dict):
             parent_session_id=parent_session_id,
             context_limits=context_limits,
         )
+        # Sanitize: internal exception strings must not flow into the HTTP response.
+        if "error" in result and not result.get("success"):
+            logger.error("subagent_internal_error", error=result.get("error"), subagent_id=result.get("subagent_id"))
+            result = {k: v for k, v in result.items() if k != "error"}
+            result["error"] = "Subagent execution failed"
         return result
     except Exception as e:
         logger.error("subagent_spawn_failed", error=str(e))
