@@ -7,7 +7,7 @@ import structlog
 
 from .config import ModelConfig
 from .ollama_client import OllamaClient
-from .cloud_api_client import CloudAPIClient
+from .cloud_api_client import CloudAPIClient, _OpenRouterRateLimitError
 from .cost_tracker import CostTracker
 from .rate_limiter import RateLimiter, RateLimitExceeded
 from .health import HealthChecker
@@ -218,8 +218,23 @@ class ModelRouter:
                 self.logger.warning("circuit_breaker_open", model=config.name)
                 raise
 
+            except _OpenRouterRateLimitError as e:
+                # OpenRouter 429 — respect Retry-After, then fall back to local
+                self.logger.warning(
+                    "openrouter_rate_limited",
+                    model=config.name,
+                    retry_after=e.retry_after,
+                )
+                self.health_checker.record_rate_limit(config.name)
+                if not _is_fallback:
+                    fallback = self._get_local_fallback(config.name)
+                    if fallback:
+                        self.logger.info("using_local_fallback", fallback=fallback.name)
+                        return await self.generate(prompt, fallback, max_retries=max_retries, _is_fallback=True)
+                raise LLMError(f"OpenRouter model {config.name!r} is rate-limited and no local fallback available") from e
+
             except Exception as e:
-                # 429 from a remote API — skip further retries and fall back immediately
+                # Generic 429 string match (other remote providers)
                 if self._is_rate_limit_error(e) and config.type != "local" and not _is_fallback:
                     self.logger.warning(
                         "remote_rate_limited_falling_back",

@@ -14,6 +14,13 @@ _OPENROUTER_REFERER = "http://localhost"  # satisfies OpenRouter's HTTP-Referer 
 _OPENROUTER_TITLE = "local-coding-agent"
 
 
+class _OpenRouterRateLimitError(Exception):
+    """Raised when OpenRouter responds with 429. Carries retry_after seconds."""
+    def __init__(self, retry_after: int = 0):
+        self.retry_after = retry_after
+        super().__init__(f"429 Too Many Requests (retry after {retry_after}s)")
+
+
 class CloudAPIClient:
     def __init__(self):
         self.logger = logger.bind(component="cloud_api_client")
@@ -173,6 +180,9 @@ class CloudAPIClient:
                 headers=headers,
                 json=payload,
             )
+            if response.status_code == 429:
+                retry_after = int(response.headers.get("retry-after", 0))
+                raise _OpenRouterRateLimitError(retry_after=retry_after)
             response.raise_for_status()
             data = response.json()
             return data["choices"][0]["message"]["content"]
