@@ -1,4 +1,5 @@
 import re
+from datetime import date
 from pathlib import Path
 from typing import Dict, Any, List, Optional
 from agent.agents.base_agent import AgentRole
@@ -30,7 +31,10 @@ class ResearchRole(AgentRole):
         self.code_analyzer = code_analyzer
 
     def get_system_prompt(self) -> str:
-        return """You are an expert research analyst with access to the codebase,
+        today = date.today().strftime("%A, %B %d, %Y")
+        return f"""Today's date is {today}.
+
+You are an expert research analyst with access to the codebase,
 the web, and documents. Your role is to:
 - Investigate and understand existing code
 - Read files and trace dependencies

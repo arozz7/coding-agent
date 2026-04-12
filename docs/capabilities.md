@@ -54,6 +54,15 @@
 - **Batch operations** on multiple files
 - **Path traversal protection** (security)
 
+### Web Research
+
+- **Search the web** for current events, scores, prices, news, documentation
+- **Automatic date injection** — queries with "last night", "today", "this week" etc. get the
+  actual calendar date appended so search engines return the correct timeframe
+- **Multi-provider fallback** — Brave Search API → DuckDuckGo → Playwright Google → Google CSE
+- **Fetch page content** from URLs referenced in a question
+- **Read PDFs, Word documents, spreadsheets** and CSV files
+
 ### Conversational AI
 
 - **Maintain context** across multiple turns
@@ -61,6 +70,14 @@
 - **Build upon earlier work** incrementally
 - **Answer technical questions**
 - **Explain concepts** and patterns
+- **Current date awareness** — always knows today's date for time-sensitive questions
+
+### Cloud Model Integration
+
+- **OpenRouter** — access 200+ models (GPT, Gemini, LLaMA, Mistral, etc.) via a single key
+- **Automatic rate-limit fallback** — when a cloud model returns 429, the agent falls back
+  to your local model immediately without burning retries
+- **Model switching** — `!model <name>` in Discord or `POST /models/active` via API
 
 ---
 
@@ -68,7 +85,6 @@
 
 ### Security Limitations
 
-- **No network access** in sandboxed mode (by design)
 - **No sudo/admin actions** without explicit permission
 - **Path traversal protection** prevents accessing files outside workspace
 - **Command validation** blocks dangerous operations
@@ -77,14 +93,12 @@
 
 - **No execution** of arbitrary code outside sandbox
 - **No database connections** unless configured
-- **No external API calls** (except to configured LLM endpoints)
 - **Context window limits** apply to very long conversations
 - **Model capabilities** depend on configured LLM
 
 ### Physical Limitations
 
 - **Cannot interact** with GUI applications
-- **Cannot browse the web**
 - **Cannot send emails** or notifications
 - **Cannot directly modify** system files
 - **Cannot install software** (only write files)
@@ -276,4 +290,4 @@ Results depend heavily on the underlying LLM. **Mitigation**: Use code-optimized
 
 ---
 
-*Last updated: 2026-04-10*
+*Last updated: 2026-04-12*

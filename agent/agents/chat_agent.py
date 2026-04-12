@@ -1,4 +1,5 @@
 import re
+from datetime import date
 from typing import Dict, Any
 from agent.agents.base_agent import AgentRole
 from agent.tools.web_tool import extract_urls
@@ -62,7 +63,10 @@ class ChatRole(AgentRole):
         )
 
     def get_system_prompt(self) -> str:
-        return """You are a knowledgeable, friendly assistant. Your role is to:
+        today = date.today().strftime("%A, %B %d, %Y")
+        return f"""Today's date is {today}.
+
+You are a knowledgeable, friendly assistant. Your role is to:
 - Answer questions clearly and concisely
 - Explain concepts in plain language
 - Have natural, helpful conversations
