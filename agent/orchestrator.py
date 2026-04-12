@@ -471,12 +471,13 @@ class AgentOrchestrator:
     async def _run_specialized_agent(self, task: str, task_type: str, session_id: str) -> dict:
         session_executor = self._create_session_executor(session_id)
         enriched_context = await self._build_enriched_context(task)
+        history = self._build_context_from_events(session_id)
         context = {
             "session_id": session_id,
             "workspace_path": self.workspace_path,
             "model_router": self.model_router,
             "tool_executor": session_executor,
-            "enriched_context": enriched_context,  # wiki + RAG + skill instructions
+            "enriched_context": enriched_context + history,  # wiki + RAG + skill instructions + chat history
         }
 
         if task_type == "review":

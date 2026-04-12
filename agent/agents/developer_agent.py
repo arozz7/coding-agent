@@ -154,7 +154,7 @@ FILE:
             "response": response,
             "task": task,
             "files_created": files_created,
-            "shell_output": shell_output,
+            "shell_output": shell_outputs,
             "screenshot": screenshot_path,
         }
 
