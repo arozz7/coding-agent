@@ -166,11 +166,29 @@ class ModelRouter:
         self._active_model_name = self._defaults.get("coding_model")
         self.logger.info("active_model_reset", model=self._active_model_name)
 
+    def _get_local_fallback(self, exclude_name: str) -> Optional[ModelConfig]:
+        """Return the first healthy local model that is not *exclude_name*."""
+        for cfg in self.configs:
+            if cfg.type == "local" and cfg.name != exclude_name:
+                return cfg
+        # If nothing else, use any local model (even the same name — better than failing)
+        for cfg in self.configs:
+            if cfg.type == "local":
+                return cfg
+        return None
+
+    @staticmethod
+    def _is_rate_limit_error(exc: Exception) -> bool:
+        """Return True if *exc* is a 429 response from a remote API."""
+        msg = str(exc)
+        return "429" in msg and ("Too Many Requests" in msg or "rate" in msg.lower())
+
     async def generate(
         self,
         prompt: str,
         config: ModelConfig,
         max_retries: int = 3,
+        _is_fallback: bool = False,
     ) -> str:
         await self.rate_limiter.acquire(config.name)
 
@@ -201,6 +219,20 @@ class ModelRouter:
                 raise
 
             except Exception as e:
+                # 429 from a remote API — skip further retries and fall back immediately
+                if self._is_rate_limit_error(e) and config.type != "local" and not _is_fallback:
+                    self.logger.warning(
+                        "remote_rate_limited_falling_back",
+                        model=config.name,
+                        error=str(e)[:120],
+                    )
+                    self.health_checker.record_rate_limit(config.name)
+                    fallback = self._get_local_fallback(config.name)
+                    if fallback:
+                        self.logger.info("using_local_fallback", fallback=fallback.name)
+                        return await self.generate(prompt, fallback, max_retries=max_retries, _is_fallback=True)
+                    raise LLMError(f"Remote model {config.name!r} is rate-limited and no local fallback available") from e
+
                 self.logger.error(
                     "llm_error",
                     model=config.name,
