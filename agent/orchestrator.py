@@ -9,6 +9,7 @@ from agent.memory import SessionMemory, CodebaseMemory
 from agent.memory.memory_wiki import MemoryWiki
 from agent.tools import FileSystemTool, PytestTool, CodeAnalyzer
 from agent.agents.developer_agent import DeveloperAgent
+from agent.agents.plan_agent import PlanAgent
 from agent.agents.tester_agent import TesterAgent
 from agent.agents.reviewer_agent import ReviewerAgent
 from agent.agents.architect_agent import ArchitectAgent
@@ -52,6 +53,7 @@ class AgentOrchestrator:
         self.tool_executor = ToolExecutor(workspace_path, self.code_analyzer, self.pytest_tool)
         self.skill_manager = SkillManager("skills")
         self.wiki_manager = WikiManager(workspace_path)
+        self.wiki_manager._ensure_dirs()   # create .agent-wiki/ structure on startup
         self.skill_executor = SkillExecutor(self.wiki_manager, self.skill_manager)
         self.memory_wiki = MemoryWiki(project_id=Path(workspace_path).name)
 
@@ -69,6 +71,7 @@ class AgentOrchestrator:
             shell_tool=self.shell_tool,
             browser_tool=self.browser_tool,
         )
+        self.plan_agent = PlanAgent(model_router)
         self.tester_agent = TesterAgent(
             model_router,
             tools=[self.fs_tool, self.pytest_tool],
@@ -274,6 +277,7 @@ class AgentOrchestrator:
         """Keyword-based task classifier — used as fallback when LLM is unavailable.
 
         Priority (highest first):
+          0. Plan — user explicitly wants a plan before any code is written
           1. Explicit coding — output is new/modified source files
           2. Review / security audit
           3. Testing — write or run tests
@@ -282,6 +286,17 @@ class AgentOrchestrator:
           6. Chat — everything else (conversation, general questions)
         """
         t = task.lower()
+
+        # 0. Planning mode — user wants a blueprint before implementation
+        _PLAN = [
+            "plan first", "solid plan", "show me a plan", "want to plan",
+            "want first work on a", "planning phase", "let's plan", "lets plan",
+            "before we build", "before building", "before implementing",
+            "roadmap", "outline the approach", "outline a plan", "create a plan",
+            "work on a plan", "i want a plan",
+        ]
+        if any(kw in t for kw in _PLAN):
+            return "plan"
 
         # 1. Explicit development: output is code/files
         _DEVELOP = [
@@ -438,6 +453,15 @@ class AgentOrchestrator:
         """
         parts: list[str] = []
 
+        # 0. AGENTS.md — global coding agent instructions (injected once per task)
+        agents_md = Path("AGENTS.md")
+        if agents_md.exists():
+            try:
+                agents_content = agents_md.read_text(encoding="utf-8")
+                parts.append(f"\n\n## Global Agent Instructions (AGENTS.md)\n{agents_content}")
+            except Exception:
+                pass
+
         # 1. Wiki query — check persistent knowledge before every task
         wiki_ctx = await self.skill_executor.execute_pre("wiki-query", task)
         if wiki_ctx:
@@ -480,7 +504,9 @@ class AgentOrchestrator:
             "enriched_context": enriched_context + history,  # wiki + RAG + skill instructions + chat history
         }
 
-        if task_type == "review":
+        if task_type == "plan":
+            return await self.plan_agent.run(task, context)
+        elif task_type == "review":
             return await self.reviewer_agent.run(task, context)
         elif task_type == "test":
             return await self.tester_agent.run(task, context)
@@ -580,6 +606,7 @@ class AgentOrchestrator:
         self.session_memory.emit_event(session_id, "status", {"phase": "start", "task_type": task_type})
 
         _phase_labels = {
+            "plan": "planning",
             "develop": "developing",
             "review": "reviewing",
             "test": "testing",
@@ -609,9 +636,11 @@ class AgentOrchestrator:
                     "agent", 0, {"response_length": len(response)}
                 )
 
-                # Post-execution skills (wiki-compile, handover, etc.)
+                # Post-execution skills — wiki-compile always runs; others on keyword match.
                 post_skill_reports: list[str] = []
-                for skill_name in self._detect_skill_names(task, "post"):
+                _always_post = ["wiki-compile"]
+                _keyword_post = [s for s in self._detect_skill_names(task, "post") if s not in _always_post]
+                for skill_name in _always_post + _keyword_post:
                     try:
                         report = await self.skill_executor.execute_post(
                             skill_name, task, result, self.model_router

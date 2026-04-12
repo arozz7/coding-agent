@@ -228,17 +228,28 @@ class TestKeywordClassifier:
             return AgentOrchestrator(str(tmp_path), router)
 
     @pytest.mark.parametrize("task, expected", [
+        # plan mode — must detect BEFORE develop keywords
+        ("let's build a new game but I want first work on a solid plan", "plan"),
+        ("plan first: create a REST API", "plan"),
+        ("show me a plan for the auth system", "plan"),
+        ("I want a plan before we build anything", "plan"),
+        # develop
         ("implement a login function", "develop"),
         ("refactor the auth module", "develop"),
         ("write a script to parse CSV", "develop"),
+        # review
         ("review the code in auth.py", "review"),
         ("code review for PR #42", "review"),
+        # test
         ("write unit tests for the parser", "test"),
         ("run tests and report failures", "test"),
+        # architect
         ("design the architecture for the billing system", "architect"),
         ("write an ADR for the database choice", "architect"),
+        # research
         ("how does the existing cache work?", "research"),
         ("where is the config loaded?", "research"),
+        # chat
         ("what's the weather today?", "chat"),
         ("who won the championship?", "chat"),
         ("explain recursion to me", "chat"),

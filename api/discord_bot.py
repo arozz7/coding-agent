@@ -161,6 +161,7 @@ bot = DiscordAgentBot()
 _PHASE_LABELS: dict[str, str] = {
     "queued":      "Queued",
     "pending":     "Queued",
+    "planning":    "Building plan",
     "developing":  "Writing code",
     "reviewing":   "Reviewing",
     "testing":     "Running tests",
@@ -181,7 +182,7 @@ async def _poll_job(ctx: commands.Context, status_msg: discord.Message, job_id: 
     """
     start = time.monotonic()
     # Task types whose full response should be shown inline in the channel.
-    _INLINE_TYPES = {"chat", "research"}
+    _INLINE_TYPES = {"chat", "research", "plan"}
 
     while True:
         await asyncio.sleep(POLL_INTERVAL)
@@ -220,6 +221,7 @@ async def _poll_job(ctx: commands.Context, status_msg: discord.Message, job_id: 
                 chunks = _chunk(full)
                 for chunk in chunks:
                     await ctx.send(chunk)
+                    await asyncio.sleep(0.3)  # avoid Discord rate-limit dropping messages
 
             else:
                 # Summarise-only for file-producing tasks.
@@ -345,6 +347,7 @@ async def result(ctx: commands.Context):
 
     for chunk in _chunk(clean):
         await ctx.send(chunk)
+        await asyncio.sleep(0.3)  # avoid Discord rate-limit dropping messages
 
 
 @bot.command(name="files")

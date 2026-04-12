@@ -30,7 +30,7 @@ class TestStartPollCycle:
         data = resp.json()
         assert "job_id" in data
         assert "session_id" in data
-        assert data["task_type"] in ("chat", "develop", "research", "review", "test", "architect")
+        assert data["task_type"] in ("chat", "develop", "research", "review", "test", "architect", "plan")
 
     @pytest.mark.asyncio
     async def test_full_poll_cycle_chat(self, client):
