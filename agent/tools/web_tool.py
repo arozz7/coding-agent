@@ -91,9 +91,12 @@ class WebTool:
     ) -> List[Dict[str, str]]:
         """Fall back to DuckDuckGo (no API key required)."""
         try:
-            from duckduckgo_search import DDGS  # type: ignore
+            from ddgs import DDGS  # type: ignore
         except ImportError:
-            return [{"error": "duckduckgo-search not installed — run: pip install duckduckgo-search"}]
+            try:
+                from duckduckgo_search import DDGS  # type: ignore  # legacy name
+            except ImportError:
+                return [{"error": "ddgs not installed — run: pip install ddgs"}]
 
         try:
             n = min(max_results, _MAX_RESULTS)
