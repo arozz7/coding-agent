@@ -505,11 +505,26 @@ async def tasks_cmd(ctx: commands.Context):
     for t in task_list:
         icon = _STATUS_ICONS.get(t["status"], "•")
         agent = t["agent_type"]
-        desc = t["description"][:60]
         seq = t["sequence"]
+
+        # Truncate description at a word boundary
+        raw_desc = t["description"]
+        if len(raw_desc) > 72:
+            cut = raw_desc[:72].rsplit(" ", 1)[0]
+            desc = cut + "…"
+        else:
+            desc = raw_desc
+
+        # Strip code blocks and leading whitespace from result snippet
         result_snippet = ""
-        if t.get("result") and t["status"] == "done":
-            result_snippet = f"  › {t['result'][:50]}…"
+        if t.get("result") and t["status"] in ("done", "failed"):
+            raw = re.sub(r'```[\s\S]*?```', '', t["result"]).strip()
+            # Take first non-empty line as snippet
+            first_line = next((ln.strip() for ln in raw.splitlines() if ln.strip()), "")
+            if first_line:
+                snippet = first_line[:60] + ("…" if len(first_line) > 60 else "")
+                result_snippet = f"\n    › {snippet}"
+
         lines.append(f"{icon} **{seq}.** [{agent}] {desc}{result_snippet}")
 
     await ctx.send(_truncate("\n".join(lines), 1900))
