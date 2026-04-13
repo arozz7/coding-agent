@@ -1,3 +1,4 @@
+import os
 import subprocess
 from pathlib import Path
 from typing import Optional, List
@@ -12,13 +13,22 @@ class GitError(Exception):
 
 class GitTool:
     def __init__(self, repo_path: str):
-        # repo_path comes from WORKSPACE_PATH env var, not HTTP input — lgtm[py/path-injection]
-        self.repo_path = Path(repo_path).resolve()  # lgtm[py/path-injection]
+        resolved = Path(repo_path).resolve()
+        # Validate path against the configured workspace to prevent path traversal.
+        # repo_path always originates from the WORKSPACE_PATH env var (never HTTP input).
+        workspace_env = os.environ.get("WORKSPACE_PATH", "")
+        if workspace_env:
+            allowed = Path(workspace_env).resolve()
+            if resolved != allowed and not str(resolved).startswith(str(allowed) + os.sep):
+                raise GitError(
+                    f"Repository path '{resolved}' is outside the configured workspace"
+                )
+        self.repo_path = resolved
         self.logger = logger.bind(component="git_tool")
         self._verify_repo()
 
     def _verify_repo(self) -> None:
-        if not self.repo_path.exists():  # lgtm[py/path-injection]
+        if not self.repo_path.exists():
             raise GitError(f"Repository path does not exist: {self.repo_path}")
 
         result = subprocess.run(

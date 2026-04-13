@@ -138,11 +138,16 @@ def _summarize_response(text: str, max_chars: int = 500) -> str:
     **Shell Output:** section is extracted first and appended in truncated
     form so Discord users can see what ran without needing !result.
     """
-    # Extract shell output block before stripping code fences
+    # Cap input length before regex to prevent ReDoS on adversarial inputs
+    safe_text = text[:20_000]
+
+    # Extract shell output block before stripping code fences.
+    # re.DOTALL lets '.' match newlines; avoids the [\s\S] pattern flagged for ReDoS.
     shell_snippet = ""
     shell_match = re.search(
-        r'\*\*Shell Output:\*\*\s*```[^\n]*\n([\s\S]*?)```',
-        text,
+        r'\*\*Shell Output:\*\*\s*```[^\n]*\n(.+?)```',
+        safe_text,
+        re.DOTALL,
     )
     if shell_match:
         output = shell_match.group(1).strip()
@@ -153,7 +158,7 @@ def _summarize_response(text: str, max_chars: int = 500) -> str:
             truncated += f"\n… ({len(lines)} lines total)"
         shell_snippet = f"\n\n**Shell output:**\n```\n{truncated}\n```"
 
-    prose = re.sub(r'```[\s\S]*?```', '', text).strip()
+    prose = re.sub(r'```.*?```', '', safe_text, flags=re.DOTALL).strip()
     prose = re.sub(r'\n{3,}', '\n\n', prose)
     if len(prose) > max_chars:
         prose = prose[:max_chars].rstrip() + "…"

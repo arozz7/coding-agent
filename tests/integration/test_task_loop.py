@@ -142,12 +142,12 @@ class TestTaskLoop:
         planner.plan = AsyncMock(return_value=plan_specs)
         orch.planner_agent = planner
 
-        # task_store: fully functional in-memory using real TaskStore
+        # task_store: fully functional using real TaskStore with a temp DB
         import tempfile
         from api.task_store import TaskStore
-        import os
-        tmp = tempfile.mktemp(suffix=".db")
-        orch.task_store = TaskStore(db_path=tmp)
+        tmp_fd, tmp_path_db = tempfile.mkstemp(suffix=".db")
+        import os; os.close(tmp_fd)
+        orch.task_store = TaskStore(db_path=tmp_path_db)
 
         # _build_enriched_context returns empty string
         orch._build_enriched_context = AsyncMock(return_value="")
@@ -197,11 +197,12 @@ class TestTaskLoop:
 
     @pytest.mark.asyncio
     async def test_loop_stores_tasks_when_job_id_given(self):
-        import tempfile
+        import tempfile, os
         from api.task_store import TaskStore
 
-        tmp = tempfile.mktemp(suffix=".db")
-        task_store = TaskStore(db_path=tmp)
+        tmp_fd, tmp_path_db = tempfile.mkstemp(suffix=".db")
+        os.close(tmp_fd)
+        task_store = TaskStore(db_path=tmp_path_db)
 
         specs = [
             {"description": "T1", "agent_type": "develop"},

@@ -360,7 +360,7 @@ class SDLCWorkflow:
             if not self._port_in_use(port):
                 return port
         with socket.socket() as s:
-            s.bind(("", 0))
+            s.bind(("127.0.0.1", 0))  # bind to loopback only, not all interfaces
             return s.getsockname()[1]
 
     def _cleanup_old_screenshots(self, directory: Path) -> None:
