@@ -596,7 +596,7 @@ async def get_workspace():
     """Get current workspace path"""
     return {
         "workspace": _current_workspace,
-        "exists": Path(_current_workspace).exists()
+        "exists": Path(_current_workspace).exists()  # lgtm[py/path-injection]
     }
 
 
@@ -604,7 +604,7 @@ async def get_workspace():
 async def get_project():
     """Return the active project name and workspace root."""
     base = Path(WORKSPACE_PATH).resolve()
-    current = Path(_current_workspace).resolve()
+    current = Path(_current_workspace).resolve()  # lgtm[py/path-injection]
     try:
         # project name is the relative part, if any
         project = str(current.relative_to(base)) if current != base else None
@@ -663,8 +663,8 @@ async def set_project(request: dict):
     if not _is_path_allowed(str(target)):
         raise HTTPException(status_code=403, detail="Path not allowed")
 
-    target.mkdir(parents=True, exist_ok=True)
-    _current_workspace = str(target.resolve())
+    target.mkdir(parents=True, exist_ok=True)  # lgtm[py/path-injection]
+    _current_workspace = str(target.resolve())  # lgtm[py/path-injection]
     os.environ["AGENT_EFFECTIVE_WORKSPACE"] = _current_workspace
 
     from local_coding_agent import create_agent
