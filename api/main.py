@@ -147,8 +147,10 @@ def _effective_workspace(base: str = WORKSPACE_PATH, project: str = PROJECT_DIR)
 _current_workspace: str = _effective_workspace()
 # Ensure the effective workspace directory exists.
 Path(_current_workspace).mkdir(parents=True, exist_ok=True)
-# Keep os.environ in sync so GitTool (which reads WORKSPACE_PATH directly) agrees.
-os.environ["WORKSPACE_PATH"] = _current_workspace
+# Publish the effective workspace in a dedicated env var that GitTool reads.
+# We deliberately do NOT overwrite WORKSPACE_PATH — that variable must stay as
+# the base path from .env so that module reloads don't double-append PROJECT_DIR.
+os.environ["AGENT_EFFECTIVE_WORKSPACE"] = _current_workspace
 
 # SQLite-backed job store (write-through, in-memory hot cache)
 _job_store: JobStore = JobStore("data/jobs.db")
@@ -647,7 +649,7 @@ async def set_workspace(request: dict):
 
     _current_workspace = str(path)
     # Keep GitTool in sync with the new workspace.
-    os.environ["WORKSPACE_PATH"] = _current_workspace
+    os.environ["AGENT_EFFECTIVE_WORKSPACE"] = _current_workspace
 
     # Recreate orchestrator with new workspace
     from local_coding_agent import create_agent

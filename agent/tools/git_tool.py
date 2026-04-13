@@ -16,9 +16,24 @@ class GitTool:
         # Always resolve the workspace from the environment (trusted source only).
         # repo_path is accepted for backward-compatibility but never used in any
         # path operation — this ensures no user-supplied value reaches the filesystem.
-        workspace_env = os.environ.get("WORKSPACE_PATH", "")
-        if not workspace_env:
-            raise GitError("WORKSPACE_PATH environment variable is required")
+        #
+        # Priority:
+        #   1. AGENT_EFFECTIVE_WORKSPACE — set by api/main.py to the fully-resolved
+        #      effective path (WORKSPACE_PATH / PROJECT_DIR).  Preferred because it
+        #      is set programmatically and is never stored in .env, so module reloads
+        #      cannot cause double-appending of PROJECT_DIR.
+        #   2. WORKSPACE_PATH + PROJECT_DIR — fallback for processes that don't go
+        #      through api/main.py (e.g. tests, CLI usage).
+        effective_env = os.environ.get("AGENT_EFFECTIVE_WORKSPACE", "").strip()
+        if effective_env:
+            workspace_env = effective_env
+        else:
+            workspace_env = os.environ.get("WORKSPACE_PATH", "").strip()
+            if not workspace_env:
+                raise GitError("WORKSPACE_PATH environment variable is required")
+            project_dir = os.environ.get("PROJECT_DIR", "").strip()
+            if project_dir:
+                workspace_env = str(Path(workspace_env) / project_dir)
         self.repo_path = Path(workspace_env).resolve()
         self.logger = logger.bind(component="git_tool")
         self._verify_repo()
