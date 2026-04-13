@@ -600,6 +600,23 @@ async def get_workspace():
     }
 
 
+@app.get("/workspace/project")
+async def get_project():
+    """Return the active project name and workspace root."""
+    base = Path(WORKSPACE_PATH).resolve()
+    current = Path(_current_workspace).resolve()
+    try:
+        # project name is the relative part, if any
+        project = str(current.relative_to(base)) if current != base else None
+    except ValueError:
+        project = None
+    return {
+        "project": project,
+        "workspace": str(current),
+        "workspace_root": str(base),
+    }
+
+
 @app.get("/workspace/directories")
 async def list_workspace_directories():
     """List available directories in workspace"""
@@ -620,6 +637,49 @@ async def list_workspace_directories():
     except Exception as e:
         logger.error("workspace_list_failed", error=str(e))
         raise HTTPException(status_code=500, detail="Could not list workspace")
+
+
+@app.post("/workspace/project")
+async def set_project(request: dict):
+    """Switch the active project subdirectory within the workspace root.
+
+    Body: {"name": "<project-name>"}   — switch to WORKSPACE_PATH/<name>
+          {"name": ""}  or {"name": null} — clear back to workspace root
+    The project directory is created if it does not yet exist.
+    """
+    global _current_workspace, _orchestrator
+
+    raw_name = (request.get("name") or "").strip()
+
+    # Reject names that try to escape the workspace root.
+    if ".." in raw_name or raw_name.startswith(("/", "\\")):
+        raise HTTPException(status_code=400, detail="Invalid project name")
+
+    if raw_name:
+        target = Path(WORKSPACE_PATH) / raw_name
+    else:
+        target = Path(WORKSPACE_PATH)
+
+    if not _is_path_allowed(str(target)):
+        raise HTTPException(status_code=403, detail="Path not allowed")
+
+    target.mkdir(parents=True, exist_ok=True)
+    _current_workspace = str(target.resolve())
+    os.environ["AGENT_EFFECTIVE_WORKSPACE"] = _current_workspace
+
+    from local_coding_agent import create_agent
+    _orchestrator = create_agent(_current_workspace, "config/models.yaml")
+
+    logger.info(
+        "project_switched",
+        project=raw_name or "(root)",
+        workspace=_current_workspace,
+    )
+    return {
+        "success": True,
+        "project": raw_name or None,
+        "workspace": _current_workspace,
+    }
 
 
 @app.post("/workspace")

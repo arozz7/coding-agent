@@ -210,6 +210,9 @@ class AgentClient:
     async def get_file(self, path: str) -> dict:
         return await self._get("/workspace/file", path=path)
 
+    async def set_project(self, name: str) -> dict:
+        return await self._post("/workspace/project", {"name": name})
+
     async def get_session_history(self, session_id: str) -> dict:
         return await self._get(f"/sessions/{session_id}")
 
@@ -783,6 +786,58 @@ async def workspace(ctx: commands.Context):
         await ctx.send(f"Error: {exc}")
 
 
+@bot.command(name="project")
+async def project_cmd(ctx: commands.Context, *, name: str = ""):
+    """Show or switch the active project.
+
+    !project              — show current project and workspace root
+    !project <name>       — switch to WORKSPACE_PATH/<name> (created if needed)
+    !project clear        — return to workspace root (for starting a new project)
+    """
+    name = name.strip()
+
+    # Show current state.
+    if not name:
+        try:
+            data = await bot.client._get("/workspace")
+            ws = data.get("workspace", "unknown")
+            proj_data = await bot.client._get("/workspace/project")
+            project = proj_data.get("project") or "(none — at workspace root)"
+            root = proj_data.get("workspace_root", ws)
+            await ctx.send(
+                f"**Active project:** `{project}`\n"
+                f"**Workspace root:** `{root}`\n"
+                f"**Effective path:** `{ws}`\n\n"
+                f"Use `!project <name>` to switch, `!project clear` to return to root."
+            )
+        except Exception as exc:
+            await ctx.send(f"Error fetching project info: {exc}")
+        return
+
+    # Clear back to workspace root.
+    if name.lower() == "clear":
+        try:
+            data = await bot.client.set_project("")
+            await ctx.send(
+                f"Cleared to workspace root: `{data.get('workspace')}`\n"
+                f"The agent will now create a new subdirectory for the next project."
+            )
+        except Exception as exc:
+            await ctx.send(f"Could not clear project: {exc}")
+        return
+
+    # Switch to named project.
+    try:
+        data = await bot.client.set_project(name)
+        await ctx.send(
+            f"Switched to project **{name}**\n"
+            f"Workspace: `{data.get('workspace')}`\n"
+            f"Directory created if it did not exist. Ready for `!ask`."
+        )
+    except Exception as exc:
+        await ctx.send(f"Could not switch project: {exc}")
+
+
 @bot.command(name="git")
 async def git_cmd(ctx: commands.Context, *, args: str):
     """Run a safe read-only git command: status, log, diff, branch."""
@@ -970,7 +1025,10 @@ async def helpme(ctx: commands.Context):
         "`!clear` — Clear conversation history\n"
         "`!sessions` — List all sessions\n\n"
         "**Workspace:**\n"
-        "`!workspace` — Show workspace path and top-level contents\n\n"
+        "`!workspace` — Show workspace path and top-level contents\n"
+        "`!project` — Show active project\n"
+        "`!project <name>` — Switch to (or create) a project subdirectory\n"
+        "`!project clear` — Return to workspace root to start a new project\n\n"
         "**Models:**\n"
         "`!models` — List all configured models\n"
         "`!model` — Show active model\n"
