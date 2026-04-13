@@ -2,6 +2,7 @@ from typing import TypedDict, Annotated, List, Optional, Callable
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
+import os
 import structlog
 
 from llm import ModelRouter
@@ -515,10 +516,20 @@ class AgentOrchestrator:
         else:
             shell_guide = "Shell: bash/sh (Linux)"
 
+        active_project = os.environ.get("PROJECT_DIR", "").strip()
+        project_line = (
+            f"Active project: {active_project} "
+            f"(workspace is already scoped — write files at workspace root, "
+            f"NOT inside a new subdirectory)\n"
+            if active_project
+            else ""
+        )
+
         return (
             f"\n\n## Runtime Environment\n"
             f"OS: {system} {release}\n"
             f"{shell_guide}\n"
+            f"{project_line}"
         )
 
     async def _build_enriched_context(self, task: str) -> str:

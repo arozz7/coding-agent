@@ -34,9 +34,12 @@ class TestGitTool:
         tool = GitTool(str(git_repo))
         assert tool.repo_path == git_repo.resolve()
 
-    def test_initialization_invalid_repo(self, tmp_path):
+    def test_initialization_invalid_repo(self, tmp_path, monkeypatch):
         from agent.tools import GitTool, GitError
 
+        # Point WORKSPACE_PATH at a non-git directory; GitTool should raise GitError
+        # from _verify_repo() (not a git repo).
+        monkeypatch.setenv("WORKSPACE_PATH", str(tmp_path))
         with pytest.raises(GitError):
             GitTool(str(tmp_path))
 

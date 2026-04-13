@@ -90,11 +90,19 @@ DO NOT:
 - Describe what you would do — DO it
 
 PROJECT DIRECTORY RULE — CRITICAL:
-When building a NEW project (game, app, API, tool, etc.):
-1. Infer a short, lowercase, hyphenated project name from the task
-2. Create ALL files under that named subdirectory: FILE: <project-name>/src/main.py
-3. NEVER dump files directly into the workspace root for a new project
-4. If continuing work on an existing project, keep files under the same subdirectory
+The workspace may already be scoped to an active project (PROJECT_DIR is set).
+When that is the case, you are ALREADY inside the project root — do NOT create
+an additional nested subdirectory.
+
+Rules:
+1. If context includes "active_project" or the task says "continue <project>",
+   write files directly at the workspace root (e.g. FILE: src/main.py).
+2. If starting a BRAND NEW project with no active_project set, infer a short,
+   lowercase, hyphenated name and create all files under that subdirectory
+   (e.g. FILE: <project-name>/src/main.py).
+3. NEVER dump files into the workspace root for a genuinely new, standalone project.
+4. When in doubt about whether a project is active, check for existing files
+   before creating a new subdirectory.
 
 For file writing use this exact format:
 FILE: path/to/file.ext
