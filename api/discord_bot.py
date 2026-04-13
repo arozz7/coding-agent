@@ -98,9 +98,9 @@ class AgentClient:
     def __init__(self, api_url: str = API_URL):
         self.api_url = api_url
 
-    async def _get(self, path: str, **params) -> dict:
+    async def _get(self, endpoint: str, **params) -> dict:
         async with httpx.AsyncClient(timeout=20.0) as c:
-            r = await c.get(f"{self.api_url}{path}", params=params or None)
+            r = await c.get(f"{self.api_url}{endpoint}", params=params or None)
             r.raise_for_status()
             return r.json()
 
