@@ -332,8 +332,7 @@ async def start_task_background(request: TaskRequest):
             if result.get("success"):
                 inner = result.get("result", {})
                 full_response = inner.get("response", "")
-                _job_store.update(
-                    job_id,
+                update_kwargs: dict = dict(
                     status="done",
                     phase="complete",
                     task_type=inner.get("task_type", task_type),
@@ -342,6 +341,15 @@ async def start_task_background(request: TaskRequest):
                     _full_response=full_response,
                     screenshot_path=inner.get("screenshot_path"),
                 )
+                # Handover metadata — stored in the in-memory job cache so the
+                # Discord bot can read it via GET /task/{job_id}.
+                if result.get("handover_triggered"):
+                    update_kwargs["handover_triggered"] = True
+                    update_kwargs["new_session_id"] = result.get("session_id")
+                    update_kwargs["context_budget"] = result.get("context_budget", "bridge")
+                elif result.get("context_budget") == "warn":
+                    update_kwargs["context_budget"] = "warn"
+                _job_store.update(job_id, **update_kwargs)
             else:
                 _job_store.update(
                     job_id,

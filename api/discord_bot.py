@@ -367,6 +367,22 @@ async def _poll_job(ctx: commands.Context, status_msg: discord.Message, job_id: 
             files = job.get("files_created", [])
             screenshot_path = job.get("screenshot_path")
 
+            # Context bridge — silently swap the user's session and notify.
+            if job.get("handover_triggered") and job.get("new_session_id"):
+                new_sid = job["new_session_id"]
+                user_id = str(ctx.author.id)
+                bot.user_sessions[user_id] = new_sid
+                await ctx.send(
+                    f"**Context bridged** — session was near capacity so a fresh "
+                    f"session was started and pre-loaded with a summary of our work. "
+                    f"New session: `{new_sid}`. Everything continues seamlessly."
+                )
+            elif job.get("context_budget") == "warn":
+                await ctx.send(
+                    "**Heads-up:** context window is 75 %+ full. "
+                    "The next task may trigger an automatic context bridge."
+                )
+
             if task_type in _INLINE_TYPES:
                 # Fetch and stream the full response for conversational tasks.
                 try:

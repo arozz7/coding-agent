@@ -91,18 +91,19 @@ DO NOT:
 
 PROJECT DIRECTORY RULE — CRITICAL:
 The workspace may already be scoped to an active project (PROJECT_DIR is set).
-When that is the case, you are ALREADY inside the project root — do NOT create
-an additional nested subdirectory.
+When that is the case, you are ALREADY inside the project root — do NOT prefix
+paths with the project name again.
 
 Rules:
-1. If context includes "active_project" or the task says "continue <project>",
-   write files directly at the workspace root (e.g. FILE: src/main.py).
-2. If starting a BRAND NEW project with no active_project set, infer a short,
-   lowercase, hyphenated name and create all files under that subdirectory
-   (e.g. FILE: <project-name>/src/main.py).
+1. If context includes "Active project: <name>", the workspace IS that project.
+   Write files at the workspace root:
+     CORRECT:  FILE: docs/narrative/01-story.md
+     WRONG:    FILE: Shadows-of-Eldoria/docs/narrative/01-story.md
+2. If starting a BRAND NEW project with no active project in context, infer a
+   short, lowercase, hyphenated name and create all files under that subdirectory:
+     FILE: <project-name>/src/main.py
 3. NEVER dump files into the workspace root for a genuinely new, standalone project.
-4. When in doubt about whether a project is active, check for existing files
-   before creating a new subdirectory.
+4. When in doubt, list existing files first before creating any subdirectory.
 
 For file writing use this exact format:
 FILE: path/to/file.ext
@@ -203,10 +204,10 @@ Implement the solution with:
 3. Basic tests
 4. Clear documentation in comments
 
-Write actual files using the format:
-FILE:
-```<language>
-# file content here
+Write actual files using the EXACT format (path on the SAME line as FILE:):
+FILE: path/to/file.ext
+```language
+file content here
 ```
 """
 
@@ -221,8 +222,12 @@ FILE:
             for file_path, content in file_writes:
                 try:
                     await tool_executor.execute("file_write", {"path": file_path, "content": content})
-                    files_created.append(file_path)
-                    self.logger.info("file_written", path=file_path, size=len(content))
+                    verify = await tool_executor.execute("file_read", {"path": file_path})
+                    if not verify.startswith("Error"):
+                        files_created.append(file_path)
+                        self.logger.info("file_written", path=file_path, size=len(content))
+                    else:
+                        self.logger.warning("file_write_not_verified", path=file_path, verify=verify[:120])
                 except Exception as e:
                     self.logger.error("file_write_failed", path=file_path, error=str(e))
 
@@ -256,8 +261,11 @@ FILE:
             for file_path, content in self._extract_file_writes(force_run_response):
                 try:
                     await tool_executor.execute("file_write", {"path": file_path, "content": content})
-                    if file_path not in files_created:
+                    verify = await tool_executor.execute("file_read", {"path": file_path})
+                    if not verify.startswith("Error") and file_path not in files_created:
                         files_created.append(file_path)
+                    elif verify.startswith("Error"):
+                        self.logger.warning("force_run_file_write_not_verified", path=file_path)
                 except Exception as e:
                     self.logger.error("force_run_file_write_failed", path=file_path, error=str(e))
 
@@ -287,8 +295,11 @@ FILE:
                 for file_path, content in self._extract_file_writes(fix_response):
                     try:
                         await tool_executor.execute("file_write", {"path": file_path, "content": content})
-                        if file_path not in files_created:
+                        verify = await tool_executor.execute("file_read", {"path": file_path})
+                        if not verify.startswith("Error") and file_path not in files_created:
                             files_created.append(file_path)
+                        elif verify.startswith("Error"):
+                            self.logger.warning("fix_file_write_not_verified", path=file_path)
                     except Exception as e:
                         self.logger.error("fix_file_write_failed", path=file_path, error=str(e))
 
