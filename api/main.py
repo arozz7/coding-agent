@@ -137,29 +137,37 @@ def _summarize_response(text: str, max_chars: int = 500) -> str:
     Fenced code blocks are stripped from the prose portion, but any
     **Shell Output:** section is extracted first and appended in truncated
     form so Discord users can see what ran without needing !result.
+
+    Uses plain string operations (no regex on user input) to avoid ReDoS.
     """
-    # Cap input length before regex to prevent ReDoS on adversarial inputs
     safe_text = text[:20_000]
 
-    # Extract shell output block before stripping code fences.
-    # re.DOTALL lets '.' match newlines; avoids the [\s\S] pattern flagged for ReDoS.
+    # --- Extract shell output block using plain string search (no regex) ---
     shell_snippet = ""
-    shell_match = re.search(
-        r'\*\*Shell Output:\*\*\s*```[^\n]*\n(.{0,10000})```',
-        safe_text,
-        re.DOTALL,
-    )
-    if shell_match:
-        output = shell_match.group(1).strip()
-        lines = output.splitlines()
-        preview_lines = lines[:15]
-        truncated = "\n".join(preview_lines)
-        if len(lines) > 15:
-            truncated += f"\n… ({len(lines)} lines total)"
-        shell_snippet = f"\n\n**Shell output:**\n```\n{truncated}\n```"
+    shell_marker = "**Shell Output:**"
+    marker_pos = safe_text.find(shell_marker)
+    if marker_pos != -1:
+        fence_pos = safe_text.find("```", marker_pos)
+        if fence_pos != -1:
+            nl_pos = safe_text.find("\n", fence_pos)
+            if nl_pos != -1:
+                close_pos = safe_text.find("```", nl_pos + 1)
+                if close_pos != -1:
+                    output = safe_text[nl_pos + 1:close_pos].strip()
+                    lines = output.splitlines()
+                    truncated = "\n".join(lines[:15])
+                    if len(lines) > 15:
+                        truncated += f"\n… ({len(lines)} lines total)"
+                    shell_snippet = f"\n\n**Shell output:**\n```\n{truncated}\n```"
 
-    prose = re.sub(r'```.{0,10000}```', '', safe_text, flags=re.DOTALL).strip()
-    prose = re.sub(r'\n{3,}', '\n\n', prose)
+    # --- Strip code blocks using split (no regex on user input) ---
+    # Splitting on ``` gives alternating outside/inside-fence segments.
+    # Even-indexed parts are outside fences; odd-indexed are inside (discard).
+    parts = safe_text.split("```")
+    prose = "".join(parts[i] for i in range(0, len(parts), 2)).strip()
+    # Collapse excessive blank lines
+    while "\n\n\n" in prose:
+        prose = prose.replace("\n\n\n", "\n\n")
     if len(prose) > max_chars:
         prose = prose[:max_chars].rstrip() + "…"
     return (prose or "(task completed)") + shell_snippet
