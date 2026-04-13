@@ -334,9 +334,6 @@ async def _poll_job(ctx: commands.Context, status_msg: discord.Message, job_id: 
             return
 
         else:
-            # Always update the status message (phase may have changed).
-            # Reset the heartbeat timer on every successful edit.
-            last_heartbeat = now
             await status_msg.edit(content=f"{label}… ({elapsed}s elapsed)")
 
 
