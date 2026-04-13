@@ -1,6 +1,6 @@
 """Unit tests for model resilience."""
 import pytest
-from unittest.mock import Mock, patch
+from unittest.mock import AsyncMock, Mock, patch
 from datetime import datetime, timedelta
 
 from llm.model_resilience import (
@@ -47,58 +47,75 @@ class TestModelHealthStatus:
         assert status.is_available is True
 
 
-class TestOllamaModelManager:
-    @patch("llm.model_resilience.httpx.Client")
-    def test_list_models(self, mock_client_class):
-        mock_response = Mock()
-        mock_response.json.return_value = {"models": [{"name": "model1"}, {"name": "model2"}]}
-        
-        mock_client = Mock()
+def _make_async_client_mock(json_return=None, raise_exc=None, status_code=200):
+    """Build a mock for `async with httpx.AsyncClient() as c: await c.request(...)`.
+
+    The response object uses plain Mock (not AsyncMock) because production code
+    calls response.json() and response.raise_for_status() synchronously.
+    Only client.request() itself is awaited, so it uses AsyncMock.
+
+    Returns the class-level mock so it can be used as a patch target.
+    """
+    # response methods are sync — use plain Mock so json() returns the value directly
+    mock_response = Mock()
+    mock_response.status_code = status_code
+    mock_response.text = "{}"
+    mock_response.raise_for_status = Mock()
+    if json_return is not None:
+        mock_response.json.return_value = json_return
+
+    # client.request() is awaited — use AsyncMock
+    mock_client = AsyncMock()
+    if raise_exc:
+        mock_client.request.side_effect = raise_exc
+    else:
         mock_client.request.return_value = mock_response
-        mock_client_class.return_value = mock_client
-        
-        manager = OllamaModelManager()
-        models = manager.list_models()
-        
+
+    mock_class = Mock()
+    mock_class.return_value.__aenter__ = AsyncMock(return_value=mock_client)
+    mock_class.return_value.__aexit__ = AsyncMock(return_value=False)
+    return mock_class
+
+
+class TestOllamaModelManager:
+    @pytest.mark.asyncio
+    async def test_list_models(self):
+        mock_class = _make_async_client_mock(
+            json_return={"models": [{"name": "model1"}, {"name": "model2"}]}
+        )
+        with patch("llm.model_resilience.httpx.AsyncClient", mock_class):
+            manager = OllamaModelManager()
+            models = await manager.list_models()
+
         assert len(models) == 2
         assert models[0]["name"] == "model1"
-    
-    @patch("llm.model_resilience.httpx.Client")
-    def test_get_model_status_available(self, mock_client_class):
-        mock_response = Mock()
-        mock_response.status_code = 200
-        mock_response.json.return_value = {"model": "test-model", "parameters": {}}
-        
-        mock_client = Mock()
-        mock_client.request.return_value = mock_response
-        mock_client_class.return_value = mock_client
-        
-        manager = OllamaModelManager()
-        status = manager.get_model_status("test-model")
-        
+
+    @pytest.mark.asyncio
+    async def test_get_model_status_available(self):
+        mock_class = _make_async_client_mock(
+            json_return={"model": "test-model", "parameters": {}},
+            status_code=200,
+        )
+        with patch("llm.model_resilience.httpx.AsyncClient", mock_class):
+            manager = OllamaModelManager()
+            status = await manager.get_model_status("test-model")
+
         assert status.status == ModelStatus.AVAILABLE
         assert status.is_available is True
-    
-    @patch("llm.model_resilience.httpx.Client")
-    def test_check_ollama_running(self, mock_client_class):
-        mock_response = Mock()
-        mock_response.status_code = 200
-        
-        mock_client = Mock()
-        mock_client.request.return_value = mock_response
-        mock_client_class.return_value = mock_client
-        
-        manager = OllamaModelManager()
-        assert manager.check_ollama_running() is True
-    
-    @patch("llm.model_resilience.httpx.Client")
-    def test_check_ollama_not_running(self, mock_client_class):
-        mock_client = Mock()
-        mock_client.request.side_effect = Exception("Connection refused")
-        mock_client_class.return_value = mock_client
-        
-        manager = OllamaModelManager()
-        assert manager.check_ollama_running() is False
+
+    @pytest.mark.asyncio
+    async def test_check_ollama_running(self):
+        mock_class = _make_async_client_mock(json_return={}, status_code=200)
+        with patch("llm.model_resilience.httpx.AsyncClient", mock_class):
+            manager = OllamaModelManager()
+            assert await manager.check_ollama_running() is True
+
+    @pytest.mark.asyncio
+    async def test_check_ollama_not_running(self):
+        mock_class = _make_async_client_mock(raise_exc=Exception("Connection refused"))
+        with patch("llm.model_resilience.httpx.AsyncClient", mock_class):
+            manager = OllamaModelManager()
+            assert await manager.check_ollama_running() is False
 
 
 class TestCloudRateLimitHandler:
@@ -198,28 +215,26 @@ class TestModelResilienceManager:
         assert manager.ollama_manager.endpoint == "http://localhost:11434"
         assert manager.fallback_models == ["fallback-model"]
     
-    @patch("llm.model_resilience.OllamaModelManager")
-    def test_is_model_available(self, mock_manager_class):
-        mock_instance = Mock()
+    @pytest.mark.asyncio
+    async def test_is_model_available(self):
+        mock_instance = AsyncMock()
         mock_instance.get_model_status.return_value = ModelHealthStatus(
             model_name="test",
             status=ModelStatus.AVAILABLE,
             is_available=True,
             last_checked=datetime.utcnow(),
         )
-        mock_manager_class.return_value = mock_instance
-        
+
         manager = ModelResilienceManager()
         manager.ollama_manager = mock_instance
-        
-        available = manager.is_model_available("test")
-        
+
+        available = await manager.is_model_available("test")
+
         assert available is True
-    
-    @patch("llm.model_resilience.OllamaModelManager")
-    def test_find_available_model(self, mock_manager_class):
+
+    @pytest.mark.asyncio
+    async def test_find_available_model(self):
         manager = ModelResilienceManager()
-        
         manager._model_status_cache = {
             "unavailable": ModelHealthStatus(
                 model_name="unavailable",
@@ -234,17 +249,17 @@ class TestModelResilienceManager:
                 last_checked=datetime.utcnow(),
             ),
         }
-        
-        found = manager.find_available_model(["unavailable", "available-model"])
-        
+
+        found = await manager.find_available_model(["unavailable", "available-model"])
+
         assert found == "available-model"
-    
-    @patch("llm.model_resilience.OllamaModelManager")
-    def test_find_working_fallback_local_unavailable(self, mock_manager_class):
-        mock_instance = Mock()
-        
+
+    @pytest.mark.asyncio
+    async def test_find_working_fallback_local_unavailable(self):
+        mock_instance = AsyncMock()
         call_count = [0]
-        def mock_status(name):
+
+        async def mock_status(name):
             call_count[0] += 1
             if call_count[0] == 1:
                 return ModelHealthStatus(
@@ -259,15 +274,14 @@ class TestModelResilienceManager:
                 is_available=True,
                 last_checked=datetime.utcnow(),
             )
-        
+
         mock_instance.get_model_status.side_effect = mock_status
-        mock_manager_class.return_value = mock_instance
-        
+
         manager = ModelResilienceManager(fallback_models=["fallback-model"])
         manager.ollama_manager = mock_instance
-        
-        model, source = manager.find_working_fallback("primary", ["cloud-model"])
-        
+
+        model, source = await manager.find_working_fallback("primary", ["cloud-model"])
+
         assert model is not None
         assert source in ["local", "cloud"]
     
@@ -298,11 +312,16 @@ class TestModelResilienceManager:
         assert result["action"] == "fallback"
         assert result["reason"] == "model_offloaded"
     
-    def test_get_diagnostics(self):
+    @pytest.mark.asyncio
+    async def test_get_diagnostics(self):
+        mock_instance = AsyncMock()
+        mock_instance.check_ollama_running.return_value = False
+
         manager = ModelResilienceManager()
-        
-        diagnostics = manager.get_diagnostics()
-        
+        manager.ollama_manager = mock_instance
+
+        diagnostics = await manager.get_diagnostics()
+
         assert "ollama_server" in diagnostics
         assert "rate_limits" in diagnostics
         assert "cached_models" in diagnostics

@@ -12,6 +12,7 @@ import structlog
 from llm import ModelRouter
 from agent.orchestrator import AgentOrchestrator
 from api.job_store import JobStore
+from api.task_store import TaskStore
 
 logger = structlog.get_logger()
 
@@ -126,14 +127,50 @@ _current_workspace: str = WORKSPACE_PATH
 # SQLite-backed job store (write-through, in-memory hot cache)
 _job_store: JobStore = JobStore("data/jobs.db")
 
+# Task store — shares the same SQLite file, different table
+_task_store: TaskStore = TaskStore("data/jobs.db")
+
 
 def _summarize_response(text: str, max_chars: int = 500) -> str:
-    """Strip fenced code blocks and return a short prose summary."""
-    prose = re.sub(r'```[\s\S]*?```', '', text).strip()
-    prose = re.sub(r'\n{3,}', '\n\n', prose)
+    """Return a short prose summary with shell output snippet preserved.
+
+    Fenced code blocks are stripped from the prose portion, but any
+    **Shell Output:** section is extracted first and appended in truncated
+    form so Discord users can see what ran without needing !result.
+
+    Uses plain string operations (no regex on user input) to avoid ReDoS.
+    """
+    safe_text = text[:20_000]
+
+    # --- Extract shell output block using plain string search (no regex) ---
+    shell_snippet = ""
+    shell_marker = "**Shell Output:**"
+    marker_pos = safe_text.find(shell_marker)
+    if marker_pos != -1:
+        fence_pos = safe_text.find("```", marker_pos)
+        if fence_pos != -1:
+            nl_pos = safe_text.find("\n", fence_pos)
+            if nl_pos != -1:
+                close_pos = safe_text.find("```", nl_pos + 1)
+                if close_pos != -1:
+                    output = safe_text[nl_pos + 1:close_pos].strip()
+                    lines = output.splitlines()
+                    truncated = "\n".join(lines[:15])
+                    if len(lines) > 15:
+                        truncated += f"\n… ({len(lines)} lines total)"
+                    shell_snippet = f"\n\n**Shell output:**\n```\n{truncated}\n```"
+
+    # --- Strip code blocks using split (no regex on user input) ---
+    # Splitting on ``` gives alternating outside/inside-fence segments.
+    # Even-indexed parts are outside fences; odd-indexed are inside (discard).
+    parts = safe_text.split("```")
+    prose = "".join(parts[i] for i in range(0, len(parts), 2)).strip()
+    # Collapse excessive blank lines
+    while "\n\n\n" in prose:
+        prose = prose.replace("\n\n\n", "\n\n")
     if len(prose) > max_chars:
-        return prose[:max_chars].rstrip() + "…"
-    return prose or "(task completed)"
+        prose = prose[:max_chars].rstrip() + "…"
+    return (prose or "(task completed)") + shell_snippet
 
 
 @app.on_event("startup")
@@ -192,7 +229,7 @@ async def run_task(request: TaskRequest):
     except Exception as e:
         import traceback
         logger.error("task_failed", error=str(e), traceback=traceback.format_exc())
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail="Internal server error")
 
 
 @app.post("/task/start")
@@ -237,6 +274,7 @@ async def start_task_background(request: TaskRequest):
                 session_id=session_id,
                 include_history=request.include_history,
                 on_phase=_on_phase,
+                job_id=job_id,
             )
             if result.get("success"):
                 inner = result.get("result", {})
@@ -249,6 +287,7 @@ async def start_task_background(request: TaskRequest):
                     files_created=inner.get("files_created", []),
                     summary=_summarize_response(full_response),
                     _full_response=full_response,
+                    screenshot_path=inner.get("screenshot_path"),
                 )
             else:
                 _job_store.update(
@@ -291,6 +330,23 @@ async def get_job_result(job_id: str):
     if job["status"] != "done":
         return {"status": job["status"], "result": None}
     return {"status": "done", "result": job.get("_full_response", "")}
+
+
+@app.get("/task/{job_id}/tasks")
+async def get_job_tasks(job_id: str):
+    """Return the task list for a job (created by the planner)."""
+    job = _job_store.get(job_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail=f"Job '{job_id}' not found")
+    tasks = _task_store.list_tasks(job_id)
+    counts = _task_store.task_counts(job_id)
+    return {
+        "job_id": job_id,
+        "tasks": [t.to_dict() for t in tasks],
+        "counts": counts,
+        "total": len(tasks),
+        "all_done": _task_store.all_done(job_id),
+    }
 
 
 @app.delete("/task/{job_id}")
@@ -608,7 +664,7 @@ async def call_mcp_tool(tool_name: str, arguments: dict = None):
         raise HTTPException(status_code=404, detail=str(e))
     except Exception as e:
         logger.error("mcp_tool_failed", tool=tool_name, error=str(e))
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail="Internal server error")
 
 
 @app.post("/subagent/spawn")
@@ -665,7 +721,7 @@ async def spawn_subagent_batch(request: dict):
         return {"results": results}
     except Exception as e:
         logger.error("subagent_batch_failed", error=str(e))
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail="Internal server error")
 
 
 @app.get("/subagent")
@@ -703,7 +759,7 @@ async def index_workspace(request: dict = None):
         return {"success": True, "result": result}
     except Exception as e:
         logger.error("index_failed", error=str(e))
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail="Internal server error")
 
 
 @app.get("/search")
@@ -718,7 +774,7 @@ async def search_codebase(q: str, limit: int = 5):
         return {"query": q, "results": results}
     except Exception as e:
         logger.error("search_failed", error=str(e))
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail="Internal server error")
 
 
 @app.get("/memory/stats")
@@ -738,7 +794,7 @@ async def get_memory_stats():
         }
     except Exception as e:
         logger.error("stats_failed", error=str(e))
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail="Internal server error")
 
 
 @app.get("/ready")
@@ -854,7 +910,7 @@ async def fetch_remote_skills():
         return result
     except Exception as e:
         logger.error("skills_fetch_failed", error=str(e))
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail="Internal server error")
 
 
 if __name__ == "__main__":
