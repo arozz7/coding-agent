@@ -23,19 +23,24 @@ logger = structlog.get_logger()
 TTL_HOURS = 24
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS jobs (
-    job_id       TEXT PRIMARY KEY,
-    status       TEXT NOT NULL DEFAULT 'pending',
-    phase        TEXT NOT NULL DEFAULT 'pending',
-    task_type    TEXT NOT NULL DEFAULT 'chat',
-    summary      TEXT,
+    job_id        TEXT PRIMARY KEY,
+    status        TEXT NOT NULL DEFAULT 'pending',
+    phase         TEXT NOT NULL DEFAULT 'pending',
+    task_type     TEXT NOT NULL DEFAULT 'chat',
+    summary       TEXT,
     files_created TEXT NOT NULL DEFAULT '[]',
-    error        TEXT,
-    session_id   TEXT NOT NULL,
-    task         TEXT NOT NULL,
+    error         TEXT,
+    session_id    TEXT NOT NULL,
+    task          TEXT NOT NULL,
     full_response TEXT,
-    created_at   TEXT NOT NULL,
-    updated_at   TEXT NOT NULL
+    screenshot_path TEXT,
+    created_at    TEXT NOT NULL,
+    updated_at    TEXT NOT NULL
 );
+"""
+
+_MIGRATE_ADD_SCREENSHOT = """
+ALTER TABLE jobs ADD COLUMN screenshot_path TEXT;
 """
 
 
@@ -60,7 +65,22 @@ class JobStore:
         self._conn.execute("PRAGMA journal_mode=WAL;")
         self._conn.execute(_SCHEMA)
         self._conn.commit()
+        self._migrate()
         logger.info("job_store_initialized", db_path=db_path)
+
+    def _migrate(self) -> None:
+        """Apply schema migrations on existing databases (idempotent)."""
+        existing = {
+            row[1]
+            for row in self._conn.execute("PRAGMA table_info(jobs)").fetchall()
+        }
+        if "screenshot_path" not in existing:
+            try:
+                self._conn.execute(_MIGRATE_ADD_SCREENSHOT)
+                self._conn.commit()
+                logger.info("job_store_migrated", added_column="screenshot_path")
+            except Exception as exc:
+                logger.warning("job_store_migration_failed", error=str(exc))
 
     def load(self) -> None:
         """Load all jobs from SQLite into the in-memory cache.
@@ -101,6 +121,7 @@ class JobStore:
             "session_id": session_id,
             "task": task,
             "_full_response": None,
+            "screenshot_path": None,
             "created_at": now,
             "updated_at": now,
         }
@@ -109,11 +130,11 @@ class JobStore:
             self._conn.execute(
                 """INSERT INTO jobs
                    (job_id, status, phase, task_type, summary, files_created, error,
-                    session_id, task, full_response, created_at, updated_at)
-                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""",
+                    session_id, task, full_response, screenshot_path, created_at, updated_at)
+                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                 (
                     job_id, "pending", phase, task_type, None, "[]", None,
-                    session_id, task, None, now, now,
+                    session_id, task, None, None, now, now,
                 ),
             )
             self._conn.commit()
@@ -136,7 +157,7 @@ class JobStore:
             self._conn.execute(
                 """UPDATE jobs SET
                    status=?, phase=?, task_type=?, summary=?, files_created=?,
-                   error=?, full_response=?, updated_at=?
+                   error=?, full_response=?, screenshot_path=?, updated_at=?
                    WHERE job_id=?""",
                 (
                     record["status"],
@@ -146,6 +167,7 @@ class JobStore:
                     json.dumps(record.get("files_created") or []),
                     record["error"],
                     record.get("_full_response"),
+                    record.get("screenshot_path"),
                     record["updated_at"],
                     job_id,
                 ),
@@ -180,6 +202,8 @@ class JobStore:
             d["files_created"] = []
         # Rename DB column → internal key used by the rest of the API
         d["_full_response"] = d.pop("full_response", None)
+        # screenshot_path stays as-is (None or an absolute path string)
+        d.setdefault("screenshot_path", None)
         return d
 
     def _prune_expired_locked(self) -> None:

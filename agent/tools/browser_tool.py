@@ -76,16 +76,36 @@ class BrowserTool:
             self.logger.error("screenshot_failed", error=str(e))
             return {"success": False, "error": str(e)}
     
+    async def wait_for_server(self, url: str, timeout: int = 30) -> bool:
+        """Poll *url* until it returns a sub-500 response or *timeout* seconds pass.
+
+        Returns True when the server is up, False on timeout.
+        """
+        import httpx
+
+        self.logger.info("waiting_for_server", url=url, timeout=timeout)
+        for _ in range(timeout):
+            await asyncio.sleep(1)
+            try:
+                r = httpx.get(url, timeout=2)
+                if r.status_code < 500:
+                    self.logger.info("server_ready", url=url)
+                    return True
+            except Exception:
+                continue
+        self.logger.warning("server_wait_timeout", url=url)
+        return False
+
     async def run_and_screenshot(self, port: int = 8080) -> dict:
         """Start dev server, wait, screenshot, stop server"""
         start_result = await self.start_dev_server(port=port)
         if not start_result.get("success"):
             return start_result
-        
+
         screenshot_result = await self.screenshot(f"http://localhost:{port}")
-        
+
         self.stop_dev_server()
-        
+
         return screenshot_result
 
 

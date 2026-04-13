@@ -57,24 +57,66 @@ class ShellTool:
         self.logger.info("shell_initialized", os=platform.system(), workspace=str(self.workspace))
 
     def _translate_unix_to_windows(self, cmd: str) -> str:
-        """Translate common Unix commands to their Windows equivalents."""
-        if cmd.startswith("ls"):
-            return "dir " + cmd[3:]
-        if cmd.startswith("cat "):
-            return "type " + cmd[4:]
-        if cmd.startswith("rm "):
-            return "del " + cmd[3:]
-        if cmd.startswith("mkdir "):
-            return "mkdir " + cmd[6:]
-        if cmd.startswith("rmdir "):
-            return "rmdir " + cmd[6:]
-        if cmd.startswith("touch "):
-            filename = cmd[6:].strip()
-            return f"echo. > {filename}"
-        if cmd.startswith("pwd"):
+        """Translate common Unix commands to their Windows equivalents.
+
+        Unix flags that have no direct Windows counterpart are dropped rather
+        than passed through unchanged (e.g. `ls -la` → `dir`, not `dir -la`).
+        """
+        parts = cmd.split()
+        verb = parts[0].lower() if parts else ""
+
+        if verb == "ls":
+            # Collect non-flag arguments (directory targets)
+            targets = [p for p in parts[1:] if not p.startswith("-")]
+            return "dir " + " ".join(targets) if targets else "dir"
+
+        if verb == "cat":
+            # `cat file` → `type file`; `cat file1 file2` → `type file1 file2`
+            targets = [p for p in parts[1:] if not p.startswith("-")]
+            return "type " + " ".join(targets) if targets else "type"
+
+        if verb == "rm":
+            targets = [p for p in parts[1:] if not p.startswith("-")]
+            return "del " + " ".join(targets) if targets else "del"
+
+        if verb == "mkdir":
+            targets = [p for p in parts[1:] if not p.startswith("-")]
+            return "mkdir " + " ".join(targets) if targets else "mkdir"
+
+        if verb == "rmdir":
+            targets = [p for p in parts[1:] if not p.startswith("-")]
+            return "rmdir " + " ".join(targets) if targets else "rmdir"
+
+        if verb == "touch":
+            filename = " ".join(parts[1:]).strip()
+            return f"echo. > {filename}" if filename else "echo."
+
+        if verb == "pwd":
             return "cd"
-        if cmd.startswith("which "):
-            return "where " + cmd[6:]
+
+        if verb == "which":
+            targets = " ".join(parts[1:])
+            return f"where {targets}" if targets else "where"
+
+        if verb == "grep":
+            # Best-effort: `grep pattern file` → `findstr pattern file`
+            targets = " ".join(parts[1:])
+            return f"findstr {targets}"
+
+        if verb == "cp":
+            targets = " ".join(p for p in parts[1:] if not p.startswith("-"))
+            return f"copy {targets}"
+
+        if verb == "mv":
+            targets = " ".join(p for p in parts[1:] if not p.startswith("-"))
+            return f"move {targets}"
+
+        if verb == "clear":
+            return "cls"
+
+        if verb == "echo" and ">" not in cmd and ">>" not in cmd:
+            return cmd  # echo works on Windows already
+
         return cmd
 
     def run(self, command: str, timeout: int = 60) -> dict:

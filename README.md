@@ -1,206 +1,205 @@
 # Local Coding Agent
 
-A local coding agent with LLM integration, MCP tools, multi-agent orchestration, and session persistence.
+An autonomous coding agent with LLM integration, multi-agent orchestration, SDLC pipeline, persistent task management, and Discord remote control.
 
 ## Features
 
-- **Local & Remote LLM Support**: Flexible model routing between Ollama (local) and cloud APIs
-- **MCP-Based Tool Integration**: Standardized access to file system, git, and code analysis
-- **Session Persistence**: Conversation history persists across restarts
-- **Git Integration**: Full git workflow support (status, diff, commit, log, branches)
-- **Cost Tracking**: Monitor API usage and costs
-- **Rate Limiting**: Built-in rate limiting to prevent API throttling
-- **Streaming Responses**: Real-time feedback during generation
+- **Discord Remote Control** — Submit tasks, monitor progress, view results from any device via Discord
+- **Agentic Task Manager** — Objectives are decomposed into ordered task lists; agents execute them sequentially and can add new tasks dynamically
+- **SDLC Pipeline** — Full plan → build → test → debug loop → run → verify → complete workflow
+- **Autonomous Run & Debug** — Agent runs shell commands, reads errors, fixes code, and re-runs automatically (up to 5 retries)
+- **Multi-Agent Routing** — Tasks automatically routed to the right agent: developer, researcher, planner, tester, reviewer, architect
+- **Local & Cloud LLM Support** — Flexible model routing between Ollama (local) and cloud APIs (OpenRouter, OpenAI-compatible)
+- **Background Job API** — FastAPI server with SQLite-backed job store; poll for status, retrieve results
+- **Session Persistence** — Conversation history survives restarts
+- **RAG + Wiki Memory** — Codebase indexed in ChromaDB; wiki compiled per session
+- **OS-Aware Execution** — Agent knows its OS and shell upfront; Windows command translation built in
 
 ## Documentation
 
-- [User Manual](docs/user-manual.md) - Complete usage guide
-- [Examples](docs/examples.md) - Practical examples and workflows
-- [Capabilities](docs/capabilities.md) - What the agent can and cannot do
-- [Implementation Plan](docs/plans/implementation_plan_v2.md) - Technical roadmap
+- [User Manual](docs/user-manual.md) — Complete usage guide
+- [Examples](docs/examples.md) — Practical examples and workflows
+- [Capabilities](docs/capabilities.md) — What the agent can and cannot do
 
 ## Quick Start
 
 ### Prerequisites
 
 - Python 3.11+
-- Ollama or OpenAI-compatible API (for local models)
+- Ollama or OpenAI-compatible API endpoint
+- Discord bot token (for remote control)
 
 ### Installation
 
 ```powershell
 cd J:\Projects\coding-agent
-C:\Users\arozz\AppData\Local\Programs\Python\Python313\python.exe -m pip install -e .
-```
-
-Or install dependencies directly:
-
-```powershell
-C:\Users\arozz\AppData\Local\Programs\Python\Python313\python.exe -m pip install pydantic pydantic-settings langgraph httpx structlog chromadb pytest
+python -m pip install -e .
 ```
 
 ### Configuration
 
-Edit `config/models.yaml` to configure your LLM:
+**Model config** — edit `config/models.yaml`:
 
 ```yaml
 models:
-  - name: qwen3.5-35b-a3b
+  - name: qwen2.5-coder-32b
     type: local
-    endpoint: http://127.0.0.1:1234  # Your Ollama/OpenAI-compatible endpoint
-    context_window: 262144
+    endpoint: http://127.0.0.1:1234
+    context_window: 32768
     is_coding_optimized: true
-    recommended_for: [coding, code_review, test_generation]
-    rate_limit_rpm: 120
 ```
 
-## Usage
+**Discord bot** — set environment variables:
 
-### Single Task Mode
-
-```bash
-python -m local_coding_agent --task "Write a hello world script"
+```powershell
+$env:DISCORD_BOT_TOKEN = "your-token-here"
+$env:AGENT_API_URL     = "http://localhost:5005"
 ```
 
-### Interactive Mode
+### Running
 
-```bash
-python -m local_coding_agent
+```powershell
+# Start the API server
+python -m uvicorn api.main:app --host 0.0.0.0 --port 5005
+
+# Start the Discord bot (separate terminal)
+python -m api.discord_bot
 ```
 
-Interactive commands:
-- `exit` / `quit` - Exit the program
-- `history` - Show conversation history
-- `sessions` - List all sessions
-- `resume <id>` - Switch to another session
+## Discord Commands
 
-### Session Management
+| Command | Description |
+|---------|-------------|
+| `!ask <task>` | Submit a task — returns immediately, polls in background |
+| `!tasks` | Show the current task plan with per-task status |
+| `!result` | Full prose response from the last job |
+| `!files` | List files created or modified by the last task |
+| `!show <path>` | View a workspace file inline or as attachment |
+| `!status` | Current job status |
+| `!cancel` | Cancel the running job |
+| `!session` | Show current session ID |
 
-```bash
-# List all sessions
-python -m local_coding_agent --list-sessions
+### Discord UX example
 
-# Resume a specific session
-python -m local_coding_agent --session session_20260410_123456
+```
+Zeus: !ask run and debug the Shadows-of-Eldoria game
 
-# Disable conversation history in context
-python -m local_coding_agent --task "..." --no-history
+Logan [APP]: Planning tasks… (2s)
+Logan [APP]: Task 1/4 — Check package.json and note start script (8s)
+Logan [APP]: Task 2/4 — Run npm start to capture the error (22s)
+Logan [APP]: Task 3/4 — Fix the TypeError in src/game.js (67s)
+Logan [APP]: Task 4/4 — Run npm start to verify the fix (89s)
+Logan [APP]: Done [develop] · 92s
+              Fixed TypeError in src/game.js: cannot read property 'length' of undefined
+              Shell output:
+              ```
+              > shadows-of-eldoria@1.0.0 start
+              Server running on http://localhost:3000
+              ```
+              Files created/modified:
+                `Shadows-of-Eldoria/src/game.js`
+
+Zeus: !tasks
+Logan [APP]: Task plan (4/4 done)
+             ✅ 1. [develop] Check package.json and note start script
+             ✅ 2. [develop] Run npm start to capture the error
+             ✅ 3. [develop] Fix the TypeError in src/game.js
+             ✅ 4. [develop] Run npm start to verify the fix
 ```
 
-## CLI Options
+## Agent Types
 
-| Option | Description |
-|--------|-------------|
-| `--task <text>` | Run a single task and exit |
-| `--session <id>` | Resume a specific session |
-| `--workspace <path>` | Set workspace directory |
-| `--config <path>` | Path to model configuration |
-| `--list-sessions` | List all saved sessions |
-| `--no-history` | Don't include conversation history |
-| `--verbose` | Show detailed logging |
-| `--stream` | Stream responses in real-time |
+| Type | Keyword triggers | What it does |
+|------|-----------------|--------------|
+| `develop` | implement, fix, run and debug, build | Writes code, runs commands, auto-fixes errors |
+| `research` | search for, find where, how does, investigate | Reads files, searches web, synthesizes reports |
+| `sdlc` | build me a complete, end-to-end | Full plan→build→test→debug→run→verify pipeline |
+| `plan` | create a plan, plan first | Architecture plan before implementation |
+| `test` | write tests, run tests | Writes and runs test suites |
+| `review` | code review, security audit | Audits code for bugs and security issues |
+| `architect` | system design, write an ADR | High-level design and architecture decisions |
+| `chat` | everything else | General questions and conversation |
 
-## Available Tools
+## Task Manager
 
-### File System
-- `read_file` - Read file contents
-- `write_file` - Write content to files
-- `list_directory` - List directory contents
-- `search_files` - Find files by pattern
+Every `develop` and `research` job is decomposed into an ordered task list by the **PlannerAgent** before execution starts.
 
-### Git
-- `git_status` - Show working tree status
-- `git_diff` - Show changes
-- `git_diff_staged` - Show staged changes
-- `git_commit` - Commit changes
-- `git_log` - Show commit history
-- `git_branch` - List branches
-- `git_add` - Stage files
-- `git_restore` - Unstage files
-
-### Test Runner
-- `pytest_run` - Run pytest tests with configurable options
-- `pytest_list` - List available tests
-- `pytest_by_marker` - Run tests by marker
-
-### Code Analysis
-- `analyze_file` - Extract functions, classes, imports, dependencies
-- `analyze_directory` - Batch analyze multiple files
-- `find_function` - Find function by name
-- `get_function_at_line` - Get function containing specific line
-
-### Code Chunking
-- Language-specific code chunking for vector storage
-- Supports Python, JavaScript, TypeScript, Java, Go, Rust, and more
-- Respects function/class boundaries
-
-## Multi-Agent Workflow
-
-The agent supports a LangGraph-based multi-agent workflow with three nodes:
-
-- **Planner** - Analyzes task and creates step-by-step execution plan
-- **Executor** - Executes the plan using available tools
-- **Reviewer** - Evaluates result, approves or requests retry (up to max_iterations)
-
-```python
-from agent import MultiAgentOrchestrator
-
-orchestrator = MultiAgentOrchestrator(
-    workspace_path="./workspace",
-    model_router=model_router,
-)
-result = await orchestrator.run_task("Write a hello world", session_id)
 ```
+User objective
+    → PlannerAgent (1 LLM call)
+    → TaskStore (SQLite agent_tasks table)
+    → Task loop:
+        ┌─ get next pending task
+        ├─ route to agent (_direct=True, no re-planning)
+        ├─ agent result may append new_tasks
+        ├─ mark task done/failed
+        └─ repeat until all_done()
+```
+
+Tasks persist in SQLite. `!tasks` in Discord shows live progress. The loop continues even if individual tasks fail.
+
+## REST API
+
+| Method | Path | Description |
+|--------|------|-------------|
+| `POST` | `/task/start` | Submit a background task → returns `job_id` |
+| `GET` | `/task/{job_id}` | Poll job status + summary |
+| `GET` | `/task/{job_id}/result` | Full agent response |
+| `GET` | `/task/{job_id}/tasks` | Task plan with per-task status |
+| `DELETE` | `/task/{job_id}` | Cancel a job |
+| `GET` | `/jobs` | List all jobs |
+| `GET` | `/workspace/file?path=` | Read a workspace file |
+| `GET` | `/models` | List configured models |
+| `GET` | `/health` | Health check |
 
 ## Project Structure
 
 ```
-local-coding-agent/
-├── agent/                    # Core agent
-│   ├── orchestrator.py       # Main agent orchestration
-│   ├── multi_agent/          # LangGraph multi-agent workflow
-│   │   ├── workflow.py       # Planner, Executor, Reviewer nodes
-│   │   └── __init__.py
-│   ├── memory/              # Session and vector memory
-│   │   ├── session_memory.py
-│   │   └── codebase_memory.py
-│   └── tools/               # Tool implementations
-│       ├── file_system_tool.py
-│       ├── git_tool.py
-│       ├── test_runner_tool.py    # Pytest integration
-│       ├── code_analysis_tool.py  # AST parsing
-│       └── code_chunker.py        # Language-specific chunking
-├── llm/                     # LLM abstraction
-│   ├── model_router.py      # Model routing
-│   ├── ollama_client.py     # Ollama/OpenAI-compatible client
-│   ├── cloud_api_client.py  # Cloud API client
-│   ├── cost_tracker.py      # Cost tracking
-│   ├── rate_limiter.py      # Rate limiting
-│   └── health.py            # Health checks
-├── mcp/                     # MCP server
-├── observability/            # Metrics and logging
+coding-agent/
+├── agent/
+│   ├── orchestrator.py          # Main orchestrator + task loop
+│   ├── sdlc_workflow.py         # SDLC pipeline (plan→build→test→debug→run→verify)
+│   ├── agents/
+│   │   ├── planner_agent.py     # Decomposes objectives into task lists
+│   │   ├── developer_agent.py   # Writes code, runs commands, fix loop
+│   │   ├── research_agent.py    # Web search, file reading, synthesis
+│   │   ├── tester_agent.py      # Test generation and execution
+│   │   ├── reviewer_agent.py    # Code review and security audit
+│   │   ├── architect_agent.py   # System design and ADRs
+│   │   ├── plan_agent.py        # Implementation planning
+│   │   └── chat_agent.py        # Conversational responses
+│   ├── memory/
+│   │   ├── session_memory.py    # SQLite conversation history
+│   │   └── codebase_memory.py   # ChromaDB vector store (RAG)
+│   └── tools/
+│       ├── shell_tool.py        # Shell execution (OS-aware, Windows translation)
+│       ├── browser_tool.py      # Playwright screenshots + server polling
+│       ├── file_system_tool.py  # File CRUD
+│       └── tool_executor.py     # Unified tool dispatch
+├── api/
+│   ├── main.py                  # FastAPI server
+│   ├── job_store.py             # SQLite job store (write-through + in-memory cache)
+│   ├── task_store.py            # SQLite task store (agent_tasks table)
+│   └── discord_bot.py           # Discord bot with polling and file attachments
+├── llm/
+│   ├── model_router.py          # Model routing + fallback
+│   ├── model_resilience.py      # Rate-limit handling + Ollama health checks
+│   └── openrouter_client.py     # OpenRouter API client
+├── mcp/                         # MCP server for tool exposure
 ├── config/
-│   └── models.yaml          # Model configuration
-├── docs/                    # Documentation
-│   ├── user-manual.md       # User guide
-│   ├── examples.md          # Examples
-│   ├── capabilities.md      # Capabilities reference
-│   └── plans/               # Implementation plans
-└── tests/                   # Unit tests
+│   ├── models.yaml              # Model configuration
+│   └── task_classifier.yaml     # LLM task-type classifier prompt
+├── tests/
+│   ├── unit/                    # Unit tests (TaskStore, model resilience, shell, …)
+│   └── integration/             # Integration tests (SDLC, task loop, Discord sim)
+└── aiChangeLog/                 # Per-phase change logs
 ```
 
-## Development
+## Running Tests
 
-### Running Tests
-
-```bash
-python -m pytest tests/unit/ -v
-```
-
-### Running with Verbose Logging
-
-```bash
-python -m local_coding_agent --task "..." --verbose
+```powershell
+python -m pytest tests/ -v
+# 345 tests, all passing
 ```
 
 ## License

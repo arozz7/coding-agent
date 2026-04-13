@@ -10,6 +10,7 @@ from agent.memory.memory_wiki import MemoryWiki
 from agent.tools import FileSystemTool, PytestTool, CodeAnalyzer
 from agent.agents.developer_agent import DeveloperAgent
 from agent.agents.plan_agent import PlanAgent
+from agent.agents.planner_agent import PlannerAgent
 from agent.agents.tester_agent import TesterAgent
 from agent.agents.reviewer_agent import ReviewerAgent
 from agent.agents.architect_agent import ArchitectAgent
@@ -98,6 +99,11 @@ class AgentOrchestrator:
             file_system_tool=self.fs_tool,
             code_analyzer=self.code_analyzer,
         )
+        self.planner_agent = PlannerAgent(model_router)
+
+        # Task store — shares the same SQLite file as the job store
+        from api.task_store import TaskStore
+        self.task_store = TaskStore("data/jobs.db")
 
         # Subagent management
         self.subagents: dict[str, "SubagentSession"] = {}
@@ -277,17 +283,50 @@ class AgentOrchestrator:
         """Keyword-based task classifier — used as fallback when LLM is unavailable.
 
         Priority (highest first):
-          0. Plan — user explicitly wants a plan before any code is written
-          1. Explicit coding — output is new/modified source files
-          2. Review / security audit
-          3. Testing — write or run tests
-          4. Architecture / ADR
-          5. Research — investigate the existing codebase
-          6. Chat — everything else (conversation, general questions)
+          0. SDLC — full plan+build+test+debug+run+verify pipeline
+          1. Plan — user explicitly wants a plan before any code is written
+          2. Explicit coding — output is new/modified source files
+          3. Review / security audit
+          4. Testing — write or run tests
+          5. Architecture / ADR
+          6. Research — investigate the existing codebase
+          7. Chat — everything else (conversation, general questions)
         """
         t = task.lower()
 
-        # 0. Planning mode — user wants a blueprint before implementation
+        # 0. Full SDLC pipeline — build, run, test, and verify autonomously
+        _SDLC = [
+            "build me a complete", "build a complete", "build a full",
+            "create a full", "create a complete",
+            "develop a complete", "develop a full",
+            "build and test", "build, test",
+            "build and run", "build and deploy",
+            "implement and test", "implement, test",
+            "full app", "full application", "entire application",
+            "end to end", "end-to-end",
+            "full development", "full stack",
+            "build the whole", "build the entire",
+        ]
+        if any(kw in t for kw in _SDLC):
+            return "sdlc"
+
+        # 0b. Run / debug / launch — user wants to execute existing code and fix errors
+        _RUN_DEBUG = [
+            "run and debug", "run and fix", "debug and fix", "run the game",
+            "run the app", "run the server", "run the project", "run the code",
+            "run and test", "launch the", "start the app", "start the server",
+            "start the game", "start the project",
+            "debug the", "debug it", "debugging the",
+            "fix the runtime", "fix the error", "fix the errors", "fix the bug",
+            "fix the bugs", "fix and run", "fix this error", "fix these errors",
+            "there are still errors", "still not running", "not starting",
+            "can't run", "cannot run", "won't run", "fails to run",
+            "fails to start", "failing to run",
+        ]
+        if any(kw in t for kw in _RUN_DEBUG):
+            return "develop"
+
+        # 1. Planning mode — user wants a blueprint before implementation
         _PLAN = [
             "plan first", "solid plan", "show me a plan", "want to plan",
             "want first work on a", "planning phase", "let's plan", "lets plan",
@@ -444,6 +483,44 @@ class AgentOrchestrator:
                         seen.append(name)
         return seen
 
+    @staticmethod
+    def _build_environment_context() -> str:
+        """Return a compact block describing the runtime environment.
+
+        Injected at the top of every task context so agents never have to
+        probe the OS by running commands — they already know.
+        """
+        import platform as _platform
+        system = _platform.system()
+        release = _platform.release()
+
+        if system == "Windows":
+            shell_guide = (
+                "Shell: PowerShell / cmd.exe (Windows)\n"
+                "IMPORTANT — Windows command equivalents:\n"
+                "  dir          (not ls)\n"
+                "  type         (not cat)\n"
+                "  del          (not rm)\n"
+                "  copy         (not cp)\n"
+                "  move         (not mv)\n"
+                "  cls          (not clear)\n"
+                "  where        (not which)\n"
+                "  findstr      (not grep)\n"
+                "  $env:VAR     (not export VAR=)\n"
+                "Chain with: &&  (not ; or ||)\n"
+                "Paths use backslash or forward slash both work in npm/node/python."
+            )
+        elif system == "Darwin":
+            shell_guide = "Shell: zsh/bash (macOS)"
+        else:
+            shell_guide = "Shell: bash/sh (Linux)"
+
+        return (
+            f"\n\n## Runtime Environment\n"
+            f"OS: {system} {release}\n"
+            f"{shell_guide}\n"
+        )
+
     async def _build_enriched_context(self, task: str) -> str:
         """Build prompt enrichment: wiki-query results + RAG chunks + skill instructions.
 
@@ -453,7 +530,11 @@ class AgentOrchestrator:
         """
         parts: list[str] = []
 
-        # 0. AGENTS.md — global coding agent instructions (injected once per task)
+        # 0a. Runtime environment — OS, shell, command cheat-sheet.
+        #     Injected first so agents never have to probe the OS.
+        parts.append(self._build_environment_context())
+
+        # 0c. AGENTS.md — global coding agent instructions (injected once per task)
         agents_md = Path("AGENTS.md")
         if agents_md.exists():
             try:
@@ -492,7 +573,38 @@ class AgentOrchestrator:
             session_id,
         )
 
-    async def _run_specialized_agent(self, task: str, task_type: str, session_id: str) -> dict:
+    async def _run_specialized_agent(
+        self,
+        task: str,
+        task_type: str,
+        session_id: str,
+        on_phase: Optional[Callable[[str], None]] = None,
+        job_id: Optional[str] = None,
+        _direct: bool = False,
+    ) -> dict:
+        """Route a task to the appropriate agent.
+
+        For "develop" and "research" task types the task is first decomposed
+        into a plan and run through the task loop — unless _direct=True, which
+        bypasses the loop (used when called from inside the loop to avoid
+        infinite recursion).
+
+        For all other types (plan, review, test, architect, chat, sdlc) the
+        agent is called directly as before.
+        """
+        # SDLC workflow is handled by its own class — does not need a context dict
+        if task_type == "sdlc":
+            from agent.sdlc_workflow import SDLCWorkflow
+            workflow = SDLCWorkflow(self)
+            return await workflow.run(task, session_id, on_phase=on_phase, job_id=job_id)
+
+        # Task loop for develop and research (when called from run_task, not from loop itself)
+        if not _direct and task_type in ("develop", "research"):
+            return await self._run_task_loop(
+                task, task_type, session_id, on_phase=on_phase, job_id=job_id
+            )
+
+        # --- Direct execution (all other types, or inner loop calls) ---
         session_executor = self._create_session_executor(session_id)
         enriched_context = await self._build_enriched_context(task)
         history = self._build_context_from_events(session_id)
@@ -501,7 +613,7 @@ class AgentOrchestrator:
             "workspace_path": self.workspace_path,
             "model_router": self.model_router,
             "tool_executor": session_executor,
-            "enriched_context": enriched_context + history,  # wiki + RAG + skill instructions + chat history
+            "enriched_context": enriched_context + history,
         }
 
         if task_type == "plan":
@@ -517,8 +629,184 @@ class AgentOrchestrator:
         elif task_type == "chat":
             return await self.chat_agent.run(task, context)
         else:
-            # "develop" and unrecognised types go to the developer agent
             return await self.developer_agent.run(task, context)
+
+    async def _run_task_loop(
+        self,
+        objective: str,
+        task_type: str,
+        session_id: str,
+        on_phase: Optional[Callable[[str], None]] = None,
+        job_id: Optional[str] = None,
+    ) -> dict:
+        """Decompose an objective into tasks and execute them sequentially.
+
+        Flow:
+          1. PlannerAgent decomposes objective → [{description, agent_type}]
+          2. Tasks are stored in TaskStore (if job_id provided)
+          3. Loop: pick next pending task → route to agent → store result
+          4. Agent results may contain "new_tasks" to append mid-loop
+          5. Return combined response when all tasks are terminal
+        """
+        import asyncio as _asyncio
+
+        def _emit(label: str) -> None:
+            if on_phase:
+                try:
+                    on_phase(label)
+                except Exception:
+                    pass
+
+        # 1. Plan
+        _emit("planning:tasks")
+        enriched_preview = await self._build_enriched_context(objective)
+        task_specs = await self.planner_agent.plan(
+            objective,
+            context=enriched_preview[:600],
+            task_type=task_type,
+        )
+
+        # 2. Persist tasks
+        if job_id:
+            self.task_store.create_tasks(job_id, task_specs)
+
+        total = len(task_specs)
+        self.logger.info(
+            "task_loop_started",
+            objective=objective[:80],
+            task_count=total,
+            job_id=job_id,
+        )
+
+        all_responses: list[str] = []
+        all_files: list[str] = []
+        screenshot_path: Optional[str] = None
+        task_num = 0
+
+        # 3. Execute loop
+        while True:
+            if job_id:
+                task_obj = self.task_store.get_next_pending(job_id)
+                if task_obj is None:
+                    break
+                task_id = task_obj.task_id
+                task_num = task_obj.sequence
+                description = task_obj.description
+                agent_type = task_obj.agent_type
+                total = max(total, task_num)  # may have grown via new_tasks
+                self.task_store.update_task(task_id, "running")
+            else:
+                # No persistence — run specs in order
+                if task_num >= len(task_specs):
+                    break
+                spec = task_specs[task_num]
+                task_num += 1
+                task_id = None
+                description = spec["description"]
+                agent_type = spec.get("agent_type", "develop")
+
+            _emit(f"task:{task_num}/{total}:{description[:40]}")
+            self.logger.info(
+                "task_loop_executing",
+                task_num=task_num,
+                total=total,
+                agent_type=agent_type,
+                description=description[:60],
+            )
+
+            try:
+                result = await self._run_specialized_agent(
+                    description,
+                    agent_type,
+                    session_id,
+                    on_phase=on_phase,
+                    job_id=None,     # prevent re-entering the loop
+                    _direct=True,    # go straight to agent
+                )
+
+                if result.get("success"):
+                    response_text = result.get("response", "")
+                    all_responses.append(
+                        f"**Task {task_num}: {description[:60]}**\n\n{response_text}"
+                    )
+                    new_files = result.get("files_created", [])
+                    all_files.extend(new_files)
+                    if result.get("screenshot_path"):
+                        screenshot_path = result.get("screenshot_path")
+
+                    # Agent may append new tasks dynamically
+                    new_task_specs = result.get("new_tasks", [])
+                    if new_task_specs:
+                        for spec in new_task_specs:
+                            if job_id:
+                                new_task = self.task_store.create_task(
+                                    job_id=job_id,
+                                    description=spec["description"],
+                                    agent_type=spec.get("agent_type", "develop"),
+                                )
+                                total = max(total, new_task.sequence)
+                            else:
+                                task_specs.append(spec)
+                                total = len(task_specs)
+                        self.logger.info(
+                            "new_tasks_added",
+                            count=len(new_task_specs),
+                            total=total,
+                        )
+
+                    result_summary = response_text[:300]
+                    if task_id:
+                        self.task_store.update_task(task_id, "done", result_summary)
+                else:
+                    error = result.get("error", "agent failed")
+                    all_responses.append(
+                        f"**Task {task_num}: {description[:60]}** — failed: {error}"
+                    )
+                    if task_id:
+                        self.task_store.update_task(task_id, "failed", error)
+                    self.logger.warning(
+                        "task_loop_task_failed",
+                        task_num=task_num,
+                        error=error,
+                    )
+
+            except Exception as exc:
+                self.logger.error(
+                    "task_loop_exception",
+                    task_num=task_num,
+                    error=str(exc),
+                )
+                if task_id:
+                    self.task_store.update_task(task_id, "failed", str(exc))
+                all_responses.append(
+                    f"**Task {task_num}: {description[:60]}** — error: {exc}"
+                )
+
+            # Safety guard for no-persistence mode
+            if not job_id and task_num >= len(task_specs):
+                break
+
+        combined = "\n\n---\n\n".join(all_responses) if all_responses else "(no output)"
+        # Deduplicate files while preserving order
+        seen: set[str] = set()
+        unique_files: list[str] = []
+        for f in all_files:
+            if f not in seen:
+                seen.add(f)
+                unique_files.append(f)
+
+        self.logger.info(
+            "task_loop_complete",
+            tasks_run=task_num,
+            files_created=len(unique_files),
+        )
+        return {
+            "success": True,
+            "response": combined,
+            "files_created": unique_files,
+            "screenshot_path": screenshot_path,
+            "task_count": total,
+        }
 
     def _build_context_from_events(self, session_id: str) -> str:
         """Build conversation context from paginated events.
@@ -558,6 +846,7 @@ class AgentOrchestrator:
         session_id: Optional[str] = None,
         include_history: bool = True,
         on_phase: Optional[Callable[[str], None]] = None,
+        job_id: Optional[str] = None,
     ) -> dict:
         """Run a task and return the agent result.
 
@@ -613,11 +902,14 @@ class AgentOrchestrator:
             "architect": "designing",
             "research": "researching",
             "chat": "thinking",
+            "sdlc": "sdlc:planning",
         }
         _emit_phase(_phase_labels.get(task_type, "working"))
 
         try:
-            result = await self._run_specialized_agent(task, task_type, session_id)
+            result = await self._run_specialized_agent(
+                task, task_type, session_id, on_phase=on_phase, job_id=job_id
+            )
 
             if result.get("success"):
                 response = result.get("response", "")
@@ -659,6 +951,7 @@ class AgentOrchestrator:
                         "task_type": task_type,
                         "files_created": result.get("files_created", []),
                         "skill_reports": post_skill_reports,
+                        "screenshot_path": result.get("screenshot_path"),
                     },
                 }
             else:

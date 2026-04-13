@@ -36,7 +36,7 @@ def strip_code_blocks(text: str) -> str:
     def _replace(m: re.Match) -> str:
         lang = m.group(1).strip() or "code"
         n = len(m.group(2).strip().splitlines())
-        return f"[{lang} — {n} lines · use !show to view]"
+        return f"[{lang} — {n} lines · use `!files` then `!show <path>` to view]"
 
     return re.sub(r'```(\w*)\n([\s\S]*?)```', _replace, text)
 
@@ -59,6 +59,33 @@ def _chunk(text: str, limit: int = 1900) -> list[str]:
 
 def _truncate(text: str, limit: int = 2000) -> str:
     return text if len(text) <= limit else text[: limit - 1] + "…"
+
+
+async def _send_screenshot(
+    ctx: commands.Context,
+    screenshot_path: str,
+    task_type: str,
+    elapsed: int,
+) -> None:
+    """Send a screenshot file as a Discord attachment with a caption."""
+    import pathlib
+
+    p = pathlib.Path(screenshot_path)
+    if not p.exists() or not p.is_file():
+        await ctx.send(f"Screenshot was captured but the file is no longer available: `{screenshot_path}`")
+        return
+
+    size_bytes = p.stat().st_size
+    if size_bytes > _MAX_ATTACHMENT_BYTES:
+        await ctx.send(
+            f"Screenshot too large to attach ({size_bytes / 1024 / 1024:.1f} MB). "
+            f"Use `!show {p.name}` or check the workspace directly."
+        )
+        return
+
+    caption = f"**SDLC verify** [{task_type}] · {elapsed}s — running app screenshot"
+    with p.open("rb") as fh:
+        await ctx.send(caption, file=File(fh, filename=p.name))
 
 
 # ---------------------------------------------------------------------------
@@ -103,6 +130,9 @@ class AgentClient:
 
     async def cancel_job(self, job_id: str) -> dict:
         return await self._delete(f"/task/{job_id}")
+
+    async def get_job_tasks(self, job_id: str) -> dict:
+        return await self._get(f"/task/{job_id}/tasks")
 
     async def get_file(self, path: str) -> dict:
         return await self._get("/workspace/file", path=path)
@@ -159,17 +189,24 @@ bot = DiscordAgentBot()
 # ---------------------------------------------------------------------------
 
 _PHASE_LABELS: dict[str, str] = {
-    "queued":      "Queued",
-    "pending":     "Queued",
-    "planning":    "Building plan",
-    "developing":  "Writing code",
-    "reviewing":   "Reviewing",
-    "testing":     "Running tests",
-    "designing":   "Designing architecture",
-    "researching": "Researching codebase",
-    "thinking":    "Thinking",
-    "working":     "Working",
-    "complete":    "Finishing up",
+    "queued":        "Queued",
+    "pending":       "Queued",
+    "planning":      "Building plan",
+    "developing":    "Writing code",
+    "reviewing":     "Reviewing",
+    "testing":       "Running tests",
+    "designing":     "Designing architecture",
+    "researching":   "Researching codebase",
+    "thinking":      "Thinking",
+    "working":       "Working",
+    "complete":      "Finishing up",
+    # SDLC pipeline phases
+    "sdlc:planning":  "SDLC — Planning",
+    "sdlc:building":  "SDLC — Building",
+    "sdlc:testing":   "SDLC — Running tests",
+    "sdlc:debugging": "SDLC — Debugging",
+    "sdlc:running":   "SDLC — Starting app",
+    "sdlc:verifying": "SDLC — Verifying (screenshot)",
 }
 
 
@@ -196,11 +233,27 @@ async def _poll_job(ctx: commands.Context, status_msg: discord.Message, job_id: 
 
         job_status = job.get("status", "unknown")
         phase = job.get("phase", "")
-        label = _PHASE_LABELS.get(phase, phase or "Working")
+
+        # Task-loop phases: "task:N/M:description" or "planning:tasks"
+        if phase.startswith("task:"):
+            # task:2/5:Run npm start to capture error
+            parts = phase.split(":", 2)
+            progress = parts[1] if len(parts) > 1 else "?"
+            desc = parts[2][:40] if len(parts) > 2 else ""
+            label = f"Task {progress} — {desc}" if desc else f"Task {progress}"
+        elif phase == "planning:tasks":
+            label = "Planning tasks…"
+        elif phase.startswith("sdlc:debugging:"):
+            # SDLC debug attempts carry a dynamic suffix like "sdlc:debugging:2/5"
+            label = f"SDLC — Debugging ({phase.rsplit(':', 1)[-1]})"
+        else:
+            _phase_key = phase
+            label = _PHASE_LABELS.get(_phase_key, phase or "Working")
 
         if job_status == "done":
             task_type = job.get("task_type", "")
             files = job.get("files_created", [])
+            screenshot_path = job.get("screenshot_path")
 
             if task_type in _INLINE_TYPES:
                 # Fetch and stream the full response for conversational tasks.
@@ -234,6 +287,10 @@ async def _poll_job(ctx: commands.Context, status_msg: discord.Message, job_id: 
                     "\n`!result` — full response  ·  `!files` — file list  ·  `!show <path>` — view a file"
                 )
                 await status_msg.edit(content=_truncate("\n".join(lines)))
+
+            # Send screenshot as attachment if the SDLC workflow produced one
+            if screenshot_path:
+                await _send_screenshot(ctx, screenshot_path, task_type, elapsed)
             return
 
         elif job_status == "failed":
@@ -374,6 +431,56 @@ async def files(ctx: commands.Context):
     await ctx.send("\n".join(lines))
 
 
+_STATUS_ICONS = {
+    "pending":  "⏳",
+    "running":  "▶️",
+    "done":     "✅",
+    "failed":   "❌",
+    "skipped":  "⏭️",
+}
+
+
+@bot.command(name="tasks")
+async def tasks_cmd(ctx: commands.Context):
+    """Show the task list for the current job."""
+    user_id = str(ctx.author.id)
+    job_id = bot.user_jobs.get(user_id)
+    if not job_id:
+        await ctx.send("No recent job. Use `!ask <task>` first.")
+        return
+
+    try:
+        data = await bot.client.get_job_tasks(job_id)
+    except Exception as exc:
+        await ctx.send(f"Could not fetch task list: {exc}")
+        return
+
+    task_list = data.get("tasks", [])
+    if not task_list:
+        await ctx.send(
+            "No task plan yet — the agent may still be planning, or this job "
+            "type doesn't use the task manager (chat/plan/review)."
+        )
+        return
+
+    counts = data.get("counts", {})
+    total = data.get("total", len(task_list))
+    done_count = counts.get("done", 0) + counts.get("skipped", 0)
+
+    lines = [f"**Task plan** ({done_count}/{total} done)\n"]
+    for t in task_list:
+        icon = _STATUS_ICONS.get(t["status"], "•")
+        agent = t["agent_type"]
+        desc = t["description"][:60]
+        seq = t["sequence"]
+        result_snippet = ""
+        if t.get("result") and t["status"] == "done":
+            result_snippet = f"  › {t['result'][:50]}…"
+        lines.append(f"{icon} **{seq}.** [{agent}] {desc}{result_snippet}")
+
+    await ctx.send(_truncate("\n".join(lines), 1900))
+
+
 _BINARY_EXTENSIONS = {
     "png", "jpg", "jpeg", "gif", "bmp", "ico", "svg", "webp",
     "pdf", "zip", "tar", "gz", "bz2", "7z", "rar",
@@ -385,9 +492,16 @@ _MAX_ATTACHMENT_BYTES = 7 * 1024 * 1024  # 7 MB (Discord cap is 8 MB)
 
 
 @bot.command(name="show")
-async def show(ctx: commands.Context, *, path: str):
+async def show(ctx: commands.Context, *, path: str = ""):
     """View a workspace file. Small files inline, large files as attachment."""
     path = path.strip()
+    if not path:
+        await ctx.send(
+            "Usage: `!show <file path>`\n"
+            "Example: `!show workspace/app.py`\n"
+            "Use `!files` to list files created by the last task."
+        )
+        return
 
     # Reject known binary extensions before even fetching
     ext = path.rsplit(".", 1)[-1].lower() if "." in path else ""

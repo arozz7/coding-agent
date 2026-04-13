@@ -12,6 +12,7 @@ import structlog
 from llm import ModelRouter
 from agent.orchestrator import AgentOrchestrator
 from api.job_store import JobStore
+from api.task_store import TaskStore
 
 logger = structlog.get_logger()
 
@@ -126,14 +127,37 @@ _current_workspace: str = WORKSPACE_PATH
 # SQLite-backed job store (write-through, in-memory hot cache)
 _job_store: JobStore = JobStore("data/jobs.db")
 
+# Task store — shares the same SQLite file, different table
+_task_store: TaskStore = TaskStore("data/jobs.db")
+
 
 def _summarize_response(text: str, max_chars: int = 500) -> str:
-    """Strip fenced code blocks and return a short prose summary."""
+    """Return a short prose summary with shell output snippet preserved.
+
+    Fenced code blocks are stripped from the prose portion, but any
+    **Shell Output:** section is extracted first and appended in truncated
+    form so Discord users can see what ran without needing !result.
+    """
+    # Extract shell output block before stripping code fences
+    shell_snippet = ""
+    shell_match = re.search(
+        r'\*\*Shell Output:\*\*\s*```[^\n]*\n([\s\S]*?)```',
+        text,
+    )
+    if shell_match:
+        output = shell_match.group(1).strip()
+        lines = output.splitlines()
+        preview_lines = lines[:15]
+        truncated = "\n".join(preview_lines)
+        if len(lines) > 15:
+            truncated += f"\n… ({len(lines)} lines total)"
+        shell_snippet = f"\n\n**Shell output:**\n```\n{truncated}\n```"
+
     prose = re.sub(r'```[\s\S]*?```', '', text).strip()
     prose = re.sub(r'\n{3,}', '\n\n', prose)
     if len(prose) > max_chars:
-        return prose[:max_chars].rstrip() + "…"
-    return prose or "(task completed)"
+        prose = prose[:max_chars].rstrip() + "…"
+    return (prose or "(task completed)") + shell_snippet
 
 
 @app.on_event("startup")
@@ -237,6 +261,7 @@ async def start_task_background(request: TaskRequest):
                 session_id=session_id,
                 include_history=request.include_history,
                 on_phase=_on_phase,
+                job_id=job_id,
             )
             if result.get("success"):
                 inner = result.get("result", {})
@@ -249,6 +274,7 @@ async def start_task_background(request: TaskRequest):
                     files_created=inner.get("files_created", []),
                     summary=_summarize_response(full_response),
                     _full_response=full_response,
+                    screenshot_path=inner.get("screenshot_path"),
                 )
             else:
                 _job_store.update(
@@ -291,6 +317,23 @@ async def get_job_result(job_id: str):
     if job["status"] != "done":
         return {"status": job["status"], "result": None}
     return {"status": "done", "result": job.get("_full_response", "")}
+
+
+@app.get("/task/{job_id}/tasks")
+async def get_job_tasks(job_id: str):
+    """Return the task list for a job (created by the planner)."""
+    job = _job_store.get(job_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail=f"Job '{job_id}' not found")
+    tasks = _task_store.list_tasks(job_id)
+    counts = _task_store.task_counts(job_id)
+    return {
+        "job_id": job_id,
+        "tasks": [t.to_dict() for t in tasks],
+        "counts": counts,
+        "total": len(tasks),
+        "all_done": _task_store.all_done(job_id),
+    }
 
 
 @app.delete("/task/{job_id}")
