@@ -145,7 +145,7 @@ def _summarize_response(text: str, max_chars: int = 500) -> str:
     # re.DOTALL lets '.' match newlines; avoids the [\s\S] pattern flagged for ReDoS.
     shell_snippet = ""
     shell_match = re.search(
-        r'\*\*Shell Output:\*\*\s*```[^\n]*\n(.+?)```',
+        r'\*\*Shell Output:\*\*\s*```[^\n]*\n(.{0,10000})```',
         safe_text,
         re.DOTALL,
     )
@@ -158,7 +158,7 @@ def _summarize_response(text: str, max_chars: int = 500) -> str:
             truncated += f"\n… ({len(lines)} lines total)"
         shell_snippet = f"\n\n**Shell output:**\n```\n{truncated}\n```"
 
-    prose = re.sub(r'```.*?```', '', safe_text, flags=re.DOTALL).strip()
+    prose = re.sub(r'```.{0,10000}```', '', safe_text, flags=re.DOTALL).strip()
     prose = re.sub(r'\n{3,}', '\n\n', prose)
     if len(prose) > max_chars:
         prose = prose[:max_chars].rstrip() + "…"

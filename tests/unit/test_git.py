@@ -6,8 +6,9 @@ from pathlib import Path
 
 
 @pytest.fixture
-def git_repo(tmp_path):
+def git_repo(tmp_path, monkeypatch):
     """Create a temporary git repository."""
+    monkeypatch.setenv("WORKSPACE_PATH", str(tmp_path))
     subprocess.run(["git", "init"], cwd=str(tmp_path), capture_output=True)
     subprocess.run(
         ["git", "config", "user.email", "test@test.com"],

@@ -13,17 +13,17 @@ class GitError(Exception):
 
 class GitTool:
     def __init__(self, repo_path: str):
-        resolved = Path(repo_path).resolve()
-        # Validate path against the configured workspace to prevent path traversal.
-        # repo_path always originates from the WORKSPACE_PATH env var (never HTTP input).
+        # Source the authoritative workspace from the environment (trusted, not
+        # user-controlled).  Validate repo_path falls within it, then assign the
+        # env-var-sourced path so user input never reaches file-system operations.
         workspace_env = os.environ.get("WORKSPACE_PATH", "")
-        if workspace_env:
-            allowed = Path(workspace_env).resolve()
-            if resolved != allowed and not str(resolved).startswith(str(allowed) + os.sep):
-                raise GitError(
-                    f"Repository path '{resolved}' is outside the configured workspace"
-                )
-        self.repo_path = resolved
+        if not workspace_env:
+            raise GitError("WORKSPACE_PATH environment variable is required")
+        allowed = Path(workspace_env).resolve()
+        provided = Path(repo_path).resolve()
+        if provided != allowed and not str(provided).startswith(str(allowed) + os.sep):
+            raise GitError("Repository path outside configured workspace")
+        self.repo_path = allowed  # authoritative env-var path, not the parameter
         self.logger = logger.bind(component="git_tool")
         self._verify_repo()
 
