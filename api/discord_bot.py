@@ -210,14 +210,26 @@ _PHASE_LABELS: dict[str, str] = {
 }
 
 
+_MAX_POLL_FAILURES = 6        # give up after this many consecutive errors
+_HEARTBEAT_INTERVAL = 60     # seconds between "still working…" edits when server is silent
+
+
 async def _poll_job(ctx: commands.Context, status_msg: discord.Message, job_id: str):
     """Edit *status_msg* until the job finishes, then post the result.
 
     Chat and research jobs stream the full response inline (chunked).
     All other job types (develop, review, test, architect) show a short
     summary and point the user to ``!result`` / ``!files``.
+
+    Resilience: transient HTTP failures are retried up to _MAX_POLL_FAILURES
+    consecutive times before giving up.  A heartbeat edit is sent every
+    _HEARTBEAT_INTERVAL seconds so the status message stays visibly alive
+    during long-running tasks.
     """
     start = time.monotonic()
+    consecutive_failures = 0
+    last_label = "Working"
+
     # Task types whose full response should be shown inline in the channel.
     _INLINE_TYPES = {"chat", "research", "plan"}
 
@@ -227,16 +239,35 @@ async def _poll_job(ctx: commands.Context, status_msg: discord.Message, job_id: 
 
         try:
             job = await bot.client.get_job(job_id)
+            consecutive_failures = 0  # reset on success
         except Exception as exc:
-            await status_msg.edit(content=f"Lost contact with agent: {exc}")
-            return
+            consecutive_failures += 1
+            err_str = str(exc) or type(exc).__name__
+            if consecutive_failures >= _MAX_POLL_FAILURES:
+                await status_msg.edit(
+                    content=(
+                        f"Lost contact with agent after {consecutive_failures} retries "
+                        f"({elapsed}s elapsed). Last status: **{last_label}**\n"
+                        f"Error: `{err_str}`\n"
+                        f"The job may still be running — use `!status` to check once "
+                        f"the server is back."
+                    )
+                )
+                return
+            # Transient failure — update message and keep polling
+            await status_msg.edit(
+                content=(
+                    f"{last_label}… ({elapsed}s) — "
+                    f"reconnecting [{consecutive_failures}/{_MAX_POLL_FAILURES}]"
+                )
+            )
+            continue
 
         job_status = job.get("status", "unknown")
         phase = job.get("phase", "")
 
         # Task-loop phases: "task:N/M:description" or "planning:tasks"
         if phase.startswith("task:"):
-            # task:2/5:Run npm start to capture error
             parts = phase.split(":", 2)
             progress = parts[1] if len(parts) > 1 else "?"
             desc = parts[2][:40] if len(parts) > 2 else ""
@@ -244,11 +275,11 @@ async def _poll_job(ctx: commands.Context, status_msg: discord.Message, job_id: 
         elif phase == "planning:tasks":
             label = "Planning tasks…"
         elif phase.startswith("sdlc:debugging:"):
-            # SDLC debug attempts carry a dynamic suffix like "sdlc:debugging:2/5"
             label = f"SDLC — Debugging ({phase.rsplit(':', 1)[-1]})"
         else:
-            _phase_key = phase
-            label = _PHASE_LABELS.get(_phase_key, phase or "Working")
+            label = _PHASE_LABELS.get(phase, phase or "Working")
+
+        last_label = label  # keep for reconnect messages
 
         if job_status == "done":
             task_type = job.get("task_type", "")
@@ -303,6 +334,9 @@ async def _poll_job(ctx: commands.Context, status_msg: discord.Message, job_id: 
             return
 
         else:
+            # Always update the status message (phase may have changed).
+            # Reset the heartbeat timer on every successful edit.
+            last_heartbeat = now
             await status_msg.edit(content=f"{label}… ({elapsed}s elapsed)")
 
 
