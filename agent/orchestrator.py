@@ -339,7 +339,7 @@ class AgentOrchestrator:
         if any(kw in t for kw in _PLAN):
             return "plan"
 
-        # 1. Explicit development: output is code/files
+        # 1. Explicit development: output is code/files (including document/content writing)
         _DEVELOP = [
             "implement", "refactor", "write a function", "write a class",
             "write a script", "write the code", "write code",
@@ -353,6 +353,21 @@ class AgentOrchestrator:
             "create an api", "create a server", "create a bot", "create a cli",
             "make an app", "make a server", "make a bot", "make a script",
             "make a function", "make a class",
+            # Content / document writing — these all produce files
+            "flush out", "flesh out", "fill in", "fill out",
+            "complete the", "complete this", "finish the", "finish writing",
+            "continue to write", "continue writing", "continue to flush",
+            "continue to flesh", "continue to fill", "continue to build",
+            "continue to develop", "continue to work on",
+            "write the narrative", "write the story", "write the lore",
+            "write the docs", "write the document", "write the content",
+            "draft the", "draft a document", "draft a narrative",
+            "expand the", "expand on", "add content", "add more content",
+            "add to the", "update the doc", "update the narrative",
+            "update the story", "write more", "add more detail",
+            "create the document", "create the narrative", "create the story",
+            "create the lore", "create the wiki", "create the design doc",
+            "write up", "document the", "write out",
         ]
         if any(kw in t for kw in _DEVELOP):
             return "develop"
@@ -659,6 +674,31 @@ class AgentOrchestrator:
                 parts.append(f"\n\n## Global Agent Instructions (AGENTS.md)\n{agents_content}")
             except Exception:
                 pass
+
+        # 0b. Workspace file listing — shallow snapshot so agents know what files exist
+        #     without having to run a shell command. Capped at 80 entries to stay concise.
+        try:
+            ws_root = Path(self.workspace_path)
+            if ws_root.exists():
+                ws_lines: list[str] = []
+                _IGNORE = {".git", "node_modules", "__pycache__", ".agent-wiki", "logs", "-p"}
+                for item in sorted(ws_root.rglob("*")):
+                    # Skip hidden/noisy directories
+                    if any(part in _IGNORE for part in item.parts):
+                        continue
+                    rel = item.relative_to(ws_root)
+                    prefix = "📁 " if item.is_dir() else "📄 "
+                    ws_lines.append(f"  {prefix}{rel}")
+                    if len(ws_lines) >= 80:
+                        ws_lines.append("  … (truncated)")
+                        break
+                if ws_lines:
+                    parts.append(
+                        f"\n\n## Workspace Files ({self.workspace_path})\n"
+                        + "\n".join(ws_lines)
+                    )
+        except Exception as _ws_err:
+            self.logger.warning("workspace_listing_failed", error=str(_ws_err))
 
         # 1. Wiki query — check persistent knowledge before every task
         wiki_ctx = await self.skill_executor.execute_pre("wiki-query", task)
