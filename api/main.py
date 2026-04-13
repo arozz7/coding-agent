@@ -216,7 +216,7 @@ async def run_task(request: TaskRequest):
     except Exception as e:
         import traceback
         logger.error("task_failed", error=str(e), traceback=traceback.format_exc())
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail="Internal server error")
 
 
 @app.post("/task/start")
@@ -651,7 +651,7 @@ async def call_mcp_tool(tool_name: str, arguments: dict = None):
         raise HTTPException(status_code=404, detail=str(e))
     except Exception as e:
         logger.error("mcp_tool_failed", tool=tool_name, error=str(e))
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail="Internal server error")
 
 
 @app.post("/subagent/spawn")
@@ -708,7 +708,7 @@ async def spawn_subagent_batch(request: dict):
         return {"results": results}
     except Exception as e:
         logger.error("subagent_batch_failed", error=str(e))
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail="Internal server error")
 
 
 @app.get("/subagent")
@@ -746,7 +746,7 @@ async def index_workspace(request: dict = None):
         return {"success": True, "result": result}
     except Exception as e:
         logger.error("index_failed", error=str(e))
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail="Internal server error")
 
 
 @app.get("/search")
@@ -761,7 +761,7 @@ async def search_codebase(q: str, limit: int = 5):
         return {"query": q, "results": results}
     except Exception as e:
         logger.error("search_failed", error=str(e))
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail="Internal server error")
 
 
 @app.get("/memory/stats")
@@ -781,7 +781,7 @@ async def get_memory_stats():
         }
     except Exception as e:
         logger.error("stats_failed", error=str(e))
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail="Internal server error")
 
 
 @app.get("/ready")
@@ -897,7 +897,7 @@ async def fetch_remote_skills():
         return result
     except Exception as e:
         logger.error("skills_fetch_failed", error=str(e))
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail="Internal server error")
 
 
 if __name__ == "__main__":
