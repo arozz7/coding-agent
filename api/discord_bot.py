@@ -1054,7 +1054,13 @@ async def helpme(ctx: commands.Context):
 async def _start_bot(token: str) -> None:
     """Wait for the API to be reachable, then connect to Discord."""
     await bot.client.wait_until_reachable()
-    await bot.start(token)
+    try:
+        await bot.start(token)
+    except asyncio.CancelledError:
+        pass  # normal shutdown path when the event loop is cancelled
+    finally:
+        if not bot.is_closed():
+            await bot.close()
 
 
 def run_bot(token: str):
@@ -1062,7 +1068,10 @@ def run_bot(token: str):
         print("ERROR: DISCORD_BOT_TOKEN is not set.")
         return
     print(f"[bot] Starting — API: {API_URL}")
-    asyncio.run(_start_bot(token))
+    try:
+        asyncio.run(_start_bot(token))
+    except KeyboardInterrupt:
+        print("[bot] Stopped.")
 
 
 if __name__ == "__main__":
