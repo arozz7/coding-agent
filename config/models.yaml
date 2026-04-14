@@ -11,11 +11,28 @@ models:
   - name: google_gemma-4-31b-it
     type: local
     endpoint: ${LM_STUDIO_URL:-http://127.0.0.1:1234}
-    context_window: 262144
+    context_window: 109148
     is_coding_optimized: true
     recommended_for: [coding, code_review, test_generation, planning, research]
     rate_limit_rpm: 120
 
+  - name: google/gemma-4-26b-a4b
+    type: local
+    endpoint: ${LM_STUDIO_URL:-http://127.0.0.1:1234}
+    context_window: 109148
+    is_coding_optimized: true
+    recommended_for: [coding, code_review, test_generation, planning, research]
+    rate_limit_rpm: 120
+
+  - name: gemma-4-31b-it
+    type: local
+    endpoint: ${LM_STUDIO_URL:-http://127.0.0.1:1234}
+    context_window: 109148
+    is_coding_optimized: true
+    recommended_for: [coding, code_review, test_generation, planning, research]
+    rate_limit_rpm: 120
+    
+    
   # ---- OpenRouter models (set OPENROUTER_API_KEY in .env to activate) ----
   # OpenRouter speaks the OpenAI-compatible /v1/chat/completions API.
   # Use any model slug from https://openrouter.ai/models as the `name`.
@@ -72,5 +89,5 @@ rate_limiting:
 
 defaults:
   coding_model: qwen3.5-35b-a3b
-  planning_model: qwen3.5-35b-a3b
-  fallback_model: google/gemma-4-31b-it:free
+  planning_model: google_gemma-4-31b-it
+  fallback_model: openai/gpt-oss-120b:free
