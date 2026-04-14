@@ -26,6 +26,58 @@ from discord.ext import commands
 API_URL = os.getenv("AGENT_API_URL", "http://localhost:5005")
 POLL_INTERVAL = int(os.getenv("BOT_POLL_INTERVAL", "5"))  # seconds
 
+# ---------------------------------------------------------------------------
+# Reconnect / retry helpers
+# ---------------------------------------------------------------------------
+
+# Backoff steps (seconds) — climbs to 5 min then holds there indefinitely.
+_BACKOFF_STEPS = [2, 5, 15, 30, 60, 120, 300]
+
+
+def _backoff(attempt: int) -> float:
+    """Return the delay for the given attempt index (0-based). Capped at 5 min."""
+    return float(_BACKOFF_STEPS[min(attempt, len(_BACKOFF_STEPS) - 1)])
+
+
+# HTTP status codes worth retrying (transient server / gateway errors).
+_RETRIABLE_STATUSES = {429, 502, 503, 504}
+
+
+async def _http_retry(coro_factory, label: str = "request"):
+    """Call ``coro_factory()`` repeatedly until it succeeds.
+
+    ``coro_factory`` must be a zero-argument callable that returns a coroutine
+    (so the coroutine can be recreated on each attempt — coroutines are
+    single-use).  Retries forever with the exponential-hold backoff curve.
+    Only non-retriable ``httpx.HTTPStatusError`` (e.g. 404, 403) propagates
+    immediately.
+    """
+    attempt = 0
+    while True:
+        try:
+            return await coro_factory()
+        except httpx.HTTPStatusError as exc:
+            if exc.response.status_code not in _RETRIABLE_STATUSES:
+                raise  # 404 / 401 / 400 — caller should handle these
+            delay = _backoff(attempt)
+            print(
+                f"[bot] {label}: HTTP {exc.response.status_code} — "
+                f"retry in {delay:.0f}s (attempt {attempt + 1})"
+            )
+        except (httpx.ConnectError, httpx.TimeoutException, httpx.RemoteProtocolError) as exc:
+            delay = _backoff(attempt)
+            print(
+                f"[bot] {label}: {type(exc).__name__} — "
+                f"retry in {delay:.0f}s (attempt {attempt + 1})"
+            )
+        except Exception as exc:
+            # Unexpected error — don't retry blindly, re-raise so callers can
+            # surface a meaningful message to the user.
+            raise
+
+        await asyncio.sleep(delay)
+        attempt += 1
+
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -98,21 +150,42 @@ class AgentClient:
     def __init__(self, api_url: str = API_URL):
         self.api_url = api_url
 
-    async def _get(self, path: str, **params) -> dict:
+    async def _get(self, endpoint: str, **params) -> dict:
+        url = f"{self.api_url}{endpoint}"
+        return await _http_retry(
+            lambda: self._raw_get(url, params or None),
+            label=f"GET {endpoint}",
+        )
+
+    async def _raw_get(self, url: str, params) -> dict:
         async with httpx.AsyncClient(timeout=20.0) as c:
-            r = await c.get(f"{self.api_url}{path}", params=params or None)
+            r = await c.get(url, params=params)
             r.raise_for_status()
             return r.json()
 
     async def _post(self, path: str, body: dict, timeout: float = 30.0) -> dict:
+        url = f"{self.api_url}{path}"
+        return await _http_retry(
+            lambda: self._raw_post(url, body, timeout),
+            label=f"POST {path}",
+        )
+
+    async def _raw_post(self, url: str, body: dict, timeout: float) -> dict:
         async with httpx.AsyncClient(timeout=timeout) as c:
-            r = await c.post(f"{self.api_url}{path}", json=body)
+            r = await c.post(url, json=body)
             r.raise_for_status()
             return r.json()
 
     async def _delete(self, path: str) -> dict:
+        url = f"{self.api_url}{path}"
+        return await _http_retry(
+            lambda: self._raw_delete(url),
+            label=f"DELETE {path}",
+        )
+
+    async def _raw_delete(self, url: str) -> dict:
         async with httpx.AsyncClient(timeout=15.0) as c:
-            r = await c.delete(f"{self.api_url}{path}")
+            r = await c.delete(url)
             r.raise_for_status()
             return r.json()
 
@@ -137,6 +210,9 @@ class AgentClient:
     async def get_file(self, path: str) -> dict:
         return await self._get("/workspace/file", path=path)
 
+    async def set_project(self, name: str) -> dict:
+        return await self._post("/workspace/project", {"name": name})
+
     async def get_session_history(self, session_id: str) -> dict:
         return await self._get(f"/sessions/{session_id}")
 
@@ -146,14 +222,28 @@ class AgentClient:
     async def delete_session(self, session_id: str) -> dict:
         return await self._delete(f"/sessions/{session_id}")
 
-    # Sync health probe — only called before the event loop starts
-    def is_reachable(self) -> bool:
-        import requests as _req
-        try:
-            _req.get(f"{self.api_url}/health", timeout=5).raise_for_status()
-            return True
-        except Exception:
-            return False
+    async def wait_until_reachable(self) -> None:
+        """Poll /health until the API responds. Never gives up.
+
+        Uses the same backoff curve as _http_retry so early retries are fast
+        and long outages settle at one probe every 5 minutes.
+        """
+        attempt = 0
+        while True:
+            try:
+                async with httpx.AsyncClient(timeout=5.0) as c:
+                    r = await c.get(f"{self.api_url}/health")
+                    r.raise_for_status()
+                print(f"[bot] API is reachable at {self.api_url}")
+                return
+            except Exception as exc:
+                delay = _backoff(attempt)
+                print(
+                    f"[bot] API not reachable ({type(exc).__name__}) — "
+                    f"retrying in {delay:.0f}s (attempt {attempt + 1})"
+                )
+                await asyncio.sleep(delay)
+                attempt += 1
 
 
 # ---------------------------------------------------------------------------
@@ -210,7 +300,6 @@ _PHASE_LABELS: dict[str, str] = {
 }
 
 
-_MAX_POLL_FAILURES = 6        # give up after this many consecutive errors
 _HEARTBEAT_INTERVAL = 60     # seconds between "still working…" edits when server is silent
 
 
@@ -221,10 +310,9 @@ async def _poll_job(ctx: commands.Context, status_msg: discord.Message, job_id: 
     All other job types (develop, review, test, architect) show a short
     summary and point the user to ``!result`` / ``!files``.
 
-    Resilience: transient HTTP failures are retried up to _MAX_POLL_FAILURES
-    consecutive times before giving up.  A heartbeat edit is sent every
-    _HEARTBEAT_INTERVAL seconds so the status message stays visibly alive
-    during long-running tasks.
+    Resilience: transient HTTP failures trigger the backoff curve and are
+    retried indefinitely — the poller never gives up.  A heartbeat edit keeps
+    the Discord message visibly alive during long outages.
     """
     start = time.monotonic()
     consecutive_failures = 0
@@ -238,29 +326,25 @@ async def _poll_job(ctx: commands.Context, status_msg: discord.Message, job_id: 
         elapsed = int(time.monotonic() - start)
 
         try:
+            # _get() already retries internally via _http_retry; reaching here
+            # means success.  Reset the consecutive-failure counter so the
+            # status message goes back to the normal label.
             job = await bot.client.get_job(job_id)
-            consecutive_failures = 0  # reset on success
+            if consecutive_failures > 0:
+                consecutive_failures = 0
+                await status_msg.edit(content=f"{last_label}… ({elapsed}s) — reconnected")
         except Exception as exc:
+            # _http_retry re-raises only non-retriable errors (e.g. 404).
+            # Show the error but keep polling so a temporary outage recovers.
             consecutive_failures += 1
-            err_str = str(exc) or type(exc).__name__
-            if consecutive_failures >= _MAX_POLL_FAILURES:
-                await status_msg.edit(
-                    content=(
-                        f"Lost contact with agent after {consecutive_failures} retries "
-                        f"({elapsed}s elapsed). Last status: **{last_label}**\n"
-                        f"Error: `{err_str}`\n"
-                        f"The job may still be running — use `!status` to check once "
-                        f"the server is back."
-                    )
-                )
-                return
-            # Transient failure — update message and keep polling
+            delay = _backoff(consecutive_failures - 1)
             await status_msg.edit(
                 content=(
                     f"{last_label}… ({elapsed}s) — "
-                    f"reconnecting [{consecutive_failures}/{_MAX_POLL_FAILURES}]"
+                    f"connection lost, next retry in {delay:.0f}s"
                 )
             )
+            await asyncio.sleep(delay)
             continue
 
         job_status = job.get("status", "unknown")
@@ -285,6 +369,22 @@ async def _poll_job(ctx: commands.Context, status_msg: discord.Message, job_id: 
             task_type = job.get("task_type", "")
             files = job.get("files_created", [])
             screenshot_path = job.get("screenshot_path")
+
+            # Context bridge — silently swap the user's session and notify.
+            if job.get("handover_triggered") and job.get("new_session_id"):
+                new_sid = job["new_session_id"]
+                user_id = str(ctx.author.id)
+                bot.user_sessions[user_id] = new_sid
+                await ctx.send(
+                    f"**Context bridged** — session was near capacity so a fresh "
+                    f"session was started and pre-loaded with a summary of our work. "
+                    f"New session: `{new_sid}`. Everything continues seamlessly."
+                )
+            elif job.get("context_budget") == "warn":
+                await ctx.send(
+                    "**Heads-up:** context window is 75 %+ full. "
+                    "The next task may trigger an automatic context bridge."
+                )
 
             if task_type in _INLINE_TYPES:
                 # Fetch and stream the full response for conversational tasks.
@@ -686,6 +786,58 @@ async def workspace(ctx: commands.Context):
         await ctx.send(f"Error: {exc}")
 
 
+@bot.command(name="project")
+async def project_cmd(ctx: commands.Context, *, name: str = ""):
+    """Show or switch the active project.
+
+    !project              — show current project and workspace root
+    !project <name>       — switch to WORKSPACE_PATH/<name> (created if needed)
+    !project clear        — return to workspace root (for starting a new project)
+    """
+    name = name.strip()
+
+    # Show current state.
+    if not name:
+        try:
+            data = await bot.client._get("/workspace")
+            ws = data.get("workspace", "unknown")
+            proj_data = await bot.client._get("/workspace/project")
+            project = proj_data.get("project") or "(none — at workspace root)"
+            root = proj_data.get("workspace_root", ws)
+            await ctx.send(
+                f"**Active project:** `{project}`\n"
+                f"**Workspace root:** `{root}`\n"
+                f"**Effective path:** `{ws}`\n\n"
+                f"Use `!project <name>` to switch, `!project clear` to return to root."
+            )
+        except Exception as exc:
+            await ctx.send(f"Error fetching project info: {exc}")
+        return
+
+    # Clear back to workspace root.
+    if name.lower() == "clear":
+        try:
+            data = await bot.client.set_project("")
+            await ctx.send(
+                f"Cleared to workspace root: `{data.get('workspace')}`\n"
+                f"The agent will now create a new subdirectory for the next project."
+            )
+        except Exception as exc:
+            await ctx.send(f"Could not clear project: {exc}")
+        return
+
+    # Switch to named project.
+    try:
+        data = await bot.client.set_project(name)
+        await ctx.send(
+            f"Switched to project **{name}**\n"
+            f"Workspace: `{data.get('workspace')}`\n"
+            f"Directory created if it did not exist. Ready for `!ask`."
+        )
+    except Exception as exc:
+        await ctx.send(f"Could not switch project: {exc}")
+
+
 @bot.command(name="git")
 async def git_cmd(ctx: commands.Context, *, args: str):
     """Run a safe read-only git command: status, log, diff, branch."""
@@ -873,7 +1025,10 @@ async def helpme(ctx: commands.Context):
         "`!clear` — Clear conversation history\n"
         "`!sessions` — List all sessions\n\n"
         "**Workspace:**\n"
-        "`!workspace` — Show workspace path and top-level contents\n\n"
+        "`!workspace` — Show workspace path and top-level contents\n"
+        "`!project` — Show active project\n"
+        "`!project <name>` — Switch to (or create) a project subdirectory\n"
+        "`!project clear` — Return to workspace root to start a new project\n\n"
         "**Models:**\n"
         "`!models` — List all configured models\n"
         "`!model` — Show active model\n"
@@ -896,12 +1051,27 @@ async def helpme(ctx: commands.Context):
 # Entry point
 # ---------------------------------------------------------------------------
 
+async def _start_bot(token: str) -> None:
+    """Wait for the API to be reachable, then connect to Discord."""
+    await bot.client.wait_until_reachable()
+    try:
+        await bot.start(token)
+    except asyncio.CancelledError:
+        pass  # normal shutdown path when the event loop is cancelled
+    finally:
+        if not bot.is_closed():
+            await bot.close()
+
+
 def run_bot(token: str):
     if not token:
         print("ERROR: DISCORD_BOT_TOKEN is not set.")
         return
     print(f"[bot] Starting — API: {API_URL}")
-    bot.run(token)
+    try:
+        asyncio.run(_start_bot(token))
+    except KeyboardInterrupt:
+        print("[bot] Stopped.")
 
 
 if __name__ == "__main__":

@@ -1,13 +1,105 @@
+import os
 import subprocess
 import platform
 import re
 import shlex
+import shutil
 from pathlib import Path
 import structlog
 
 logger = structlog.get_logger()
 
 IS_WINDOWS = platform.system() == "Windows"
+
+
+def _build_tool_env() -> dict:
+    """Return a copy of os.environ with PATH augmented to include common tool directories.
+
+    Solves the "npm not found" class of errors that occur when the API server
+    is started from an IDE terminal or service that inherits a minimal PATH.
+
+    Discovery order:
+      1. Current os.environ (inherits whatever the server was started with)
+      2. Well-known Windows install directories for Node, Python, Git, Cargo
+      3. User-level package manager directories (nvm, fnm, pyenv, volta)
+      4. EXTRA_PATH env var — comma/semicolon-separated dirs the user adds in .env
+         for truly non-standard installs
+    """
+    env = os.environ.copy()
+    path_parts = [p for p in env.get("PATH", "").split(os.pathsep) if p]
+
+    if IS_WINDOWS:
+        appdata = os.environ.get("APPDATA", "")
+        localappdata = os.environ.get("LOCALAPPDATA", "")
+        userprofile = os.environ.get("USERPROFILE", "")
+        programfiles = os.environ.get("ProgramFiles", "C:\\Program Files")
+        programfiles86 = os.environ.get("ProgramFiles(x86)", "C:\\Program Files (x86)")
+
+        _COMMON_WIN_PATHS = [
+            # Node / npm
+            Path(programfiles) / "nodejs",
+            Path(programfiles86) / "nodejs",
+            Path(appdata) / "npm",
+            # nvm for Windows
+            Path(userprofile) / "AppData" / "Roaming" / "nvm",
+            Path(localappdata) / "nvm",
+            # Volta
+            Path(userprofile) / ".volta" / "bin",
+            # fnm
+            Path(localappdata) / "fnm" / "aliases" / "default" / "bin",
+            # Python launchers
+            Path(localappdata) / "Programs" / "Python" / "Launcher",
+            # Git
+            Path(programfiles) / "Git" / "cmd",
+            Path(programfiles86) / "Git" / "cmd",
+            # Rust / Cargo
+            Path(userprofile) / ".cargo" / "bin",
+            # Yarn
+            Path(localappdata) / "Yarn" / "bin",
+            Path(appdata) / "npm",  # yarn also installs here on Windows
+        ]
+        # Also probe all Python3x dirs under %LOCALAPPDATA%\Programs\Python
+        py_root = Path(localappdata) / "Programs" / "Python"
+        if py_root.exists():
+            for d in py_root.iterdir():
+                if d.is_dir() and d.name.startswith("Python"):
+                    _COMMON_WIN_PATHS.append(d)
+                    _COMMON_WIN_PATHS.append(d / "Scripts")
+    else:
+        _COMMON_WIN_PATHS = [
+            # Homebrew (macOS Intel / Apple Silicon)
+            Path("/usr/local/bin"),
+            Path("/opt/homebrew/bin"),
+            # nvm / nodenv default locations
+            Path.home() / ".nvm" / "versions" / "node",
+            Path.home() / ".nodenv" / "shims",
+            # pyenv
+            Path.home() / ".pyenv" / "shims",
+            # Cargo
+            Path.home() / ".cargo" / "bin",
+            # Volta
+            Path.home() / ".volta" / "bin",
+        ]
+
+    for candidate in _COMMON_WIN_PATHS:
+        s = str(candidate)
+        if candidate.exists() and s not in path_parts:
+            path_parts.append(s)
+
+    # User-supplied extra paths via EXTRA_PATH in .env
+    extra = os.environ.get("EXTRA_PATH", "").strip()
+    if extra:
+        for p in re.split(r"[;,]", extra):
+            p = p.strip()
+            if p and p not in path_parts:
+                path_parts.append(p)
+
+    env["PATH"] = os.pathsep.join(path_parts)
+    return env
+
+
+# Built once at module load; shared by all ShellTool instances.
+_TOOL_ENV = _build_tool_env()
 
 # Patterns that are unconditionally blocked regardless of platform.
 # These guard against LLM-generated command injection and destructive operations.
@@ -54,7 +146,9 @@ class ShellTool:
         # workspace_path comes from WORKSPACE_PATH env var / server config, not user HTTP input.
         self.workspace = Path(workspace_path).resolve()  # lgtm[py/path-injection]
         self.logger = logger.bind(component="shell_tool")
-        self.logger.info("shell_initialized", os=platform.system(), workspace=str(self.workspace))
+        # Log which key tools are resolvable so PATH issues are visible at startup.
+        _found = {t: shutil.which(t, path=_TOOL_ENV["PATH"]) for t in ("npm", "node", "python", "git", "cargo")}
+        self.logger.info("shell_initialized", os=platform.system(), workspace=str(self.workspace), tools_found=_found)
 
     def _translate_unix_to_windows(self, cmd: str) -> str:
         """Translate common Unix commands to their Windows equivalents.
@@ -165,6 +259,7 @@ class ShellTool:
                 capture_output=True,
                 text=True,
                 timeout=timeout,
+                env=_TOOL_ENV,
             )
             return {
                 "success": result.returncode == 0,

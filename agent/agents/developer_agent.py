@@ -90,11 +90,20 @@ DO NOT:
 - Describe what you would do — DO it
 
 PROJECT DIRECTORY RULE — CRITICAL:
-When building a NEW project (game, app, API, tool, etc.):
-1. Infer a short, lowercase, hyphenated project name from the task
-2. Create ALL files under that named subdirectory: FILE: <project-name>/src/main.py
-3. NEVER dump files directly into the workspace root for a new project
-4. If continuing work on an existing project, keep files under the same subdirectory
+The workspace may already be scoped to an active project (PROJECT_DIR is set).
+When that is the case, you are ALREADY inside the project root — do NOT prefix
+paths with the project name again.
+
+Rules:
+1. If context includes "Active project: <name>", the workspace IS that project.
+   Write files at the workspace root:
+     CORRECT:  FILE: docs/narrative/01-story.md
+     WRONG:    FILE: Shadows-of-Eldoria/docs/narrative/01-story.md
+2. If starting a BRAND NEW project with no active project in context, infer a
+   short, lowercase, hyphenated name and create all files under that subdirectory:
+     FILE: <project-name>/src/main.py
+3. NEVER dump files into the workspace root for a genuinely new, standalone project.
+4. When in doubt, list existing files first before creating any subdirectory.
 
 For file writing use this exact format:
 FILE: path/to/file.ext
@@ -183,23 +192,26 @@ Focus on:
             return {"success": False, "error": "model_router not available"}
 
         enriched_context = context.get("enriched_context", "")
+        # Order: static system prompt → enriched context (env, skills, history) → task (dynamic)
+        # Putting the task last mirrors standard chat format and lets any caching layer
+        # reuse the static prefix across calls.
         prompt = f"""{self.get_system_prompt()}
-
-Task: {task}
 
 {architecture if architecture else ''}{enriched_context}
 
-Implement the solution with:
-1. Complete, working code
-2. Appropriate error handling
-3. Basic tests
-4. Clear documentation in comments
+## Current Task
+{task}
 
-Write actual files using the format:
-FILE:
-```<language>
-# file content here
+Implement the solution. Write actual files using the EXACT format (path on the SAME line as FILE:):
+FILE: path/to/file.ext
+```language
+file content here
 ```
+
+When finished, end your response with:
+## DONE
+Files created: <comma-separated list, or "none">
+Summary: <one sentence>
 """
 
         model = model_router.get_model("coding")
@@ -213,8 +225,12 @@ FILE:
             for file_path, content in file_writes:
                 try:
                     await tool_executor.execute("file_write", {"path": file_path, "content": content})
-                    files_created.append(file_path)
-                    self.logger.info("file_written", path=file_path, size=len(content))
+                    verify = await tool_executor.execute("file_read", {"path": file_path})
+                    if not verify.startswith("Error"):
+                        files_created.append(file_path)
+                        self.logger.info("file_written", path=file_path, size=len(content))
+                    else:
+                        self.logger.warning("file_write_not_verified", path=file_path, verify=verify[:120])
                 except Exception as e:
                     self.logger.error("file_write_failed", path=file_path, error=str(e))
 
@@ -248,8 +264,11 @@ FILE:
             for file_path, content in self._extract_file_writes(force_run_response):
                 try:
                     await tool_executor.execute("file_write", {"path": file_path, "content": content})
-                    if file_path not in files_created:
+                    verify = await tool_executor.execute("file_read", {"path": file_path})
+                    if not verify.startswith("Error") and file_path not in files_created:
                         files_created.append(file_path)
+                    elif verify.startswith("Error"):
+                        self.logger.warning("force_run_file_write_not_verified", path=file_path)
                 except Exception as e:
                     self.logger.error("force_run_file_write_failed", path=file_path, error=str(e))
 
@@ -279,8 +298,11 @@ FILE:
                 for file_path, content in self._extract_file_writes(fix_response):
                     try:
                         await tool_executor.execute("file_write", {"path": file_path, "content": content})
-                        if file_path not in files_created:
+                        verify = await tool_executor.execute("file_read", {"path": file_path})
+                        if not verify.startswith("Error") and file_path not in files_created:
                             files_created.append(file_path)
+                        elif verify.startswith("Error"):
+                            self.logger.warning("fix_file_write_not_verified", path=file_path)
                     except Exception as e:
                         self.logger.error("fix_file_write_failed", path=file_path, error=str(e))
 
@@ -306,6 +328,25 @@ FILE:
             except Exception as e:
                 self.logger.error("screenshot_failed", error=str(e))
 
+        # Extract structured DONE block if the model emitted one.
+        # Provides a clean one-line summary for Discord / job store.
+        completion_summary = ""
+        done_match = re.search(
+            r"##\s*DONE\s*\n(?:Files created:\s*(.+?)\n)?Summary:\s*(.+)",
+            response,
+            re.IGNORECASE | re.DOTALL,
+        )
+        if done_match:
+            done_files_line = (done_match.group(1) or "").strip()
+            completion_summary = (done_match.group(2) or "").strip().splitlines()[0]
+            # Merge any files listed in the DONE block that weren't caught by
+            # the FILE: regex (e.g. files the model mentioned but wrote inline).
+            if done_files_line and done_files_line.lower() not in ("none", ""):
+                for f in re.split(r",\s*", done_files_line):
+                    f = f.strip()
+                    if f and f not in files_created:
+                        files_created.append(f)
+
         return {
             "success": True,
             "role": self.name,
@@ -314,6 +355,7 @@ FILE:
             "files_created": files_created,
             "shell_output": shell_outputs,
             "screenshot": screenshot_path,
+            "completion_summary": completion_summary,
         }
 
 

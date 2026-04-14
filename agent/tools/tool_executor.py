@@ -20,6 +20,23 @@ import structlog
 
 logger = structlog.get_logger()
 
+_SHELL_MAX_LINES = 500
+_SHELL_MAX_BYTES = 20_000
+
+
+def _cap_shell_output(text: str) -> str:
+    """Truncate shell output to _SHELL_MAX_LINES / _SHELL_MAX_BYTES, whichever is hit first."""
+    if not text:
+        return text
+    lines = text.splitlines()
+    if len(lines) > _SHELL_MAX_LINES:
+        kept = "\n".join(lines[:_SHELL_MAX_LINES])
+        return kept + f"\n… ({len(lines) - _SHELL_MAX_LINES} more lines truncated)"
+    if len(text.encode()) > _SHELL_MAX_BYTES:
+        truncated = text.encode()[:_SHELL_MAX_BYTES].decode(errors="replace")
+        return truncated + f"\n… (output truncated at {_SHELL_MAX_BYTES} bytes)"
+    return text
+
 
 class ToolExecutor:
     """Formal tool execution interface.
@@ -88,7 +105,7 @@ class ToolExecutor:
         rc = result.get("returncode")
 
         if result.get("success"):
-            return stdout or "(command completed, no output)"
+            return _cap_shell_output(stdout or "(command completed, no output)")
 
         parts = []
         if stdout:
@@ -97,7 +114,7 @@ class ToolExecutor:
             parts.append(f"stderr:\n{stderr}")
         body = "\n".join(parts) if parts else result.get("error", "unknown error")
         rc_str = f" (exit {rc})" if rc is not None else ""
-        return f"Command failed{rc_str}:\n{body}"
+        return _cap_shell_output(f"Command failed{rc_str}:\n{body}")
     
     def _read_file(self, input: Dict[str, Any]) -> str:
         """Read a file."""

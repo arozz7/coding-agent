@@ -2,6 +2,8 @@ from typing import TypedDict, Annotated, List, Optional, Callable
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
+import os
+import subprocess
 import structlog
 
 from llm import ModelRouter
@@ -337,7 +339,7 @@ class AgentOrchestrator:
         if any(kw in t for kw in _PLAN):
             return "plan"
 
-        # 1. Explicit development: output is code/files
+        # 1. Explicit development: output is code/files (including document/content writing)
         _DEVELOP = [
             "implement", "refactor", "write a function", "write a class",
             "write a script", "write the code", "write code",
@@ -351,6 +353,21 @@ class AgentOrchestrator:
             "create an api", "create a server", "create a bot", "create a cli",
             "make an app", "make a server", "make a bot", "make a script",
             "make a function", "make a class",
+            # Content / document writing — these all produce files
+            "flush out", "flesh out", "fill in", "fill out",
+            "complete the", "complete this", "finish the", "finish writing",
+            "continue to write", "continue writing", "continue to flush",
+            "continue to flesh", "continue to fill", "continue to build",
+            "continue to develop", "continue to work on",
+            "write the narrative", "write the story", "write the lore",
+            "write the docs", "write the document", "write the content",
+            "draft the", "draft a document", "draft a narrative",
+            "expand the", "expand on", "add content", "add more content",
+            "add to the", "update the doc", "update the narrative",
+            "update the story", "write more", "add more detail",
+            "create the document", "create the narrative", "create the story",
+            "create the lore", "create the wiki", "create the design doc",
+            "write up", "document the", "write out",
         ]
         if any(kw in t for kw in _DEVELOP):
             return "develop"
@@ -483,6 +500,111 @@ class AgentOrchestrator:
                         seen.append(name)
         return seen
 
+    # Fallback handover template used when the skill file cannot be loaded.
+    _HANDOVER_FALLBACK = (
+        "Generate a concise Context Bridge document so a future AI session can "
+        "resume exactly where this one left off.\n\n"
+        "Output ONLY this structure:\n\n"
+        "### Current State\n"
+        "3-sentence summary of objectives, decisions, and work completed.\n\n"
+        "### Technical Details\n"
+        "Bulleted list of specific constraints, file paths, function names, "
+        "config values, and preferences established in this session.\n\n"
+        "### Next Steps\n"
+        "Prioritised list of what the next session should focus on.\n\n"
+        "### Opening Instruction\n"
+        "A single sentence the user can paste into a new chat to instantly "
+        "prime the next AI with this context.\n\n"
+        "Be concise but comprehensive — no context should be lost."
+    )
+
+    # ------------------------------------------------------------------ #
+    # Context-budget helpers                                               #
+    # ------------------------------------------------------------------ #
+
+    def _estimate_context_tokens(self, session_id: str, task: str) -> int:
+        """Rough token estimate for the next LLM call.
+
+        Measures the session history string plus a fixed overhead that accounts
+        for the system prompt (~1 500 tokens) and enriched context (~3 000 tokens).
+        Uses char/4 as the token estimator — precise enough for a threshold check.
+        """
+        history = self._build_context_from_events(session_id)
+        char_count = len(history) + len(task)
+        return char_count // 4 + 4_500  # overhead: system prompt + enriched context
+
+    def _check_context_budget(self, session_id: str, task: str) -> str:
+        """Return 'ok', 'warn' (≥75 %), or 'bridge' (≥82 %) based on token usage."""
+        config = self.model_router.get_model("coding")
+        if not config or not config.context_window:
+            return "ok"
+        estimated = self._estimate_context_tokens(session_id, task)
+        ratio = estimated / config.context_window
+        self.logger.debug(
+            "context_budget_check",
+            estimated_tokens=estimated,
+            context_window=config.context_window,
+            ratio=f"{ratio:.1%}",
+        )
+        if ratio >= 0.82:
+            return "bridge"
+        if ratio >= 0.75:
+            return "warn"
+        return "ok"
+
+    async def _run_handover(self, session_id: str, task: str) -> tuple:
+        """Generate a Context Bridge, create a new session pre-seeded with it.
+
+        Returns (bridge_text: str, new_session_id: str).
+        """
+        # Load the handover SKILL.md if available, else use fallback template.
+        skill = self.skill_manager.get_skill("handover")
+        instructions = (skill.content if skill else self._HANDOVER_FALLBACK).strip()
+
+        # Gather recent git context (best-effort).
+        git_summary = ""
+        try:
+            r = subprocess.run(
+                ["git", "log", "--oneline", "-10"],
+                cwd=str(self.workspace_path),
+                capture_output=True,
+                text=True,
+                timeout=5,
+            )
+            if r.returncode == 0:
+                git_summary = r.stdout.strip()
+        except Exception:
+            pass
+
+        history = self._build_context_from_events(session_id)
+        prompt = (
+            f"{instructions}\n\n"
+            f"## Session to summarise\n"
+            f"Session ID: {session_id}\n"
+            f"Next task (triggered this handover): {task}\n\n"
+            f"Recent git commits:\n{git_summary or '(unavailable)'}\n\n"
+            f"Conversation history:\n{history or '(no history yet)'}\n\n"
+            f"Generate the Context Bridge now."
+        )
+
+        config = self.model_router.get_model("coding")
+        bridge_text = await self.model_router.generate(prompt, config)
+
+        # Create the new session and pre-seed it with the bridge document.
+        new_session_id = f"session_{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}_bridge"
+        self.session_memory.get_or_create_session(new_session_id, self.workspace_path)
+        self.session_memory.save_message(
+            new_session_id,
+            "assistant",
+            f"[Context Bridge — resumed from session {session_id}]\n\n{bridge_text}",
+        )
+        self.logger.info(
+            "handover_complete",
+            old_session=session_id,
+            new_session=new_session_id,
+        )
+        return bridge_text, new_session_id
+
     @staticmethod
     def _build_environment_context() -> str:
         """Return a compact block describing the runtime environment.
@@ -515,10 +637,20 @@ class AgentOrchestrator:
         else:
             shell_guide = "Shell: bash/sh (Linux)"
 
+        active_project = os.environ.get("PROJECT_DIR", "").strip()
+        project_line = (
+            f"Active project: {active_project} "
+            f"(workspace is already scoped — write files at workspace root, "
+            f"NOT inside a new subdirectory)\n"
+            if active_project
+            else ""
+        )
+
         return (
             f"\n\n## Runtime Environment\n"
             f"OS: {system} {release}\n"
             f"{shell_guide}\n"
+            f"{project_line}"
         )
 
     async def _build_enriched_context(self, task: str) -> str:
@@ -542,6 +674,31 @@ class AgentOrchestrator:
                 parts.append(f"\n\n## Global Agent Instructions (AGENTS.md)\n{agents_content}")
             except Exception:
                 pass
+
+        # 0b. Workspace file listing — shallow snapshot so agents know what files exist
+        #     without having to run a shell command. Capped at 80 entries to stay concise.
+        try:
+            ws_root = Path(self.workspace_path)
+            if ws_root.exists():
+                ws_lines: list[str] = []
+                _IGNORE = {".git", "node_modules", "__pycache__", ".agent-wiki", "logs", "-p"}
+                for item in sorted(ws_root.rglob("*")):
+                    # Skip hidden/noisy directories
+                    if any(part in _IGNORE for part in item.parts):
+                        continue
+                    rel = item.relative_to(ws_root)
+                    prefix = "📁 " if item.is_dir() else "📄 "
+                    ws_lines.append(f"  {prefix}{rel}")
+                    if len(ws_lines) >= 80:
+                        ws_lines.append("  … (truncated)")
+                        break
+                if ws_lines:
+                    parts.append(
+                        f"\n\n## Workspace Files ({self.workspace_path})\n"
+                        + "\n".join(ws_lines)
+                    )
+        except Exception as _ws_err:
+            self.logger.warning("workspace_listing_failed", error=str(_ws_err))
 
         # 1. Wiki query — check persistent knowledge before every task
         wiki_ctx = await self.skill_executor.execute_pre("wiki-query", task)
@@ -881,6 +1038,30 @@ class AgentOrchestrator:
 
         self.agent_logger.log_task_start("agent", {"task": task})
 
+        # --- Context bridge check -------------------------------------------
+        # Measure the session history size before dispatching.  If we are at
+        # 82 %+ of the model's context window, generate a Context Bridge first,
+        # swap to a fresh session pre-seeded with the bridge, and continue the
+        # current task in that new session.  At 75–82 % we just flag a warning
+        # so the Discord bot can nudge the user.
+        handover_triggered = False
+        handover_bridge: Optional[str] = None
+        original_session_id: Optional[str] = None
+        budget = self._check_context_budget(session_id, task)
+        if budget == "bridge":
+            _emit_phase("handover")
+            self.logger.info("context_bridge_triggered", session_id=session_id)
+            try:
+                bridge_text, new_session_id = await self._run_handover(session_id, task)
+                original_session_id = session_id
+                session_id = new_session_id
+                handover_triggered = True
+                handover_bridge = bridge_text
+                self.logger.info("session_swapped", new_session_id=session_id)
+            except Exception as _he:
+                self.logger.error("handover_failed", error=str(_he))
+                # Continue with the old session rather than aborting the task.
+
         # Run LLM classifier and context building in parallel to save wall time.
         _emit_phase("preparing")
         import asyncio as _asyncio
@@ -945,6 +1126,9 @@ class AgentOrchestrator:
                 return {
                     "success": True,
                     "session_id": session_id,
+                    "handover_triggered": handover_triggered,
+                    "original_session_id": original_session_id,
+                    "context_budget": budget,
                     "result": {
                         "response": response,
                         "task": task,
@@ -952,6 +1136,7 @@ class AgentOrchestrator:
                         "files_created": result.get("files_created", []),
                         "skill_reports": post_skill_reports,
                         "screenshot_path": result.get("screenshot_path"),
+                        "handover_bridge": handover_bridge,
                     },
                 }
             else:

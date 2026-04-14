@@ -20,7 +20,20 @@ logger = structlog.get_logger()
 import os
 from pathlib import Path
 
+# Load .env before reading any env vars — must happen at module import time
+# so that WORKSPACE_PATH and PROJECT_DIR are available for module-level constants.
+try:
+    from dotenv import load_dotenv as _load_dotenv
+    _load_dotenv(override=False)
+except ImportError:
+    pass
+
 WORKSPACE_PATH = os.getenv("WORKSPACE_PATH", os.path.abspath("./workspace"))
+
+# Optional active-project subdirectory within the workspace root.
+# When set, the agent always operates inside WORKSPACE_PATH/PROJECT_DIR
+# instead of the bare workspace root.
+PROJECT_DIR = os.getenv("PROJECT_DIR", "").strip()
 
 # Security: Disallowed paths (critical system folders)
 DISALLOWED_PATHS = [
@@ -50,7 +63,7 @@ def _is_path_allowed(path: str) -> bool:
             return False
     return True
 
-# Ensure workspace exists
+# Ensure workspace exists (base path always; effective path when PROJECT_DIR is set)
 Path(WORKSPACE_PATH).mkdir(parents=True, exist_ok=True)
 
 
@@ -122,7 +135,22 @@ class SessionInfo(BaseModel):
 
 _model_router: Optional[ModelRouter] = None
 _orchestrator: Optional[AgentOrchestrator] = None
-_current_workspace: str = WORKSPACE_PATH
+
+# Effective workspace: WORKSPACE_PATH/PROJECT_DIR when PROJECT_DIR is set,
+# otherwise bare WORKSPACE_PATH.  GitTool reads WORKSPACE_PATH from os.environ,
+# so we update it here to match the effective path.
+def _effective_workspace(base: str = WORKSPACE_PATH, project: str = PROJECT_DIR) -> str:
+    if project:
+        return str(Path(base) / project)
+    return base
+
+_current_workspace: str = _effective_workspace()
+# Ensure the effective workspace directory exists.
+Path(_current_workspace).mkdir(parents=True, exist_ok=True)
+# Publish the effective workspace in a dedicated env var that GitTool reads.
+# We deliberately do NOT overwrite WORKSPACE_PATH — that variable must stay as
+# the base path from .env so that module reloads don't double-append PROJECT_DIR.
+os.environ["AGENT_EFFECTIVE_WORKSPACE"] = _current_workspace
 
 # SQLite-backed job store (write-through, in-memory hot cache)
 _job_store: JobStore = JobStore("data/jobs.db")
@@ -173,21 +201,48 @@ def _summarize_response(text: str, max_chars: int = 500) -> str:
     return (prose or "(task completed)") + shell_snippet
 
 
+# Backoff schedule shared with the bot (seconds → holds at 5 min indefinitely).
+_STARTUP_BACKOFF = [2, 5, 15, 30, 60, 120, 300]
+
+
+def _startup_backoff(attempt: int) -> float:
+    return float(_STARTUP_BACKOFF[min(attempt, len(_STARTUP_BACKOFF) - 1)])
+
+
 @app.on_event("startup")
 async def startup_event():
-    global _model_router, _orchestrator, _current_workspace
+    global _orchestrator
     from local_coding_agent import create_agent
 
-    logger.info("starting_api", component="api", workspace=WORKSPACE_PATH)
+    logger.info(
+        "starting_api",
+        component="api",
+        workspace=_current_workspace,
+        project_dir=PROJECT_DIR or "(none)",
+    )
 
     # Restore persisted jobs; mark stale running jobs as failed
     _job_store.load()
 
-    try:
-        _orchestrator = create_agent(WORKSPACE_PATH, "config/models.yaml")
-        logger.info("agent_initialized")
-    except Exception as e:
-        logger.error("agent_init_failed", error=str(e))
+    # Retry agent initialisation indefinitely — the LLM backend (LM Studio /
+    # Ollama) may not be up yet.  Backoff slows to 5-minute probes so we don't
+    # spam the log during a long outage.  The API stays up and returns 503 on
+    # /task endpoints until the agent is ready.
+    attempt = 0
+    while _orchestrator is None:
+        try:
+            _orchestrator = create_agent(_current_workspace, "config/models.yaml")
+            logger.info("agent_initialized", attempt=attempt)
+        except Exception as e:
+            delay = _startup_backoff(attempt)
+            logger.warning(
+                "agent_init_failed",
+                error=str(e),
+                attempt=attempt,
+                retry_in=delay,
+            )
+            attempt += 1
+            await asyncio.sleep(delay)
 
 
 @app.get("/")
@@ -279,8 +334,7 @@ async def start_task_background(request: TaskRequest):
             if result.get("success"):
                 inner = result.get("result", {})
                 full_response = inner.get("response", "")
-                _job_store.update(
-                    job_id,
+                update_kwargs: dict = dict(
                     status="done",
                     phase="complete",
                     task_type=inner.get("task_type", task_type),
@@ -289,6 +343,15 @@ async def start_task_background(request: TaskRequest):
                     _full_response=full_response,
                     screenshot_path=inner.get("screenshot_path"),
                 )
+                # Handover metadata — stored in the in-memory job cache so the
+                # Discord bot can read it via GET /task/{job_id}.
+                if result.get("handover_triggered"):
+                    update_kwargs["handover_triggered"] = True
+                    update_kwargs["new_session_id"] = result.get("session_id")
+                    update_kwargs["context_budget"] = result.get("context_budget", "bridge")
+                elif result.get("context_budget") == "warn":
+                    update_kwargs["context_budget"] = "warn"
+                _job_store.update(job_id, **update_kwargs)
             else:
                 _job_store.update(
                     job_id,
@@ -533,7 +596,24 @@ async def get_workspace():
     """Get current workspace path"""
     return {
         "workspace": _current_workspace,
-        "exists": Path(_current_workspace).exists()
+        "exists": Path(_current_workspace).exists()  # lgtm[py/path-injection]
+    }
+
+
+@app.get("/workspace/project")
+async def get_project():
+    """Return the active project name and workspace root."""
+    base = Path(WORKSPACE_PATH).resolve()
+    current = Path(_current_workspace).resolve()  # lgtm[py/path-injection]
+    try:
+        # project name is the relative part, if any
+        project = str(current.relative_to(base)) if current != base else None
+    except ValueError:
+        project = None
+    return {
+        "project": project,
+        "workspace": str(current),
+        "workspace_root": str(base),
     }
 
 
@@ -557,6 +637,49 @@ async def list_workspace_directories():
     except Exception as e:
         logger.error("workspace_list_failed", error=str(e))
         raise HTTPException(status_code=500, detail="Could not list workspace")
+
+
+@app.post("/workspace/project")
+async def set_project(request: dict):
+    """Switch the active project subdirectory within the workspace root.
+
+    Body: {"name": "<project-name>"}   — switch to WORKSPACE_PATH/<name>
+          {"name": ""}  or {"name": null} — clear back to workspace root
+    The project directory is created if it does not yet exist.
+    """
+    global _current_workspace, _orchestrator
+
+    raw_name = (request.get("name") or "").strip()
+
+    # Reject names that try to escape the workspace root.
+    if ".." in raw_name or raw_name.startswith(("/", "\\")):
+        raise HTTPException(status_code=400, detail="Invalid project name")
+
+    if raw_name:
+        target = Path(WORKSPACE_PATH) / raw_name
+    else:
+        target = Path(WORKSPACE_PATH)
+
+    if not _is_path_allowed(str(target)):
+        raise HTTPException(status_code=403, detail="Path not allowed")
+
+    target.mkdir(parents=True, exist_ok=True)  # lgtm[py/path-injection]
+    _current_workspace = str(target.resolve())  # lgtm[py/path-injection]
+    os.environ["AGENT_EFFECTIVE_WORKSPACE"] = _current_workspace
+
+    from local_coding_agent import create_agent
+    _orchestrator = create_agent(_current_workspace, "config/models.yaml")
+
+    logger.info(
+        "project_switched",
+        project=raw_name or "(root)",
+        workspace=_current_workspace,
+    )
+    return {
+        "success": True,
+        "project": raw_name or None,
+        "workspace": _current_workspace,
+    }
 
 
 @app.post("/workspace")
@@ -585,7 +708,9 @@ async def set_workspace(request: dict):
         raise HTTPException(status_code=403, detail="Cannot set workspace to system folder")
 
     _current_workspace = str(path)
-    
+    # Keep GitTool in sync with the new workspace.
+    os.environ["AGENT_EFFECTIVE_WORKSPACE"] = _current_workspace
+
     # Recreate orchestrator with new workspace
     from local_coding_agent import create_agent
     _orchestrator = create_agent(_current_workspace, "config/models.yaml")

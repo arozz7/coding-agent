@@ -9,6 +9,9 @@ from pathlib import Path
 def git_repo(tmp_path, monkeypatch):
     """Create a temporary git repository."""
     monkeypatch.setenv("WORKSPACE_PATH", str(tmp_path))
+    # Clear vars that would cause GitTool to resolve a path other than tmp_path.
+    monkeypatch.delenv("AGENT_EFFECTIVE_WORKSPACE", raising=False)
+    monkeypatch.delenv("PROJECT_DIR", raising=False)
     subprocess.run(["git", "init"], cwd=str(tmp_path), capture_output=True)
     subprocess.run(
         ["git", "config", "user.email", "test@test.com"],
@@ -34,9 +37,14 @@ class TestGitTool:
         tool = GitTool(str(git_repo))
         assert tool.repo_path == git_repo.resolve()
 
-    def test_initialization_invalid_repo(self, tmp_path):
+    def test_initialization_invalid_repo(self, tmp_path, monkeypatch):
         from agent.tools import GitTool, GitError
 
+        # Point WORKSPACE_PATH at a non-git directory; GitTool should raise GitError
+        # from _verify_repo() (not a git repo).
+        monkeypatch.setenv("WORKSPACE_PATH", str(tmp_path))
+        monkeypatch.delenv("AGENT_EFFECTIVE_WORKSPACE", raising=False)
+        monkeypatch.delenv("PROJECT_DIR", raising=False)
         with pytest.raises(GitError):
             GitTool(str(tmp_path))
 
