@@ -324,6 +324,15 @@ class AgentOrchestrator:
             "there are still errors", "still not running", "not starting",
             "can't run", "cannot run", "won't run", "fails to run",
             "fails to start", "failing to run",
+            # Execution / build phrases commonly missed by above
+            "run the build", "running the build", "try running", "run it",
+            "run with verbose", "run with", "run verbose",
+            "go ahead and run", "go run", "now run", "run now",
+            "run the application", "run the program",
+            "run npm", "npm run", "npm install", "npm start",
+            "compile the", "execute the", "execute it",
+            "build it", "build the project", "build the app",
+            "running builds", "running the app", "running the application",
         ]
         if any(kw in t for kw in _RUN_DEBUG):
             return "develop"
