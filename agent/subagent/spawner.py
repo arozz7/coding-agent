@@ -15,7 +15,7 @@ class SubagentContext:
     task: str
     created_at: datetime
     tools: List[str] = field(default_factory=list)
-    max_depth: int = 3
+    max_depth: int = 2
     current_depth: int = 0
     metadata: Dict[str, Any] = field(default_factory=dict)
 
@@ -23,7 +23,7 @@ class SubagentContext:
 class SubagentSpawner:
     def __init__(
         self,
-        max_depth: int = 3,
+        max_depth: int = 2,
         max_subagents: int = 5,
         isolation_mode: bool = True,
     ):

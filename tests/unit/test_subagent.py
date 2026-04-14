@@ -78,8 +78,8 @@ class TestSubagentSpawner:
         assert len(children) == 2
     
     def test_get_ancestors(self):
-        spawner = SubagentSpawner()
-        
+        spawner = SubagentSpawner(max_depth=3)  # explicit depth for 3-level traversal test
+
         root = spawner.spawn("root", "root task")
         child1 = spawner.spawn(root.id, "child1 task")
         child2 = spawner.spawn(child1.id, "child2 task")
@@ -225,8 +225,9 @@ class TestSubagentOrchestrator:
         assert result["success"] is True
     
     def test_get_tree(self):
-        orchestrator = SubagentOrchestrator()
-        
+        from agent.subagent.spawner import SubagentSpawner
+        orchestrator = SubagentOrchestrator(spawner=SubagentSpawner(max_depth=3))  # 3-level tree test
+
         spawner = orchestrator.spawner
         child = spawner.spawn(orchestrator.root_agent_id, "child task")
         spawner.spawn(child.id, "grandchild task")

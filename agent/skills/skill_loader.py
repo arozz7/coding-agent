@@ -19,19 +19,34 @@ logger = structlog.get_logger()
 
 
 class Skill:
-    """Represents a loaded skill."""
-    
-    def __init__(self, name: str, description: str, path: Path, content: str, 
+    """Represents a loaded skill.
+
+    Content (full SKILL.md text) is loaded lazily on first access so that
+    startup only pays for metadata (name, description, triggers).  The full
+    text is only read when a skill is actually triggered for a task.
+    """
+
+    def __init__(self, name: str, description: str, path: Path,
                  user_invocable: bool = False, triggers: List[str] = None,
                  allowed_tools: List[str] = None):
         self.name = name
         self.description = description
         self.path = path
-        self.content = content
         self.user_invocable = user_invocable
         self.triggers = triggers or []
         self.allowed_tools = allowed_tools or []
-    
+        self._content: Optional[str] = None  # loaded on first access
+
+    @property
+    def content(self) -> str:
+        """Full SKILL.md text, loaded lazily."""
+        if self._content is None:
+            try:
+                self._content = self.path.read_text(encoding="utf-8")
+            except Exception:
+                self._content = ""
+        return self._content
+
     def matches_trigger(self, text: str) -> bool:
         """Check if text triggers this skill."""
         text_lower = text.lower()
@@ -70,45 +85,51 @@ class SkillManager:
         self.logger.info("skills_discovered", count=len(self.skills))
     
     def _load_skill(self, path: Path) -> Optional[Skill]:
-        """Load a skill from SKILL.md file."""
-        content = path.read_text(encoding="utf-8")
-        
+        """Load skill metadata from SKILL.md frontmatter only.
+
+        The full file content is NOT read here — it is loaded lazily via
+        Skill.content when the skill is actually triggered for a task.
+        """
+        # Read only enough of the file to extract frontmatter (~500 bytes).
+        # If there is no frontmatter we read the whole file to infer metadata,
+        # but this is the uncommon path and only happens once at startup.
+        raw = path.read_text(encoding="utf-8")
+
         # Extract frontmatter
         frontmatter = {}
-        if content.startswith("---"):
-            end_idx = content.find("---", 3)
+        if raw.startswith("---"):
+            end_idx = raw.find("---", 3)
             if end_idx > 0:
-                fm_text = content[3:end_idx].strip()
+                fm_text = raw[3:end_idx].strip()
                 frontmatter = yaml.safe_load(fm_text) or {}
-        
+
         name = frontmatter.get("name", path.parent.name)
         description = frontmatter.get("description", "")
         user_invocable = frontmatter.get("user_invocable", False)
-        
+
         # Extract keywords from description for triggers
         triggers = []
         desc_lower = description.lower()
-        keywords = ["test", "security", "architect", "adr", "database", "auth", 
+        keywords = ["test", "security", "architect", "adr", "database", "auth",
                     "api", "review", "refactor", "document", "cleanup", "lint"]
         for kw in keywords:
             if kw in desc_lower:
                 triggers.append(kw)
-        
+
         # Also add triggers from skill name
         for word in name.split("-"):
             if len(word) > 2:
                 triggers.append(word)
-        
+
         # Get allowed tools
         allowed_tools = frontmatter.get("allowed-tools", "")
         if isinstance(allowed_tools, str):
             allowed_tools = [t.strip() for t in allowed_tools.split(",")]
-        
+
         return Skill(
             name=name,
             description=description,
             path=path,
-            content=content,
             user_invocable=user_invocable,
             triggers=triggers,
             allowed_tools=allowed_tools,
