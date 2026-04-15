@@ -121,6 +121,43 @@ This phase hardened the runtime reliability of the coding agent across four area
 
 ---
 
+### Fix localhost IPv6 resolution on Windows 11
+
+#### `.env`, `supervisor.py`, `api/discord_bot.py`
+- Changed `AGENT_API_URL` default from `http://localhost:5005` → `http://127.0.0.1:5005`.
+- On Windows 11, `localhost` resolves to `::1` (IPv6), but uvicorn binds to `0.0.0.0` (IPv4 only). The IPv6 address hit a different service returning 404, causing supervisor health-check failures and bot HTTPStatusError loops.
+
+---
+
+### Models Discovery View (DMV)
+
+#### `llm/ollama_client.py`
+- Added `list_all_models()`: calls `/api/v0/models` and returns the full list of LM Studio downloaded models with their `state` field.
+- `check_model_state()` / `health_check()` / `warmup()`: now use `/api/v0/models` state field instead of `/v1/models` (which lists all downloadable models regardless of VRAM state).
+
+#### `api/main.py`
+- `GET /models`: extended response with:
+  - `state` field per configured local model (from LM Studio `/api/v0/models`)
+  - `lm_studio_available`: list of `{id, state}` for models downloaded in LM Studio but not yet in `models.yaml`
+
+#### `api/discord_bot.py`
+- `!models`: redesigned output with two sections:
+  - **Configured Models** — each with 🟢 (loaded) / ⚪ (not-loaded) state icon for local models
+  - **Available in LM Studio (not configured)** — discovery list of downloaded-but-unconfigured models
+  - Truncated to 1900 chars to stay within Discord's 2000-char limit
+
+---
+
+### Wiki Flow Hardening
+
+#### `agent/skills/skill_executor.py`
+- `_wiki_compile` synthesis `model_router.generate()` call now passes `enable_thinking=False` — the structured output (TITLE/TAGS/CATEGORY/CONFIDENCE) is deterministic and doesn't benefit from a thinking trace; this eliminates a potential 10-30 min stall when a Qwen3 model is active.
+
+#### `agent/orchestrator.py`
+- `_run_task_loop`: added per-subtask `wiki-compile` call inside the success branch after each subtask completes. Learnings from Task 1 are now persisted to `.agent-wiki/` before Task 2 starts, enabling later subtasks to query relevant prior context. Failures are swallowed with a warning so a wiki error never stalls the task loop.
+
+---
+
 ## Root Causes Fixed (Follow-on)
 
 | Bug | Root Cause | Fix |
@@ -130,6 +167,14 @@ This phase hardened the runtime reliability of the coding agent across four area
 | Agent silently hangs after model TTL eviction | LM Studio 503 not handled | `ModelNotReadyError` + 120s retry × 3 |
 | Supervisor can't tell if restart will work | `POST /restart` returned no state | Returns `supervisor_running` bool from heartbeat |
 | Supervisor health-check times out at startup | Blocking `startup_event` delayed `/health` | Background init task; `/health` responds immediately |
+| Supervisor/bot health checks fail on Windows 11 | `localhost` resolves to `::1`, uvicorn binds IPv4 only | Changed default URL to `http://127.0.0.1:5005` |
+| `health_check` returns True for unloaded models | `/v1/models` lists all downloadable models regardless of VRAM | Use `/api/v0/models` state field; fall back to `/v1/models` for plain Ollama |
+| `!models` shows no LM Studio state or discovery | Only read `models.yaml` config | Added live state per configured local model + unconfigured downloaded models list |
+| Wiki synthesis call could stall 10-30 min on Qwen3 | Thinking mode on for structured output generation | `enable_thinking=False` passed to synthesis generate call |
+| Subtask learnings not available to later subtasks in same job | `_run_task_loop` only did wiki-query pre-task, never wiki-compile post-subtask | Per-subtask wiki-compile added inside success branch; failures swallowed |
+| Job stuck at "preparing" for 26+ minutes | Qwen3 generates `<think>` block before every response, including 1-word classifier answers, which can take 10-30 min; `asyncio.wait_for` cannot cancel httpx mid-read on Python 3.12 | (1) `_do_generate` now uses `asyncio.to_thread` + sync `httpx.Client` so `wait_for` can cancel on Python 3.12; (2) `model_router.generate` accepts `enable_thinking` override; classifier passes `enable_thinking=False` since it only needs one word — all real coding/planning calls keep thinking enabled |
+| Task stuck for 1+ hour; entire API server frozen | `httpx.AsyncClient` blocks the asyncio event loop when stuck mid-read — all FastAPI endpoints (incl. `/health`, `/jobs`) become unreachable; supervisor watchdog can't reach API to detect stale job | `asyncio.to_thread` fix moves httpx off the event loop; supervisor `_check_stale_job` now counts consecutive API-unreachable cycles and forces restart after 15 min of unreachable API |
+| Timeout retries waste 1800s (3× 600s) before failing | Generic `except Exception` in `model_router.generate` retried all errors including timeouts | Timeout errors (containing "timeout" in message) now fail fast without retry |
 
 ---
 
@@ -143,3 +188,4 @@ This phase hardened the runtime reliability of the coding agent across four area
 - [ ] `!continue` — resumes active debug session
 - [ ] Unload model in LM Studio mid-task — logs show `model_not_ready_waiting`; retries 3× before failing
 - [ ] Confirm no `UnicodeDecodeError` in logs when `npm` commands run
+- [ ] `!models` — shows configured models with 🟢/⚪ state, plus LM Studio discovery section
