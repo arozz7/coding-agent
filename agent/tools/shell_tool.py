@@ -281,6 +281,8 @@ class ShellTool:
                 cwd=str(self.workspace),
                 capture_output=True,
                 text=True,
+                encoding='utf-8',
+                errors='replace',
                 timeout=timeout,
                 env=_TOOL_ENV,
             )

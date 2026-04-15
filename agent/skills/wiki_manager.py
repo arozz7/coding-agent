@@ -210,14 +210,33 @@ class WikiManager:
         rel_path: str,
         timestamp: str,
     ) -> None:
+        """Upsert a row in index.md — update the existing row for rel_path if
+        present, append a new row otherwise.  Prevents duplicate index entries
+        when wiki-compile is called multiple times for the same entry.
+        """
         index_path = self.wiki_root / "index.md"
+        header = "# Agent Wiki Index\n\n| Path | Title | Category | Tags | Updated |\n|------|-------|----------|------|----------|\n"
         if not index_path.exists():
-            header = "# Agent Wiki Index\n\n| Path | Title | Category | Tags | Updated |\n|------|-------|----------|------|----------|\n"
             index_path.write_text(header, encoding="utf-8")
 
-        row = f"| {rel_path} | {title} | {category} | {', '.join(tags)} | {timestamp} |\n"
-        with open(index_path, "a", encoding="utf-8") as f:
-            f.write(row)
+        new_row = f"| {rel_path} | {title} | {category} | {', '.join(tags)} | {timestamp} |\n"
+
+        existing = index_path.read_text(encoding="utf-8")
+        lines = existing.splitlines(keepends=True)
+
+        # Replace existing row that references this rel_path.
+        updated = False
+        for i, line in enumerate(lines):
+            if f"| {rel_path} |" in line:
+                lines[i] = new_row
+                updated = True
+                break
+
+        if updated:
+            index_path.write_text("".join(lines), encoding="utf-8")
+        else:
+            with open(index_path, "a", encoding="utf-8") as f:
+                f.write(new_row)
 
     def _append_log(self, message: str) -> None:
         log_path = self.wiki_root / "log.md"

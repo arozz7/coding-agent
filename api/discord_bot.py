@@ -16,6 +16,7 @@ import os
 import re
 import subprocess
 import time
+from pathlib import Path
 from typing import Optional
 
 import discord
@@ -23,8 +24,12 @@ import httpx
 from discord import Intents, Message, File
 from discord.ext import commands
 
-API_URL = os.getenv("AGENT_API_URL", "http://localhost:5005")
+API_URL = os.getenv("AGENT_API_URL", "http://127.0.0.1:5005")
 POLL_INTERVAL = int(os.getenv("BOT_POLL_INTERVAL", "5"))  # seconds
+
+# State directory shared with supervisor.py (one level up from api/)
+_STATE_DIR = Path(__file__).parent.parent / ".state"
+_LAST_CHANNEL_FILE = _STATE_DIR / "last_channel"
 
 # ---------------------------------------------------------------------------
 # Reconnect / retry helpers
@@ -189,10 +194,17 @@ class AgentClient:
             r.raise_for_status()
             return r.json()
 
-    async def start_task(self, task: str, session_id: Optional[str] = None) -> dict:
+    async def start_task(
+        self,
+        task: str,
+        session_id: Optional[str] = None,
+        force_task_type: Optional[str] = None,
+    ) -> dict:
         payload: dict = {"task": task}
         if session_id:
             payload["session_id"] = session_id
+        if force_task_type:
+            payload["force_task_type"] = force_task_type
         return await self._post("/task/start", payload)
 
     async def get_job(self, job_id: str) -> dict:
@@ -221,6 +233,9 @@ class AgentClient:
 
     async def delete_session(self, session_id: str) -> dict:
         return await self._delete(f"/sessions/{session_id}")
+
+    async def restart(self) -> dict:
+        return await self._post("/restart", {}, timeout=10.0)
 
     async def wait_until_reachable(self) -> None:
         """Poll /health until the API responds. Never gives up.
@@ -262,6 +277,16 @@ class DiscordAgentBot(commands.Bot):
 
     async def on_ready(self):
         print(f"[bot] Logged in as {self.user}  |  API: {API_URL}")
+        # After a supervisor-triggered restart, notify the channel that asked for it.
+        if _LAST_CHANNEL_FILE.exists():
+            try:
+                channel_id = int(_LAST_CHANNEL_FILE.read_text().strip())
+                _LAST_CHANNEL_FILE.unlink(missing_ok=True)
+                channel = self.get_channel(channel_id)
+                if channel:
+                    await channel.send("Services restarted and back online.")
+            except Exception:
+                _LAST_CHANNEL_FILE.unlink(missing_ok=True)
 
     async def on_message(self, message: Message):
         if message.author == self.user:
@@ -303,6 +328,30 @@ _PHASE_LABELS: dict[str, str] = {
 _HEARTBEAT_INTERVAL = 60     # seconds between "still working…" edits when server is silent
 
 
+async def _safe_edit(msg: discord.Message, content: str) -> None:
+    """Edit a Discord message, swallowing transient Discord server errors.
+
+    Discord occasionally returns 503 during upstream hiccups. Dropping one
+    status-message edit is fine — the next poll cycle will update it.
+    Non-transient errors (4xx) are re-raised so real bugs surface.
+    """
+    try:
+        await msg.edit(content=content)
+    except discord.errors.DiscordServerError:
+        pass  # 5xx from Discord's infrastructure — skip, retry next cycle
+    except discord.errors.HTTPException as exc:
+        if exc.status >= 500:
+            pass  # Other 5xx — same treatment
+        else:
+            raise
+
+
+def _on_poll_done(fut: asyncio.Future) -> None:
+    """Log any exception that escaped _poll_job so it isn't silently dropped."""
+    if not fut.cancelled() and (exc := fut.exception()):
+        print(f"[bot] _poll_job unhandled exception: {type(exc).__name__}: {exc}")
+
+
 async def _poll_job(ctx: commands.Context, status_msg: discord.Message, job_id: str):
     """Edit *status_msg* until the job finishes, then post the result.
 
@@ -318,6 +367,13 @@ async def _poll_job(ctx: commands.Context, status_msg: discord.Message, job_id: 
     consecutive_failures = 0
     last_label = "Working"
 
+    # Stale-phase detection: if the phase label hasn't changed for this long,
+    # send a separate warning message.  45 min matches the supervisor watchdog.
+    _STALE_PHASE_WARN_SECS = 45 * 60
+    _stale_warned = False
+    _last_phase_change = time.monotonic()
+    _last_phase = ""
+
     # Task types whose full response should be shown inline in the channel.
     _INLINE_TYPES = {"chat", "research", "plan"}
 
@@ -332,17 +388,16 @@ async def _poll_job(ctx: commands.Context, status_msg: discord.Message, job_id: 
             job = await bot.client.get_job(job_id)
             if consecutive_failures > 0:
                 consecutive_failures = 0
-                await status_msg.edit(content=f"{last_label}… ({elapsed}s) — reconnected")
+                await _safe_edit(status_msg, f"{last_label}… ({elapsed}s) — reconnected")
         except Exception as exc:
             # _http_retry re-raises only non-retriable errors (e.g. 404).
             # Show the error but keep polling so a temporary outage recovers.
             consecutive_failures += 1
             delay = _backoff(consecutive_failures - 1)
-            await status_msg.edit(
-                content=(
-                    f"{last_label}… ({elapsed}s) — "
-                    f"connection lost, next retry in {delay:.0f}s"
-                )
+            await _safe_edit(
+                status_msg,
+                f"{last_label}… ({elapsed}s) — "
+                f"connection lost, next retry in {delay:.0f}s",
             )
             await asyncio.sleep(delay)
             continue
@@ -364,6 +419,26 @@ async def _poll_job(ctx: commands.Context, status_msg: discord.Message, job_id: 
             label = _PHASE_LABELS.get(phase, phase or "Working")
 
         last_label = label  # keep for reconnect messages
+
+        # Stale-phase watchdog: warn in the channel if the phase hasn't
+        # changed for 45 minutes.  Only warn once per job to avoid spam.
+        if phase != _last_phase:
+            _last_phase = phase
+            _last_phase_change = time.monotonic()
+            _stale_warned = False
+        elif (
+            not _stale_warned
+            and job_status == "running"
+            and (time.monotonic() - _last_phase_change) > _STALE_PHASE_WARN_SECS
+        ):
+            _stale_warned = True
+            warn_mins = int(_STALE_PHASE_WARN_SECS // 60)
+            await ctx.send(
+                f"**Warning:** job `{job_id}` has been stuck on **{label}** "
+                f"for over {warn_mins} minutes.\n"
+                f"The model may have been unloaded — the supervisor will attempt "
+                f"an automatic restart. You can also use `!restart` manually."
+            )
 
         if job_status == "done":
             task_type = job.get("task_type", "")
@@ -393,15 +468,15 @@ async def _poll_job(ctx: commands.Context, status_msg: discord.Message, job_id: 
                     full = (result_data.get("result") or "").strip()
                 except Exception as exc:
                     full = ""
-                    await status_msg.edit(content=f"Done [{task_type}] · {elapsed}s (could not fetch result: {exc})")
+                    await _safe_edit(status_msg, f"Done [{task_type}] · {elapsed}s (could not fetch result: {exc})")
                     return
 
                 if not full:
-                    await status_msg.edit(content=f"Done [{task_type}] · {elapsed}s — (empty response)")
+                    await _safe_edit(status_msg, f"Done [{task_type}] · {elapsed}s — (empty response)")
                     return
 
                 # Edit the status message to a short header, then send chunks.
-                await status_msg.edit(content=f"**Done** [{task_type}] · {elapsed}s")
+                await _safe_edit(status_msg, f"**Done** [{task_type}] · {elapsed}s")
                 chunks = _chunk(full)
                 for chunk in chunks:
                     await ctx.send(chunk)
@@ -417,7 +492,7 @@ async def _poll_job(ctx: commands.Context, status_msg: discord.Message, job_id: 
                 lines.append(
                     "\n`!result` — full response  ·  `!files` — file list  ·  `!show <path>` — view a file"
                 )
-                await status_msg.edit(content=_truncate("\n".join(lines)))
+                await _safe_edit(status_msg, _truncate("\n".join(lines)))
 
             # Send screenshot as attachment if the SDLC workflow produced one
             if screenshot_path:
@@ -426,31 +501,34 @@ async def _poll_job(ctx: commands.Context, status_msg: discord.Message, job_id: 
 
         elif job_status == "failed":
             error = (job.get("error") or "unknown error")[:400]
-            await status_msg.edit(content=f"**Task failed** after {elapsed}s:\n```\n{error}\n```")
+            await _safe_edit(status_msg, f"**Task failed** after {elapsed}s:\n```\n{error}\n```")
             return
 
         elif job_status == "cancelled":
-            await status_msg.edit(content=f"Task cancelled after {elapsed}s.")
+            await _safe_edit(status_msg, f"Task cancelled after {elapsed}s.")
             return
 
         else:
-            await status_msg.edit(content=f"{label}… ({elapsed}s elapsed)")
+            await _safe_edit(status_msg, f"{label}… ({elapsed}s elapsed)")
 
 
 # ---------------------------------------------------------------------------
 # Commands
 # ---------------------------------------------------------------------------
 
-@bot.command(name="ask")
-async def ask(ctx: commands.Context, *, task: str):
-    """Submit a task. The agent works in the background — this message updates live."""
+async def _submit_task(
+    ctx: commands.Context,
+    task: str,
+    force_task_type: Optional[str] = None,
+) -> None:
+    """Shared submit logic for !ask and !dev."""
     user_id = str(ctx.author.id)
     session_id = bot.user_sessions.get(user_id, user_id)
 
     status_msg = await ctx.send("Submitting…")
 
     try:
-        resp = await bot.client.start_task(task, session_id)
+        resp = await bot.client.start_task(task, session_id, force_task_type=force_task_type)
     except Exception as exc:
         await status_msg.edit(content=f"Could not reach agent: {exc}")
         return
@@ -465,7 +543,55 @@ async def ask(ctx: commands.Context, *, task: str):
 
     task_type = resp.get("task_type", "")
     await status_msg.edit(content=f"Got it [{task_type}] — working on it…")
-    asyncio.create_task(_poll_job(ctx, status_msg, job_id))
+    asyncio.create_task(_poll_job(ctx, status_msg, job_id)).add_done_callback(_on_poll_done)
+
+
+@bot.command(name="ask")
+async def ask(ctx: commands.Context, *, task: str):
+    """Submit a task. The agent works in the background — this message updates live."""
+    await _submit_task(ctx, task)
+
+
+@bot.command(name="dev")
+async def dev(ctx: commands.Context, *, task: str):
+    """Submit a task and force it to be treated as a develop task (bypass classifier).
+
+    Use this when the classifier keeps picking chat/research for a debugging or
+    build task — e.g. `!dev fix the TypeScript errors and get the game running`.
+    """
+    await _submit_task(ctx, task, force_task_type="develop")
+
+
+@bot.command(name="continue")
+async def continue_task(ctx: commands.Context, *, note: str = ""):
+    """Continue fixing the last task.  Use when the build still has errors after !ask/!dev.
+
+    Optionally pass extra guidance: `!continue focus on the webpack config errors`.
+    The session context carries forward so the agent knows what was already tried.
+    """
+    user_id = str(ctx.author.id)
+    last_job_id = bot.user_jobs.get(user_id)
+    if not last_job_id:
+        await ctx.send("No previous job found. Use `!ask` or `!dev` to start one.")
+        return
+
+    # Fetch the last job to pull the original task text
+    try:
+        last_job = await bot.client.get_job(last_job_id)
+    except Exception as exc:
+        await ctx.send(f"Could not fetch last job: {exc}")
+        return
+
+    original_task = last_job.get("task", "the previous task")
+    continuation = (
+        f"Continue debugging from where we left off. "
+        f"The original task was: {original_task}. "
+        f"The build still has errors. Keep fixing until it compiles and runs cleanly."
+    )
+    if note:
+        continuation += f" Additional guidance: {note}"
+
+    await _submit_task(ctx, continuation, force_task_type="develop")
 
 
 @bot.command(name="status")
@@ -861,7 +987,7 @@ async def git_cmd(ctx: commands.Context, *, args: str):
 
 @bot.command(name="models")
 async def list_models(ctx: commands.Context):
-    """List all configured models and show which one is active."""
+    """List configured models with LM Studio state, plus all downloaded-but-unconfigured models."""
     try:
         data = await bot.client._get("/models")
     except Exception as exc:
@@ -869,15 +995,33 @@ async def list_models(ctx: commands.Context):
         return
 
     active = data.get("active_model") or "(default)"
-    lines = [f"**Models** · active: `{active}`\n"]
+    lines = [f"**Configured Models** · active: `{active}`\n"]
+
     for m in data.get("models", []):
         marker = "**[active]**" if m.get("is_active") else "       "
         name = m["name"]
         mtype = m.get("type", "?")
         ctx_k = m.get("context_window", 0) // 1000
-        lines.append(f"{marker} `{name}` — {mtype} · {ctx_k}k ctx")
+        state = m.get("state")
+        state_icon = " 🟢" if state == "loaded" else (" ⚪" if state == "not-loaded" else "")
+        lines.append(f"{marker} `{name}` — {mtype} · {ctx_k}k ctx{state_icon}")
+
     lines.append("\nUse `!model <name>` to switch · `!model reset` to restore default")
-    await ctx.send("\n".join(lines))
+
+    lm_available = data.get("lm_studio_available", [])
+    if lm_available:
+        lines.append("\n**Available in LM Studio (not configured)**")
+        for m in lm_available:
+            mid = m.get("id", "?")
+            state = m.get("state", "")
+            state_icon = " 🟢" if state == "loaded" else (" ⚪" if state == "not-loaded" else "")
+            lines.append(f"  `{mid}`{state_icon}")
+
+    # Discord message limit is 2000 chars; truncate if needed.
+    message = "\n".join(lines)
+    if len(message) > 1900:
+        message = message[:1900] + "\n…(truncated)"
+    await ctx.send(message)
 
 
 @bot.command(name="model")
@@ -1006,6 +1150,34 @@ async def skills_cmd(ctx: commands.Context, action: str = "list"):
     await ctx.send("\n".join(lines))
 
 
+@bot.command(name="restart", aliases=["reboot"])
+async def restart_services(ctx: commands.Context):
+    """Restart both the API and bot via the supervisor (!reboot also works)."""
+    # Persist the channel ID so the bot can announce when it's back online.
+    try:
+        _STATE_DIR.mkdir(parents=True, exist_ok=True)
+        _LAST_CHANNEL_FILE.write_text(str(ctx.channel.id))
+    except Exception as exc:
+        print(f"[bot] Could not write last_channel: {exc}")
+
+    try:
+        resp = await bot.client.restart()
+    except Exception:
+        resp = {}  # API may be killed before response completes — treat as unknown
+
+    supervisor_ok = resp.get("supervisor_running", None)
+    if supervisor_ok is False:
+        # Supervisor isn't running — the flag was written but nothing will act on it.
+        await ctx.send(
+            "Could not restart: **supervisor.py is not running**.\n"
+            "Start it manually: `python supervisor.py`\n"
+            "Then use `!restart` again."
+        )
+        return
+
+    await ctx.send("Restarting services — back in ~15 seconds...")
+
+
 @bot.command(name="helpme")
 async def helpme(ctx: commands.Context):
     """Show available commands."""
@@ -1013,6 +1185,8 @@ async def helpme(ctx: commands.Context):
         "**Agent Commands**\n\n"
         "**Core workflow:**\n"
         "`!ask <task>` — Submit a task. Agent works in background; this message updates live.\n"
+        "`!dev <task>` — Same as !ask but forces develop mode (use for debug/build/fix tasks).\n"
+        "`!continue [note]` — Continue fixing the last job when errors remain.\n"
         "`!status` — Check your current job's status and phase\n"
         "`!cancel` — Cancel your running job\n\n"
         "**Viewing results:**\n"
@@ -1042,6 +1216,7 @@ async def helpme(ctx: commands.Context):
         "`!skills fetch` — Download latest skills from remote registry\n\n"
         "**Utilities:**\n"
         "`!git <status|log|diff|branch>` — Safe read-only git commands\n"
+        "`!restart` (or `!reboot`) — Restart both the API and bot via the supervisor\n"
         "`!helpme` — This help text\n"
     )
     await ctx.send(help_text)

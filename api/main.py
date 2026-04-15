@@ -1,13 +1,16 @@
-from fastapi import FastAPI, HTTPException, BackgroundTasks, Response
+from fastapi import FastAPI, HTTPException, BackgroundTasks, Response, Request
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from typing import Optional, List, Dict
 from prometheus_client import generate_latest, CONTENT_TYPE_LATEST
 import uuid
 import re
+import time as _time
 from datetime import datetime
 import asyncio
 import structlog
+
+_SERVER_START_TIME = _time.time()
 
 from llm import ModelRouter
 from agent.orchestrator import AgentOrchestrator
@@ -117,6 +120,7 @@ class TaskRequest(BaseModel):
     task: str
     session_id: Optional[str] = None
     include_history: bool = True
+    force_task_type: Optional[str] = None  # bypass classifier when set
 
 
 class TaskResponse(BaseModel):
@@ -209,25 +213,21 @@ def _startup_backoff(attempt: int) -> float:
     return float(_STARTUP_BACKOFF[min(attempt, len(_STARTUP_BACKOFF) - 1)])
 
 
-@app.on_event("startup")
-async def startup_event():
+async def _init_agent_background() -> None:
+    """Initialise the orchestrator in the background so uvicorn can serve
+    requests (especially GET /health) immediately.
+
+    /task endpoints return 503 until the orchestrator is ready.  Retries
+    indefinitely with the same backoff curve used before this refactor.
+
+    After the orchestrator is ready, probes the primary local model so that
+    LM Studio loads it into VRAM now rather than on the first user request.
+    A warning is logged (visible in the supervisor console) if the model is
+    not loaded, giving the user time to open LM Studio and load it.
+    """
     global _orchestrator
     from local_coding_agent import create_agent
 
-    logger.info(
-        "starting_api",
-        component="api",
-        workspace=_current_workspace,
-        project_dir=PROJECT_DIR or "(none)",
-    )
-
-    # Restore persisted jobs; mark stale running jobs as failed
-    _job_store.load()
-
-    # Retry agent initialisation indefinitely — the LLM backend (LM Studio /
-    # Ollama) may not be up yet.  Backoff slows to 5-minute probes so we don't
-    # spam the log during a long outage.  The API stays up and returns 503 on
-    # /task endpoints until the agent is ready.
     attempt = 0
     while _orchestrator is None:
         try:
@@ -244,6 +244,38 @@ async def startup_event():
             attempt += 1
             await asyncio.sleep(delay)
 
+    # Probe the primary local model.  This is intentionally fire-and-forget:
+    # a failed probe does not block startup — the ModelNotReadyError retry
+    # loop in model_router handles the case where the model loads later.
+    primary = _orchestrator.model_router.get_model("coding")
+    if primary and primary.type == "local":
+        logger.info("model_probe_start", model=primary.name)
+        ok = await _orchestrator.model_router.ollama.warmup(primary.name)
+        if not ok:
+            logger.warning(
+                "model_not_ready_at_startup",
+                model=primary.name,
+                action="Open LM Studio and load the model — tasks will block until it is ready.",
+            )
+
+
+@app.on_event("startup")
+async def startup_event():
+    logger.info(
+        "starting_api",
+        component="api",
+        workspace=_current_workspace,
+        project_dir=PROJECT_DIR or "(none)",
+    )
+
+    # Restore persisted jobs; mark stale running jobs as failed.
+    _job_store.load()
+
+    # Kick off agent init as a background task so uvicorn starts accepting
+    # requests immediately.  GET /health returns 200 straight away; POST /task
+    # returns 503 until _orchestrator is set by the background task.
+    asyncio.create_task(_init_agent_background())
+
 
 @app.get("/")
 async def root():
@@ -256,9 +288,18 @@ async def root():
 
 @app.get("/health")
 async def health_check():
+    active_jobs = 0
+    try:
+        rows = _job_store.list_jobs(limit=20)
+        active_jobs = sum(1 for j in rows if j.get("status") == "running")
+    except Exception:
+        pass
     return {
         "status": "healthy",
         "agent_ready": _orchestrator is not None,
+        "active_jobs": active_jobs,
+        "uptime_seconds": int(_time.time() - _SERVER_START_TIME),
+        "timestamp": _time.time(),
     }
 
 
@@ -296,9 +337,13 @@ async def start_task_background(request: TaskRequest):
     job_id = f"job_{uuid.uuid4().hex[:12]}"
     session_id = request.session_id or f"session_{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}"
 
-    # Use keyword classifier for instant response (0 ms) — the LLM classifier
-    # runs later inside run_task() in parallel with context building.
-    task_type = _orchestrator._detect_task_type_keyword(request.task)
+    # Use force_task_type when provided; otherwise keyword-classify for instant
+    # response (0 ms) — the LLM classifier runs later inside run_task() in
+    # parallel with context building.
+    if request.force_task_type:
+        task_type = request.force_task_type
+    else:
+        task_type = _orchestrator._detect_task_type_keyword(request.task)
     _phase_labels = {
         "develop": "developing",
         "review": "reviewing",
@@ -330,6 +375,7 @@ async def start_task_background(request: TaskRequest):
                 include_history=request.include_history,
                 on_phase=_on_phase,
                 job_id=job_id,
+                force_task_type=request.force_task_type,
             )
             if result.get("success"):
                 inner = result.get("result", {})
@@ -526,19 +572,42 @@ async def list_models():
 
     router = _orchestrator.model_router
     active = router.get_active_model_name()
+
+    # Fetch live LM Studio model list once; fall back gracefully to empty.
+    lm_all: list[dict] = await router.ollama.list_all_models()
+    lm_state_by_id: dict[str, str] = {
+        m.get("id", ""): m.get("state", "unknown")
+        for m in lm_all
+    }
+
+    # Build configured-model entries with live state for local models.
+    configured_names: set[str] = set()
+    configured_entries = []
+    for c in router.configs:
+        configured_names.add(c.name)
+        entry: dict = {
+            "name": c.name,
+            "type": c.type,
+            "endpoint": c.endpoint,
+            "coding_optimized": c.is_coding_optimized,
+            "context_window": c.context_window,
+            "is_active": c.name == active,
+        }
+        if c.type == "local":
+            entry["state"] = lm_state_by_id.get(c.name, "unknown")
+        configured_entries.append(entry)
+
+    # LM Studio models that are downloaded but not yet in models.yaml.
+    lm_available = [
+        {"id": m.get("id", ""), "state": m.get("state", "unknown")}
+        for m in lm_all
+        if m.get("id", "") not in configured_names
+    ]
+
     return {
         "active_model": active,
-        "models": [
-            {
-                "name": c.name,
-                "type": c.type,
-                "endpoint": c.endpoint,
-                "coding_optimized": c.is_coding_optimized,
-                "context_window": c.context_window,
-                "is_active": c.name == active,
-            }
-            for c in router.configs
-        ],
+        "models": configured_entries,
+        "lm_studio_available": lm_available,
     }
 
 
@@ -990,6 +1059,58 @@ async def get_llm_health():
         "resilience": diagnostics,
         "rate_limiter": rate_status,
         "cost": cost_summary,
+    }
+
+
+@app.post("/restart", status_code=202)
+async def request_restart(req: Request):
+    """Signal the supervisor to restart both services.
+
+    Writes .state/restart.flag at the project root; the supervisor polls for
+    it and performs an ordered shutdown → restart of the API and bot.
+
+    Only accepted from localhost — remote callers receive 403.
+    """
+    client_host = req.client.host if req.client else ""
+    if client_host not in ("127.0.0.1", "::1", "localhost"):
+        raise HTTPException(
+            status_code=403,
+            detail="Restart is only allowed from localhost",
+        )
+
+    state_dir = Path(__file__).parent.parent / ".state"
+    state_dir.mkdir(parents=True, exist_ok=True)
+
+    flag = state_dir / "restart.flag"
+    flag.touch()
+
+    # Check if the supervisor is alive by reading its heartbeat file.
+    # The supervisor writes a Unix timestamp every 5 seconds; if the file is
+    # missing or older than 30 seconds the supervisor is likely not running.
+    import time as _time
+    heartbeat_file = state_dir / "supervisor.heartbeat"
+    supervisor_running = False
+    try:
+        age = _time.time() - float(heartbeat_file.read_text().strip())
+        supervisor_running = age < 30
+    except Exception:
+        pass
+
+    logger.info(
+        "restart_requested",
+        client=client_host,
+        supervisor_running=supervisor_running,
+    )
+    return {
+        "status": "restarting" if supervisor_running else "flag_written",
+        "supervisor_running": supervisor_running,
+        "message": (
+            "Restart flag written. Supervisor will restart services shortly."
+            if supervisor_running
+            else
+            "Restart flag written, but supervisor.py does not appear to be running. "
+            "Start it with: python supervisor.py"
+        ),
     }
 
 
