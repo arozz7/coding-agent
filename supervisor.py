@@ -44,7 +44,7 @@ RESTART_FLAG = STATE_DIR / "restart.flag"
 API_URL = os.getenv("AGENT_API_URL", "http://localhost:5005")
 _HEALTH_URL = f"{API_URL}/health"
 RESTART_DELAY = int(os.getenv("RESTART_DELAY_SECS", "3"))
-API_STARTUP_TIMEOUT = int(os.getenv("API_STARTUP_TIMEOUT", "60"))
+API_STARTUP_TIMEOUT = int(os.getenv("API_STARTUP_TIMEOUT", "120"))
 _POLL_INTERVAL = 2  # seconds between restart-flag / crash checks
 
 # Separate Python interpreter for the bot — useful when the bot's dependencies
@@ -162,7 +162,10 @@ def _wait_for_health(timeout: int = API_STARTUP_TIMEOUT) -> bool:
         time.sleep(2)
         attempt += 1
 
-    print(f"[supervisor] WARNING: API not healthy after {timeout}s — continuing anyway")
+    print(
+        f"[supervisor] WARNING: API did not return 200 /health after {timeout}s "
+        "— continuing anyway (bot will retry indefinitely)"
+    )
     return False
 
 

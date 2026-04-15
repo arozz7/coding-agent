@@ -210,25 +210,16 @@ def _startup_backoff(attempt: int) -> float:
     return float(_STARTUP_BACKOFF[min(attempt, len(_STARTUP_BACKOFF) - 1)])
 
 
-@app.on_event("startup")
-async def startup_event():
+async def _init_agent_background() -> None:
+    """Initialise the orchestrator in the background so uvicorn can serve
+    requests (especially GET /health) immediately.
+
+    /task endpoints return 503 until the orchestrator is ready.  Retries
+    indefinitely with the same backoff curve used before this refactor.
+    """
     global _orchestrator
     from local_coding_agent import create_agent
 
-    logger.info(
-        "starting_api",
-        component="api",
-        workspace=_current_workspace,
-        project_dir=PROJECT_DIR or "(none)",
-    )
-
-    # Restore persisted jobs; mark stale running jobs as failed
-    _job_store.load()
-
-    # Retry agent initialisation indefinitely — the LLM backend (LM Studio /
-    # Ollama) may not be up yet.  Backoff slows to 5-minute probes so we don't
-    # spam the log during a long outage.  The API stays up and returns 503 on
-    # /task endpoints until the agent is ready.
     attempt = 0
     while _orchestrator is None:
         try:
@@ -244,6 +235,24 @@ async def startup_event():
             )
             attempt += 1
             await asyncio.sleep(delay)
+
+
+@app.on_event("startup")
+async def startup_event():
+    logger.info(
+        "starting_api",
+        component="api",
+        workspace=_current_workspace,
+        project_dir=PROJECT_DIR or "(none)",
+    )
+
+    # Restore persisted jobs; mark stale running jobs as failed.
+    _job_store.load()
+
+    # Kick off agent init as a background task so uvicorn starts accepting
+    # requests immediately.  GET /health returns 200 straight away; POST /task
+    # returns 503 until _orchestrator is set by the background task.
+    asyncio.create_task(_init_agent_background())
 
 
 @app.get("/")
