@@ -65,9 +65,81 @@ This phase hardened the runtime reliability of the coding agent across four area
 
 ---
 
+## Follow-on Hardening Commits
+
+### `3e24908` — Fix classifier misfires and long debug session stability
+
+#### `agent/orchestrator.py`
+- Added `_DEFINITIVE_DEVELOP` regex for pre-LLM classification: if the task text contains keywords like `fix`, `implement`, `refactor`, `build`, `write`, etc., it is classified as `develop` without an LLM call.
+- Added `force_task_type` field on `TaskRequest` — callers can override classification entirely.
+- `MAX_FIX_ITERATIONS` raised from 5 → 10 to survive longer debug sessions.
+- Error text passed to the fix prompt capped at 4 000 chars (avoids bloated context).
+- Fix-attempt prose capped at 3 code blocks per iteration.
+
+#### `api/discord_bot.py`
+- Added `!dev <task>` command — forces `force_task_type=develop`, bypassing classifier.
+- Added `!continue [note]` command — resumes the current debugging session with an optional note.
+
+---
+
+### `b0af718` — Fix UnicodeDecodeError in ShellTool on Windows
+
+#### `agent/tools/shell_tool.py`
+- `ShellTool.run()` now passes `encoding='utf-8', errors='replace'` to `subprocess.run()`.
+- Fixes `UnicodeDecodeError` raised when `npm` or other Windows tools emit non-UTF-8 bytes (e.g., `cp1252` characters in error output).
+
+---
+
+### `af96f81` — Handle model TTL eviction and unreliable restarts gracefully
+
+#### `llm/ollama_client.py`
+- Added `ModelNotReadyError` exception raised when LM Studio returns HTTP 503 or a "model not loaded" response.
+
+#### `llm/model_router.py`
+- Wraps `ollama_client.generate()` in a retry loop: 120-second wait × 3 attempts on `ModelNotReadyError` before propagating.
+- `asyncio.wait_for` hard wall-clock timeout wraps the entire generate call.
+
+#### `supervisor.py`
+- Added heartbeat writer: writes `.state/supervisor.heartbeat` timestamp every 30 seconds.
+- Added stale-job watchdog: scans active jobs every 5 minutes; alerts Discord if any job has been in the same phase for > 45 minutes.
+
+#### `api/main.py`
+- `POST /restart` now returns a `supervisor_running` boolean in the response body (derived from heartbeat file recency).
+
+#### `api/discord_bot.py`
+- `!restart` warns the user if `supervisor_running` is `false` ("supervisor.py is not running — restart not possible") instead of going silent.
+- `_poll_job` emits a stale-phase alert in Discord when a job exceeds 45 minutes in the same phase.
+
+---
+
+### `ef7ed5e` — Fix API startup blocking /health and causing supervisor timeout
+
+#### `api/main.py`
+- `startup_event` now calls `asyncio.create_task(_init_agent_background())` immediately on startup.
+- `/health` endpoint is reachable during agent initialization — previously the blocking init caused the supervisor's 120-second health-check timeout to fire before the server was ready.
+- `API_STARTUP_TIMEOUT` raised from 60 → 120 seconds in `supervisor.py`.
+
+---
+
+## Root Causes Fixed (Follow-on)
+
+| Bug | Root Cause | Fix |
+|-----|-----------|-----|
+| Classifier misclassifies obvious dev tasks as chat | LLM called for clearly-develop prompts | Pre-LLM regex check `_DEFINITIVE_DEVELOP` |
+| UnicodeDecodeError on npm output | `subprocess` defaults to system codepage on Windows | `encoding='utf-8', errors='replace'` |
+| Agent silently hangs after model TTL eviction | LM Studio 503 not handled | `ModelNotReadyError` + 120s retry × 3 |
+| Supervisor can't tell if restart will work | `POST /restart` returned no state | Returns `supervisor_running` bool from heartbeat |
+| Supervisor health-check times out at startup | Blocking `startup_event` delayed `/health` | Background init task; `/health` responds immediately |
+
+---
+
 ## Testing Checklist
 
 - [ ] `python supervisor.py` — API starts, bot connects
-- [ ] `!restart` from Discord — "back online" message appears in same channel
+- [ ] `!restart` from Discord — "back online" message appears in same channel; warns if supervisor not running
 - [ ] Submit a develop task — phase transitions `preparing → developing` within ~15 seconds (classifier no longer hangs)
-- [ ] Submit a task with build errors — agent runs up to 5 fix iterations, each followed by explicit re-run
+- [ ] Submit a task with build errors — agent runs up to 10 fix iterations, each followed by explicit re-run
+- [ ] `!dev <task>` — forces develop path, skips classifier
+- [ ] `!continue` — resumes active debug session
+- [ ] Unload model in LM Studio mid-task — logs show `model_not_ready_waiting`; retries 3× before failing
+- [ ] Confirm no `UnicodeDecodeError` in logs when `npm` commands run
