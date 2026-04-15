@@ -146,7 +146,17 @@
       "Bash(du -sh R:/carved/carving-80gb/*.aac)",
       "Bash(sed -n '176,215p' config/signatures.toml)",
       "Bash(sed -n '540,570p' config/signatures.toml)",
-      "Bash(sed -n '1409,1445p' config/signatures.toml)"
+      "Bash(sed -n '1409,1445p' config/signatures.toml)",
+      "Bash(cat skills/*.md)",
+      "Bash(cat skills/wiki-query/SKILL.md)",
+      "Bash(cat skills/wiki-compile/SKILL.md)",
+      "Bash(cat skills/wiki-lint/SKILL.md)",
+      "Bash(sed -n '13,22p' agent/tools/git_tool.py)",
+      "Bash(sed -n '355,365p' api/main.py)",
+      "Bash(sed -n '637,656p' api/main.py)",
+      "Bash(cp -r J:/Projects/coding-agent/workspace/.agent-wiki/bugs J:/Projects/coding-agent/workspace/Shadows-of-Eldoria/.agent-wiki/)",
+      "Bash(cp -r J:/Projects/coding-agent/workspace/.agent-wiki/decisions J:/Projects/coding-agent/workspace/Shadows-of-Eldoria/.agent-wiki/)",
+      "Bash(cp J:/Projects/coding-agent/workspace/.agent-wiki/tech-patterns/*.md J:/Projects/coding-agent/workspace/Shadows-of-Eldoria/.agent-wiki/tech-patterns/)"
     ]
   }
 }

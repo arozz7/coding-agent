@@ -238,16 +238,39 @@ class ShellTool:
         self.logger.info("shell_run", original=command, translated=cmd, cwd=str(self.workspace))
 
         try:
-            if IS_WINDOWS and _is_windows_builtin(cmd):
-                # Built-ins must use shell=True; already validated above.
-                args: str | list = cmd
-                use_shell = True
+            if IS_WINDOWS:
+                if _is_windows_builtin(cmd):
+                    # Built-ins must use shell=True; already validated above.
+                    args: str | list = cmd
+                    use_shell = True
+                else:
+                    # External executables: tokenise first, then check if the
+                    # resolved binary is a .cmd/.bat script.  Windows CreateProcess
+                    # does NOT search PATHEXT when shell=False, so .cmd files
+                    # (e.g. npm.CMD, npx.CMD) silently fail with WinError 2.
+                    # Detect this case and fall back to shell=True (cmd /c).
+                    try:
+                        parsed = shlex.split(cmd, posix=False)
+                    except ValueError:
+                        self.logger.warning("shlex_parse_failed", cmd=cmd)
+                        return {"success": False, "error": f"Could not parse command: {cmd!r}"}
+
+                    first_tok = parsed[0] if parsed else ""
+                    resolved = shutil.which(first_tok, path=_TOOL_ENV["PATH"])
+                    if resolved and resolved.lower().endswith((".cmd", ".bat")):
+                        # Pass full command string to cmd.exe so it handles
+                        # argument quoting; shell=True is safe here because the
+                        # command has already passed _validate_command().
+                        args = cmd
+                        use_shell = True
+                    else:
+                        args = parsed
+                        use_shell = False
             else:
-                # External executables: tokenise and avoid shell=True.
+                # Unix: always tokenise; never need shell=True.
                 try:
-                    args = shlex.split(cmd, posix=not IS_WINDOWS)
+                    args = shlex.split(cmd)
                 except ValueError:
-                    # shlex failed (e.g. unmatched quotes) — fallback with shell blocked
                     self.logger.warning("shlex_parse_failed", cmd=cmd)
                     return {"success": False, "error": f"Could not parse command: {cmd!r}"}
                 use_shell = False
@@ -258,6 +281,8 @@ class ShellTool:
                 cwd=str(self.workspace),
                 capture_output=True,
                 text=True,
+                encoding='utf-8',
+                errors='replace',
                 timeout=timeout,
                 env=_TOOL_ENV,
             )

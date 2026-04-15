@@ -17,7 +17,17 @@ _INLINE_CMD_RE = re.compile(
     re.MULTILINE | re.IGNORECASE,
 )
 
-MAX_FIX_ITERATIONS = 3
+MAX_FIX_ITERATIONS = 10
+
+# Maximum characters of error output sent to the LLM per iteration.
+# TypeScript / webpack errors repeat the same stack endlessly — cap them
+# so we don't blow up the context window on iteration 3+.
+_MAX_ERROR_CHARS = 4000
+
+# Maximum number of fix-attempt prose blocks accumulated into the response
+# string.  Older blocks are replaced with a placeholder to keep the string
+# from growing unboundedly across 10 iterations.
+_MAX_RESPONSE_HISTORY = 3
 
 # Screenshot is triggered only when the task explicitly requests a browser capture.
 _SCREENSHOT_RE = re.compile(
@@ -280,41 +290,122 @@ Summary: <one sentence>
 
         # Fix-and-rerun loop: if any commands failed, ask the LLM to fix the
         # code and re-run, up to MAX_FIX_ITERATIONS times.
+        #
+        # The harness owns verification — we extract the original failing command
+        # and re-run it explicitly after each fix, regardless of what shell blocks
+        # the LLM includes in its fix response. This prevents the loop from
+        # exiting early because the LLM forgot to re-emit the build command.
         if failed_outputs and tool_executor:
+            # Extract the verify command from the first failed entry ("$ <cmd>\n...")
+            verify_cmd: str | None = None
+            first_fail = failed_outputs[0]
+            first_line = first_fail.splitlines()[0] if first_fail else ""
+            if first_line.startswith("$ "):
+                verify_cmd = first_line[2:].strip()
+
+            files_fixed_history: list[str] = []
+            # Track how many fix-attempt blocks have been appended to response.
+            fix_attempt_blocks: int = 0
+
             for _attempt in range(MAX_FIX_ITERATIONS):
-                error_summary = "\n\n".join(failed_outputs)
+                # Trim error text: TypeScript / webpack errors can be thousands of
+                # repeated lines.  Keep the tail (most recent errors) not the head.
+                raw_errors = "\n\n".join(failed_outputs)
+                if len(raw_errors) > _MAX_ERROR_CHARS:
+                    raw_errors = "…(truncated)…\n" + raw_errors[-_MAX_ERROR_CHARS:]
+
+                history_note = (
+                    f"\nFiles already modified in prior fix attempts: {', '.join(files_fixed_history)}\n"
+                    if files_fixed_history
+                    else ""
+                )
                 fix_prompt = (
                     f"{self.get_system_prompt()}\n\n"
                     f"Original task: {task}\n\n"
-                    f"The following shell commands failed. "
-                    f"Fix the source files and re-run:\n\n"
-                    f"```\n{error_summary[:3000]}\n```\n\n"
-                    f"Write any fixed files using FILE: blocks, then re-run the commands."
+                    f"The following commands are still failing (attempt {_attempt + 1}/{MAX_FIX_ITERATIONS}).\n"
+                    f"{history_note}"
+                    f"Fix the source files:\n\n"
+                    f"```\n{raw_errors}\n```\n\n"
+                    f"Write ONLY FILE: blocks to fix the errors. "
+                    f"Do NOT include shell blocks — the system will re-run the build automatically after your fixes.\n"
+                    f"Fix ALL errors shown above, not just the first one."
                 )
                 model = model_router.get_model("coding")
                 fix_response = await model_router.generate(fix_prompt, model)
 
                 # Write any fixed files
+                iteration_files: list[str] = []
                 for file_path, content in self._extract_file_writes(fix_response):
                     try:
                         await tool_executor.execute("file_write", {"path": file_path, "content": content})
                         verify = await tool_executor.execute("file_read", {"path": file_path})
-                        if not verify.startswith("Error") and file_path not in files_created:
-                            files_created.append(file_path)
-                        elif verify.startswith("Error"):
+                        if not verify.startswith("Error"):
+                            if file_path not in files_created:
+                                files_created.append(file_path)
+                            iteration_files.append(file_path)
+                        else:
                             self.logger.warning("fix_file_write_not_verified", path=file_path)
                     except Exception as e:
                         self.logger.error("fix_file_write_failed", path=file_path, error=str(e))
 
-                # Re-run commands from the fix response
-                new_outputs, new_failures = await self._run_shell_blocks(fix_response, tool_executor)
-                shell_outputs.extend(new_outputs)
-                response += f"\n\n**Fix attempt {_attempt + 1}:**\n" + fix_response
+                files_fixed_history.extend(f for f in iteration_files if f not in files_fixed_history)
 
-                if not new_failures:
-                    failed_outputs = []
-                    break
-                failed_outputs = new_failures
+                # Cap accumulated fix-attempt prose to avoid unbounded growth.
+                # Once we hit the limit, replace the oldest block with a summary.
+                if fix_attempt_blocks < _MAX_RESPONSE_HISTORY:
+                    response += f"\n\n**Fix attempt {_attempt + 1}:**\n" + fix_response
+                    fix_attempt_blocks += 1
+                else:
+                    # Drop the oldest block by rewriting from the N-th marker.
+                    marker = "\n\n**Fix attempt "
+                    # Find the first fix-attempt marker and remove up to the second.
+                    first = response.find(marker)
+                    second = response.find(marker, first + 1) if first != -1 else -1
+                    if second != -1:
+                        response = (
+                            response[:first]
+                            + f"\n\n*(earlier fix attempts omitted)*"
+                            + response[second:]
+                        )
+                    response += f"\n\n**Fix attempt {_attempt + 1}:**\n" + fix_response
+
+                # Always re-run the original failing command to verify — do not
+                # rely on the LLM including a shell block in its fix response.
+                if verify_cmd and tool_executor:
+                    try:
+                        verify_out = await tool_executor.execute("shell", {"command": verify_cmd})
+                        verify_entry = f"$ {verify_cmd}\n{verify_out}"
+                        shell_outputs.append(verify_entry)
+                        self.logger.info("fix_verify_run", attempt=_attempt + 1, cmd=verify_cmd)
+
+                        is_failure = (
+                            "returncode: 1" in verify_out
+                            or "exit code: 1" in verify_out
+                            or "Command failed" in verify_out
+                            or "FAILED" in verify_out
+                            or (
+                                "error" in verify_out.lower()[:300]
+                                and "errors: 0" not in verify_out.lower()
+                                and "0 errors" not in verify_out.lower()
+                            )
+                        )
+                        if is_failure:
+                            failed_outputs = [verify_entry]
+                        else:
+                            failed_outputs = []
+                            break
+                    except Exception as e:
+                        self.logger.error("fix_verify_failed", error=str(e))
+                        break
+                else:
+                    # No verify command available — fall back to running any
+                    # shell blocks the LLM included (legacy path).
+                    new_outputs, new_failures = await self._run_shell_blocks(fix_response, tool_executor)
+                    shell_outputs.extend(new_outputs)
+                    if not new_failures:
+                        failed_outputs = []
+                        break
+                    failed_outputs = new_failures
 
         if shell_outputs:
             combined = "\n\n".join(shell_outputs)

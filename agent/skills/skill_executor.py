@@ -177,7 +177,7 @@ Be concise. The entry should be useful for future tasks, not a task log."""
             config = model_router.get_model("coding")
             if not config:
                 raise ValueError("No coding model")
-            synthesis = await model_router.generate(synthesis_prompt, config)
+            synthesis = await model_router.generate(synthesis_prompt, config, enable_thinking=False)
 
             # Parse structured output
             lines = synthesis.strip().splitlines()

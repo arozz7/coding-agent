@@ -11,7 +11,7 @@ valid_types:
   - research  # Read-only investigation of the codebase or web
   - chat      # General questions, explanations, conversation
 
-timeout_seconds: 3
+timeout_seconds: 10
 
 prompt: |
   Classify the following task into exactly one of these task types:
@@ -19,12 +19,21 @@ prompt: |
     plan      - User explicitly wants a plan, blueprint, or outline FIRST before any code is written
                 (phrases: "plan first", "solid plan", "show me a plan", "want to plan", "planning phase",
                 "let's plan", "before we build", "roadmap", "outline the approach")
-    develop   - Write, create, fix, update, implement, refactor, or GENERATE ANY FILES — this
-                includes writing/flushing out/fleshing out/completing/expanding narrative documents,
-                markdown files, story content, config files, design docs, or any other file content.
-                Phrases like "flush out", "flesh out", "fill in", "complete the docs", "write the
-                narrative", "continue writing", "draft the", "expand the", "add content to" all
-                indicate a develop task because they require creating or modifying files.
+    develop   - Write, create, fix, update, implement, refactor, or GENERATE ANY FILES; OR
+                run, execute, build, compile, launch, or debug existing code/application.
+                This covers: writing/flushing out/fleshing out/completing/expanding narrative
+                documents, markdown files, story content, config files, design docs, or any
+                other file content — AND executing commands like "npm run build", running the
+                app, debugging errors, launching the server, compiling the project, etc.
+                Phrases like "flush out", "flesh out", "fill in", "complete the docs", "write
+                the narrative", "continue writing", "draft the", "expand the", "add content to",
+                "run the build", "try running", "go ahead and run", "run it", "run with verbose",
+                "run the app", "run the game", "run the server", "run the project", "build it",
+                "compile the", "launch the", "debug the", "execute the", "npm run", "start the"
+                all indicate a develop task.
+                IMPORTANT: Even if the message is phrased conversationally ("yes try running…",
+                "go ahead and run…", "ok now run…") it is still a develop task if it involves
+                executing, building, running, or debugging code.
     review    - Review code, perform a security audit, or critique existing code
     test      - Write or run tests (unit tests, pytest, test suites)
     architect - High-level system design, create ADRs, design patterns
