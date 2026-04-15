@@ -183,7 +183,92 @@ class OllamaClient:
                         except json.JSONDecodeError:
                             continue
 
+    async def check_model_state(self, model: str) -> Optional[str]:
+        """Return the LM Studio model state string ("loaded", "not-loaded", etc.).
+
+        Uses the /api/v0/models endpoint which includes a ``state`` field.
+        Returns None when the endpoint is unavailable (plain Ollama or older
+        LM Studio that doesn't expose /api/v0/models).
+        """
+        try:
+            async with httpx.AsyncClient(timeout=5.0) as client:
+                r = await client.get(f"{self.base_url}/api/v0/models")
+                if r.status_code != 200:
+                    return None
+                for m in r.json().get("data", []):
+                    if m.get("id") == model:
+                        return m.get("state")  # "loaded" | "not-loaded" | None
+                return None
+        except Exception:
+            return None
+
+    async def warmup(self, model: str) -> bool:
+        """Probe the primary model on startup; return True if it is loaded.
+
+        Checks the LM Studio state endpoint first for a fast answer.
+        If the state is "loaded", returns True immediately.
+        If the state is "not-loaded" (or the endpoint is unavailable), sends a
+        minimal inference request — this either confirms the model is ready or
+        triggers auto-load if LM Studio has that feature enabled.
+        Never raises; failures are logged as warnings.
+        """
+        state = await self.check_model_state(model)
+        if state == "loaded":
+            self.logger.info("model_warmup_already_loaded", model=model)
+            return True
+
+        if state is not None:
+            # State endpoint available but model is not loaded.
+            self.logger.warning(
+                "model_not_loaded_in_lm_studio",
+                model=model,
+                state=state,
+                hint="Load the model in LM Studio before submitting tasks.",
+            )
+
+        # Send a tiny inference ping.  This will:
+        #   • Confirm the model is ready if it somehow loaded since the state check.
+        #   • Trigger auto-load if LM Studio has auto-load enabled.
+        #   • Fail immediately with a clear error if neither applies.
+        try:
+            async with httpx.AsyncClient(timeout=30.0) as client:
+                payload = {
+                    "model": model,
+                    "messages": [{"role": "user", "content": "hi"}],
+                    "max_tokens": 1,
+                }
+                r = await client.post(self._get_chat_endpoint(), json=payload)
+                if r.status_code == 200:
+                    self.logger.info("model_warmup_ping_ok", model=model)
+                    return True
+                body = r.text
+                lower = body.lower()
+                if any(hint in lower for hint in _MODEL_NOT_READY_HINTS):
+                    self.logger.warning(
+                        "model_warmup_not_ready",
+                        model=model,
+                        hint="Open LM Studio and load the model before sending tasks.",
+                    )
+                else:
+                    self.logger.warning("model_warmup_ping_failed", model=model, status=r.status_code, body=body[:200])
+                return False
+        except Exception as e:
+            self.logger.error("model_warmup_error", model=model, error=str(e))
+            return False
+
     async def health_check(self, model: str) -> bool:
+        """Return True only when the model is confirmed loaded in LM Studio.
+
+        Prefers the /api/v0/models ``state`` field (accurate) over the plain
+        /v1/models list (which returns all available models, loaded or not).
+        Falls back to /v1/models existence check when the state endpoint is
+        unavailable (plain Ollama).
+        """
+        state = await self.check_model_state(model)
+        if state is not None:
+            return state == "loaded"
+
+        # Fallback: plain Ollama /v1/models existence check.
         try:
             async with httpx.AsyncClient(timeout=10.0) as client:
                 response = await client.get(f"{self.base_url}/v1/models")

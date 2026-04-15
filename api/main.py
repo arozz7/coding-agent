@@ -216,6 +216,11 @@ async def _init_agent_background() -> None:
 
     /task endpoints return 503 until the orchestrator is ready.  Retries
     indefinitely with the same backoff curve used before this refactor.
+
+    After the orchestrator is ready, probes the primary local model so that
+    LM Studio loads it into VRAM now rather than on the first user request.
+    A warning is logged (visible in the supervisor console) if the model is
+    not loaded, giving the user time to open LM Studio and load it.
     """
     global _orchestrator
     from local_coding_agent import create_agent
@@ -235,6 +240,20 @@ async def _init_agent_background() -> None:
             )
             attempt += 1
             await asyncio.sleep(delay)
+
+    # Probe the primary local model.  This is intentionally fire-and-forget:
+    # a failed probe does not block startup — the ModelNotReadyError retry
+    # loop in model_router handles the case where the model loads later.
+    primary = _orchestrator.model_router.get_model("coding")
+    if primary and primary.type == "local":
+        logger.info("model_probe_start", model=primary.name)
+        ok = await _orchestrator.model_router.ollama.warmup(primary.name)
+        if not ok:
+            logger.warning(
+                "model_not_ready_at_startup",
+                model=primary.name,
+                action="Open LM Studio and load the model — tasks will block until it is ready.",
+            )
 
 
 @app.on_event("startup")
