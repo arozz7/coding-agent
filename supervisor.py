@@ -25,6 +25,7 @@ import sys
 import time
 import urllib.request
 from pathlib import Path
+from typing import IO, Optional
 
 # Load .env before reading any env vars so BOT_PYTHON and other settings are available.
 try:
@@ -64,16 +65,20 @@ _BOT_BACKOFF_STEPS = [2, 5, 15, 30, 60]
 _HEARTBEAT_FILE = None  # set after STATE_DIR is known
 _HEARTBEAT_INTERVAL = 5  # seconds
 
-# Stale-job watchdog: if a job stays in the same phase for longer than this,
-# force a full restart so a hung LLM call doesn't block overnight.
+# Stale-job watchdog: if a job stays running longer than this, force restart.
 _STALE_JOB_THRESHOLD = 45 * 60  # 45 minutes in seconds
-_JOBS_DB = None  # set after ROOT is known
 
-# API-unreachable watchdog: if GET /jobs has failed this many consecutive
-# stale-check cycles (each cycle is 5 min), assume the event loop is blocked
-# (e.g. httpx AsyncClient blocking the asyncio loop) and force a restart.
-_API_UNREACHABLE_MAX_CYCLES = 3   # 3 × 5 min = 15 min of unreachable API
-_api_unreachable_cycles: int = 0
+# Continuous health probe — runs every 30 s.
+# If the API process is alive but /health is unreachable for this many
+# consecutive probes, it's "live but dead" (blocked event loop, deadlock, etc.)
+# and we force a kill + restart.
+_HEALTH_PROBE_INTERVAL = 30       # seconds between probes
+_HEALTH_PROBE_MAX_FAILURES = 3    # 3 × 30 s = 90 s before restart
+
+# Log capture — child process stdout/stderr is redirected to dated files here.
+_LOG_DIR = _ROOT / "logs"
+_api_log: Optional[IO] = None
+_bot_log: Optional[IO] = None
 
 
 # ── Heartbeat & watchdog helpers ─────────────────────────────────────────────
@@ -87,34 +92,21 @@ def _write_heartbeat() -> None:
 
 
 def _check_stale_job() -> bool:
-    """Return True if any running job has been stuck for too long, OR if the
-    API has been unreachable for _API_UNREACHABLE_MAX_CYCLES consecutive checks.
+    """Return True if any running job has been stuck longer than _STALE_JOB_THRESHOLD.
 
-    A blocked asyncio event loop (e.g. httpx.AsyncClient stuck mid-read) makes
-    the entire FastAPI server unresponsive — GET /jobs will time out.  After
-    _API_UNREACHABLE_MAX_CYCLES consecutive failures we assume the server is
-    hung and force a restart.
-
-    Uses the GET /jobs API endpoint so we don't need a direct SQLite import.
+    Uses GET /jobs so we don't need a direct SQLite import.  API-unreachable
+    errors are silently ignored here — the continuous health probe (every 30 s)
+    handles unresponsive-API detection much faster.
     """
-    global _api_unreachable_cycles
     try:
         with urllib.request.urlopen(
             f"{API_URL}/jobs?limit=5", timeout=3
         ) as resp:
             data = json.loads(resp.read())
-
-        # API is reachable — reset the unreachable counter.
-        _api_unreachable_cycles = 0
-
         jobs = data.get("jobs", [])
         for job in jobs:
             if job.get("status") != "running":
                 continue
-            # phase_updated_at is not stored yet — approximate from created_at
-            # plus a conservative minimum runtime.  This is intentionally
-            # simple: a stuck job always has status=running and the same phase
-            # for a very long time.  We detect that by looking at created_at.
             created_raw = job.get("created_at", "")
             if not created_raw:
                 continue
@@ -123,9 +115,7 @@ def _check_stale_job() -> bool:
                 created_dt = datetime.fromisoformat(
                     created_raw.replace("Z", "+00:00")
                 )
-                age = (
-                    datetime.now(timezone.utc) - created_dt
-                ).total_seconds()
+                age = (datetime.now(timezone.utc) - created_dt).total_seconds()
                 if age > _STALE_JOB_THRESHOLD:
                     print(
                         f"[supervisor] Stale job detected: {job.get('job_id')} "
@@ -134,24 +124,23 @@ def _check_stale_job() -> bool:
                     return True
             except Exception:
                 pass
-
     except Exception:
-        # GET /jobs failed — API may be unreachable (hung event loop, crash, etc.)
-        _api_unreachable_cycles += 1
-        print(
-            f"[supervisor] API unreachable during stale-check "
-            f"(cycle {_api_unreachable_cycles}/{_API_UNREACHABLE_MAX_CYCLES})"
-        )
-        if _api_unreachable_cycles >= _API_UNREACHABLE_MAX_CYCLES:
-            print(
-                "[supervisor] API has been unreachable for "
-                f"{_API_UNREACHABLE_MAX_CYCLES} consecutive checks "
-                "— event loop may be blocked, forcing restart"
-            )
-            _api_unreachable_cycles = 0
-            return True
-
+        pass  # health probe handles API-unreachable faster
     return False
+
+
+# ── Log helpers ───────────────────────────────────────────────────────────────
+
+def _open_log(name: str) -> IO:
+    """Open a fresh, timestamped log file for a child process.
+
+    Each restart produces a new file so previous output is never overwritten.
+    Buffering=1 (line-buffered) means log lines appear immediately.
+    """
+    _LOG_DIR.mkdir(parents=True, exist_ok=True)
+    ts = time.strftime("%Y%m%d-%H%M%S")
+    path = _LOG_DIR / f"{name}-{ts}.log"
+    return open(path, "w", encoding="utf-8", buffering=1)
 
 
 # ── Process helpers ───────────────────────────────────────────────────────────
@@ -200,7 +189,19 @@ def _wait_for_health(timeout: int = API_STARTUP_TIMEOUT) -> bool:
 
 
 def _start_api() -> subprocess.Popen:
-    """Launch the FastAPI server as a child process using sys.executable."""
+    """Launch the FastAPI server as a child process using sys.executable.
+
+    stdout and stderr are redirected to a timestamped file in logs/api-*.log
+    so process output is preserved across restarts.
+    """
+    global _api_log
+    if _api_log:
+        try:
+            _api_log.close()
+        except Exception:
+            pass
+    _api_log = _open_log("api")
+
     cmd = [
         sys.executable, "-m", "uvicorn",
         "api.main:app",
@@ -208,21 +209,36 @@ def _start_api() -> subprocess.Popen:
         "--port", "5005",
         "--log-level", "info",
     ]
-    print(f"[supervisor] Starting API:  {' '.join(cmd)}")
+    print(f"[supervisor] Starting API:  {' '.join(cmd)}  → {_api_log.name}")
     return subprocess.Popen(
         cmd,
         cwd=str(_ROOT),
+        stdout=_api_log,
+        stderr=subprocess.STDOUT,
         creationflags=subprocess.CREATE_NEW_PROCESS_GROUP,
     )
 
 
 def _start_bot() -> subprocess.Popen:
-    """Launch the Discord bot using BOT_PYTHON (may differ from sys.executable)."""
+    """Launch the Discord bot using BOT_PYTHON (may differ from sys.executable).
+
+    stdout and stderr are redirected to a timestamped file in logs/bot-*.log.
+    """
+    global _bot_log
+    if _bot_log:
+        try:
+            _bot_log.close()
+        except Exception:
+            pass
+    _bot_log = _open_log("bot")
+
     cmd = [_BOT_PYTHON, "-m", "api.discord_bot"]
-    print(f"[supervisor] Starting bot:  {' '.join(cmd)}")
+    print(f"[supervisor] Starting bot:  {' '.join(cmd)}  → {_bot_log.name}")
     return subprocess.Popen(
         cmd,
         cwd=str(_ROOT),
+        stdout=_bot_log,
+        stderr=subprocess.STDOUT,
         creationflags=subprocess.CREATE_NEW_PROCESS_GROUP,
     )
 
@@ -280,6 +296,19 @@ def main() -> None:
     bot_started_at = time.monotonic()
     last_heartbeat = time.monotonic()
     last_stale_check = time.monotonic()
+    last_health_probe = time.monotonic()
+    health_probe_failures = 0   # consecutive /health failures while api_proc alive
+    health_was_ok = True        # used for state-transition logging
+
+    def _reset_after_restart() -> None:
+        nonlocal bot_fast_fails, bot_started_at, last_health_probe, health_probe_failures, health_was_ok
+        bot_fast_fails = 0
+        bot_started_at = time.monotonic()
+        # Give the freshly started API time to pass its startup health check
+        # before we start probing again.
+        last_health_probe = time.monotonic()
+        health_probe_failures = 0
+        health_was_ok = True
 
     try:
         while True:
@@ -291,22 +320,67 @@ def main() -> None:
                 _write_heartbeat()
                 last_heartbeat = now
 
+            # Continuous health probe — every 30 s.
+            # Detects "live process but unresponsive" (blocked event loop, deadlock).
+            if now - last_health_probe >= _HEALTH_PROBE_INTERVAL:
+                last_health_probe = now
+                probe_ok = False
+                probe_data: dict = {}
+                try:
+                    with urllib.request.urlopen(_HEALTH_URL, timeout=5) as resp:
+                        if resp.status == 200:
+                            probe_ok = True
+                            probe_data = json.loads(resp.read())
+                except Exception as _pe:
+                    # Only log on transition from OK → failing
+                    if health_was_ok:
+                        print(f"[supervisor] health probe FAILED: {_pe}")
+
+                if probe_ok:
+                    if not health_was_ok:
+                        # Recovered — log transition
+                        print(
+                            f"[supervisor] health probe recovered — "
+                            f"agent_ready={probe_data.get('agent_ready')} "
+                            f"active_jobs={probe_data.get('active_jobs', '?')} "
+                            f"uptime={probe_data.get('uptime_seconds', '?')}s"
+                        )
+                    health_probe_failures = 0
+                    health_was_ok = True
+                else:
+                    health_probe_failures += 1
+                    print(
+                        f"[supervisor] health probe failure "
+                        f"{health_probe_failures}/{_HEALTH_PROBE_MAX_FAILURES}"
+                        + (f" — active_jobs={probe_data.get('active_jobs')}" if probe_data else "")
+                    )
+                    health_was_ok = False
+
+                    if health_probe_failures >= _HEALTH_PROBE_MAX_FAILURES:
+                        status = "alive but unresponsive" if api_proc.poll() is None else "exited"
+                        print(
+                            f"[supervisor] API {status} after "
+                            f"{_HEALTH_PROBE_MAX_FAILURES} consecutive health failures "
+                            "— killing and restarting"
+                        )
+                        api_proc, bot_proc = _restart_all(api_proc, bot_proc)
+                        _reset_after_restart()
+                        continue
+
             # Stale-job watchdog — check every 5 minutes
             if now - last_stale_check >= 300:
                 last_stale_check = now
                 if _check_stale_job():
                     print("[supervisor] Stale-job watchdog triggered — restarting")
                     api_proc, bot_proc = _restart_all(api_proc, bot_proc)
-                    bot_fast_fails = 0
-                    bot_started_at = time.monotonic()
+                    _reset_after_restart()
                     continue
 
             # Restart requested by POST /restart
             if RESTART_FLAG.exists():
                 print("[supervisor] Restart flag detected")
                 api_proc, bot_proc = _restart_all(api_proc, bot_proc)
-                bot_fast_fails = 0
-                bot_started_at = time.monotonic()
+                _reset_after_restart()
                 continue
 
             # Auto-recover a crashed API — restart both since bot depends on it
@@ -316,8 +390,7 @@ def main() -> None:
                     " — restarting all services"
                 )
                 api_proc, bot_proc = _restart_all(api_proc, bot_proc)
-                bot_fast_fails = 0
-                bot_started_at = time.monotonic()
+                _reset_after_restart()
                 continue
 
             # Auto-recover a crashed bot — restart bot only
@@ -339,8 +412,7 @@ def main() -> None:
                             time.sleep(_POLL_INTERVAL)
                         print("[supervisor] Restart flag detected — resuming")
                         api_proc, bot_proc = _restart_all(api_proc, bot_proc)
-                        bot_fast_fails = 0
-                        bot_started_at = time.monotonic()
+                        _reset_after_restart()
                         continue
 
                     delay = _BOT_BACKOFF_STEPS[min(bot_fast_fails - 1, len(_BOT_BACKOFF_STEPS) - 1)]

@@ -5,9 +5,12 @@ from typing import Optional, List, Dict
 from prometheus_client import generate_latest, CONTENT_TYPE_LATEST
 import uuid
 import re
+import time as _time
 from datetime import datetime
 import asyncio
 import structlog
+
+_SERVER_START_TIME = _time.time()
 
 from llm import ModelRouter
 from agent.orchestrator import AgentOrchestrator
@@ -285,9 +288,18 @@ async def root():
 
 @app.get("/health")
 async def health_check():
+    active_jobs = 0
+    try:
+        rows = _job_store.list_jobs(limit=20)
+        active_jobs = sum(1 for j in rows if j.get("status") == "running")
+    except Exception:
+        pass
     return {
         "status": "healthy",
         "agent_ready": _orchestrator is not None,
+        "active_jobs": active_jobs,
+        "uptime_seconds": int(_time.time() - _SERVER_START_TIME),
+        "timestamp": _time.time(),
     }
 
 
