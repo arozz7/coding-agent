@@ -63,6 +63,7 @@ python -m pip install -e .
 | `BOT_PYTHON` | No | `sys.executable` | Python interpreter for the bot subprocess (set when bot uses a different venv than the API) |
 | `API_STARTUP_TIMEOUT` | No | `120` | Seconds supervisor waits for `/health` on startup |
 | `RESTART_DELAY_SECS` | No | `3` | Seconds between stop and start during a supervisor restart |
+| `MAX_FIX_ITERATIONS` | No | `50` | Maximum fix-loop iterations the developer agent will attempt before giving up on a build error |
 
 ### Model Configuration (`config/models.yaml`)
 

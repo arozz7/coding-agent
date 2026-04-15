@@ -8,7 +8,7 @@ An autonomous coding agent with LLM integration, multi-agent orchestration, SDLC
 - **Discord Remote Control** — Submit tasks, monitor progress, switch models, manage sessions, and restart services from any device
 - **Agentic Task Manager** — Objectives decomposed into ordered task lists; agents execute sequentially, can add tasks dynamically, wiki knowledge persists between subtasks
 - **SDLC Pipeline** — Full plan → build → test → debug → run → verify workflow
-- **Autonomous Run & Debug** — Agent runs shell commands, reads errors, fixes code, re-runs (up to 10 iterations); explicit verify re-run after each fix
+- **Autonomous Run & Debug** — Agent runs shell commands, reads errors, fixes code, re-runs automatically; configurable iteration limit (default 50, set `MAX_FIX_ITERATIONS` in `.env`)
 - **Multi-Agent Routing** — Tasks routed to the right agent automatically: developer, researcher, planner, tester, reviewer, architect, chat
 - **Context Bridge** — Monitors token budget; at 82 % generates a structured handover and continues in a fresh session silently; Discord notifies at 75 %
 - **LM Studio Integration** — Live model state (loaded / not-loaded) from `/api/v0/models`; discovers downloaded-but-unconfigured models; per-call thinking mode control

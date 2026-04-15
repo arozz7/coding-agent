@@ -1,4 +1,5 @@
 from typing import Dict, Any, Optional, List
+import os
 import re
 from agent.agents.base_agent import AgentRole
 
@@ -17,7 +18,7 @@ _INLINE_CMD_RE = re.compile(
     re.MULTILINE | re.IGNORECASE,
 )
 
-MAX_FIX_ITERATIONS = 10
+MAX_FIX_ITERATIONS = int(os.getenv("MAX_FIX_ITERATIONS", "50"))
 
 # Maximum characters of error output sent to the LLM per iteration.
 # TypeScript / webpack errors repeat the same stack endlessly — cap them
