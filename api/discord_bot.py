@@ -367,6 +367,13 @@ async def _poll_job(ctx: commands.Context, status_msg: discord.Message, job_id: 
     consecutive_failures = 0
     last_label = "Working"
 
+    # Stale-phase detection: if the phase label hasn't changed for this long,
+    # send a separate warning message.  45 min matches the supervisor watchdog.
+    _STALE_PHASE_WARN_SECS = 45 * 60
+    _stale_warned = False
+    _last_phase_change = time.monotonic()
+    _last_phase = ""
+
     # Task types whose full response should be shown inline in the channel.
     _INLINE_TYPES = {"chat", "research", "plan"}
 
@@ -412,6 +419,26 @@ async def _poll_job(ctx: commands.Context, status_msg: discord.Message, job_id: 
             label = _PHASE_LABELS.get(phase, phase or "Working")
 
         last_label = label  # keep for reconnect messages
+
+        # Stale-phase watchdog: warn in the channel if the phase hasn't
+        # changed for 45 minutes.  Only warn once per job to avoid spam.
+        if phase != _last_phase:
+            _last_phase = phase
+            _last_phase_change = time.monotonic()
+            _stale_warned = False
+        elif (
+            not _stale_warned
+            and job_status == "running"
+            and (time.monotonic() - _last_phase_change) > _STALE_PHASE_WARN_SECS
+        ):
+            _stale_warned = True
+            warn_mins = int(_STALE_PHASE_WARN_SECS // 60)
+            await ctx.send(
+                f"**Warning:** job `{job_id}` has been stuck on **{label}** "
+                f"for over {warn_mins} minutes.\n"
+                f"The model may have been unloaded — the supervisor will attempt "
+                f"an automatic restart. You can also use `!restart` manually."
+            )
 
         if job_status == "done":
             task_type = job.get("task_type", "")
@@ -1115,12 +1142,22 @@ async def restart_services(ctx: commands.Context):
     except Exception as exc:
         print(f"[bot] Could not write last_channel: {exc}")
 
-    await ctx.send("Restarting services — back in ~15 seconds...")
-
     try:
-        await bot.client.restart()
+        resp = await bot.client.restart()
     except Exception:
-        pass  # Expected: the API may be killed before the response completes
+        resp = {}  # API may be killed before response completes — treat as unknown
+
+    supervisor_ok = resp.get("supervisor_running", None)
+    if supervisor_ok is False:
+        # Supervisor isn't running — the flag was written but nothing will act on it.
+        await ctx.send(
+            "Could not restart: **supervisor.py is not running**.\n"
+            "Start it manually: `python supervisor.py`\n"
+            "Then use `!restart` again."
+        )
+        return
+
+    await ctx.send("Restarting services — back in ~15 seconds...")
 
 
 @bot.command(name="helpme")

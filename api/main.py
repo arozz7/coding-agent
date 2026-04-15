@@ -1015,14 +1015,39 @@ async def request_restart(req: Request):
             detail="Restart is only allowed from localhost",
         )
 
-    flag = Path(__file__).parent.parent / ".state" / "restart.flag"
-    flag.parent.mkdir(parents=True, exist_ok=True)
+    state_dir = Path(__file__).parent.parent / ".state"
+    state_dir.mkdir(parents=True, exist_ok=True)
+
+    flag = state_dir / "restart.flag"
     flag.touch()
 
-    logger.info("restart_requested", client=client_host)
+    # Check if the supervisor is alive by reading its heartbeat file.
+    # The supervisor writes a Unix timestamp every 5 seconds; if the file is
+    # missing or older than 30 seconds the supervisor is likely not running.
+    import time as _time
+    heartbeat_file = state_dir / "supervisor.heartbeat"
+    supervisor_running = False
+    try:
+        age = _time.time() - float(heartbeat_file.read_text().strip())
+        supervisor_running = age < 30
+    except Exception:
+        pass
+
+    logger.info(
+        "restart_requested",
+        client=client_host,
+        supervisor_running=supervisor_running,
+    )
     return {
-        "status": "restarting",
-        "message": "Restart flag written. Supervisor will restart services shortly.",
+        "status": "restarting" if supervisor_running else "flag_written",
+        "supervisor_running": supervisor_running,
+        "message": (
+            "Restart flag written. Supervisor will restart services shortly."
+            if supervisor_running
+            else
+            "Restart flag written, but supervisor.py does not appear to be running. "
+            "Start it with: python supervisor.py"
+        ),
     }
 
 

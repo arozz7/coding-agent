@@ -18,10 +18,12 @@ Environment variables (all optional):
     DISCORD_BOT_TOKEN     — passed through to the bot subprocess automatically
 """
 
+import json
 import os
 import subprocess
 import sys
 import time
+import urllib.request
 from pathlib import Path
 
 # Load .env before reading any env vars so BOT_PYTHON and other settings are available.
@@ -56,6 +58,70 @@ _BOT_PYTHON = os.getenv("BOT_PYTHON", sys.executable)
 _FAST_FAIL_SECS = 10
 _BOT_MAX_FAST_FAILS = 5
 _BOT_BACKOFF_STEPS = [2, 5, 15, 30, 60]
+
+# Heartbeat: supervisor writes a timestamp file every _HEARTBEAT_INTERVAL seconds
+# so the API can detect whether the supervisor is alive.
+_HEARTBEAT_FILE = None  # set after STATE_DIR is known
+_HEARTBEAT_INTERVAL = 5  # seconds
+
+# Stale-job watchdog: if a job stays in the same phase for longer than this,
+# force a full restart so a hung LLM call doesn't block overnight.
+_STALE_JOB_THRESHOLD = 45 * 60  # 45 minutes in seconds
+_JOBS_DB = None  # set after ROOT is known
+
+
+# ── Heartbeat & watchdog helpers ─────────────────────────────────────────────
+
+def _write_heartbeat() -> None:
+    """Write the current epoch timestamp to the heartbeat file."""
+    try:
+        _HEARTBEAT_FILE.write_text(str(time.time()))
+    except Exception:
+        pass
+
+
+def _check_stale_job() -> bool:
+    """Return True if any running job has been stuck in the same phase for
+    longer than _STALE_JOB_THRESHOLD seconds.
+
+    Uses the GET /jobs API endpoint so we don't need a direct SQLite import.
+    """
+    try:
+        with urllib.request.urlopen(
+            f"{API_URL}/jobs?limit=5", timeout=3
+        ) as resp:
+            data = json.loads(resp.read())
+        jobs = data.get("jobs", [])
+        now = time.time()
+        for job in jobs:
+            if job.get("status") != "running":
+                continue
+            # phase_updated_at is not stored yet — approximate from created_at
+            # plus a conservative minimum runtime.  This is intentionally
+            # simple: a stuck job always has status=running and the same phase
+            # for a very long time.  We detect that by looking at created_at.
+            created_raw = job.get("created_at", "")
+            if not created_raw:
+                continue
+            from datetime import datetime, timezone
+            try:
+                created_dt = datetime.fromisoformat(
+                    created_raw.replace("Z", "+00:00")
+                )
+                age = (
+                    datetime.now(timezone.utc) - created_dt
+                ).total_seconds()
+                if age > _STALE_JOB_THRESHOLD:
+                    print(
+                        f"[supervisor] Stale job detected: {job.get('job_id')} "
+                        f"has been running for {age/60:.0f} min — forcing restart"
+                    )
+                    return True
+            except Exception:
+                pass
+    except Exception:
+        pass
+    return False
 
 
 # ── Process helpers ───────────────────────────────────────────────────────────
@@ -132,8 +198,11 @@ def _start_bot() -> subprocess.Popen:
 
 def _launch_all() -> tuple[subprocess.Popen, subprocess.Popen]:
     """Cold-start: API first, wait for health, then bot."""
+    global _HEARTBEAT_FILE
     STATE_DIR.mkdir(parents=True, exist_ok=True)
     RESTART_FLAG.unlink(missing_ok=True)
+    _HEARTBEAT_FILE = STATE_DIR / "supervisor.heartbeat"
+    _write_heartbeat()
 
     api_proc = _start_api()
     _wait_for_health()
@@ -176,10 +245,28 @@ def main() -> None:
 
     bot_fast_fails = 0      # consecutive fast failures (bot died < _FAST_FAIL_SECS)
     bot_started_at = time.monotonic()
+    last_heartbeat = time.monotonic()
+    last_stale_check = time.monotonic()
 
     try:
         while True:
             time.sleep(_POLL_INTERVAL)
+            now = time.monotonic()
+
+            # Write heartbeat so the API knows we're alive
+            if now - last_heartbeat >= _HEARTBEAT_INTERVAL:
+                _write_heartbeat()
+                last_heartbeat = now
+
+            # Stale-job watchdog — check every 5 minutes
+            if now - last_stale_check >= 300:
+                last_stale_check = now
+                if _check_stale_job():
+                    print("[supervisor] Stale-job watchdog triggered — restarting")
+                    api_proc, bot_proc = _restart_all(api_proc, bot_proc)
+                    bot_fast_fails = 0
+                    bot_started_at = time.monotonic()
+                    continue
 
             # Restart requested by POST /restart
             if RESTART_FLAG.exists():

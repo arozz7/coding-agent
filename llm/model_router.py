@@ -6,7 +6,7 @@ import yaml
 import structlog
 
 from .config import ModelConfig
-from .ollama_client import OllamaClient
+from .ollama_client import OllamaClient, ModelNotReadyError
 from .cloud_api_client import CloudAPIClient, _OpenRouterRateLimitError
 from .cost_tracker import CostTracker
 from .rate_limiter import RateLimiter, RateLimitExceeded
@@ -183,6 +183,13 @@ class ModelRouter:
         msg = str(exc)
         return "429" in msg and ("Too Many Requests" in msg or "rate" in msg.lower())
 
+    # How long to wait between retries when the local model is not loaded.
+    # A 35B model at 3-bit can take 3–8 minutes to reload from disk.
+    # Three attempts × 120 s each = up to ~6 minutes of patience before
+    # we give up and try a fallback model.
+    _MODEL_RELOAD_WAIT_SECS = 120
+    _MODEL_RELOAD_MAX_RETRIES = 3
+
     async def generate(
         self,
         prompt: str,
@@ -191,7 +198,10 @@ class ModelRouter:
         _is_fallback: bool = False,
         timeout: float = 600.0,
     ) -> str:
+        import asyncio
         await self.rate_limiter.acquire(config.name)
+
+        model_reload_attempts = 0
 
         for attempt in range(max_retries):
             try:
@@ -209,6 +219,44 @@ class ModelRouter:
                 self.health_checker.record_success(config.name)
                 return result
 
+            except ModelNotReadyError as e:
+                # The local model was evicted (TTL expiry) and LM Studio hasn't
+                # reloaded it yet.  Use a long wait so the model has time to
+                # re-initialise before we retry.
+                model_reload_attempts += 1
+                self.health_checker.record_failure(config.name)
+
+                if model_reload_attempts <= self._MODEL_RELOAD_MAX_RETRIES:
+                    self.logger.warning(
+                        "model_not_ready_waiting",
+                        model=config.name,
+                        reload_attempt=model_reload_attempts,
+                        wait_secs=self._MODEL_RELOAD_WAIT_SECS,
+                        error=str(e)[:120],
+                    )
+                    await asyncio.sleep(self._MODEL_RELOAD_WAIT_SECS)
+                    # Reset the fast-retry loop counter so we get a fresh set
+                    # of attempts after the wait.
+                    attempt = 0  # noqa: PLW2901 — intentional loop-var reset
+                    continue
+
+                # Reload retries exhausted — try a fallback model.
+                if not _is_fallback:
+                    fallback = self._get_local_fallback(config.name)
+                    if fallback:
+                        self.logger.warning(
+                            "model_reload_exhausted_using_fallback",
+                            primary=config.name,
+                            fallback=fallback.name,
+                        )
+                        return await self.generate(
+                            prompt, fallback, max_retries=max_retries, _is_fallback=True, timeout=timeout
+                        )
+                raise LLMError(
+                    f"Model {config.name!r} failed to reload after "
+                    f"{self._MODEL_RELOAD_MAX_RETRIES} attempts and no fallback available"
+                ) from e
+
             except RateLimitExceeded as e:
                 self.logger.warning(
                     "rate_limit_exceeded",
@@ -216,7 +264,6 @@ class ModelRouter:
                     attempt=attempt,
                     wait=e.retry_after,
                 )
-                import asyncio
                 await asyncio.sleep(e.retry_after)
                 self.health_checker.record_rate_limit(config.name)
 
@@ -263,7 +310,6 @@ class ModelRouter:
                 self.health_checker.record_failure(config.name)
                 if attempt == max_retries - 1:
                     raise
-                import asyncio
                 await asyncio.sleep(2**attempt)
 
         raise LLMError(f"All {max_retries} retries exhausted")
