@@ -81,52 +81,37 @@ class OllamaClient:
         enable_thinking: Optional[bool],
         timeout: float,
     ) -> str:
-        """Inner coroutine — executed inside asyncio.wait_for by generate()."""
-        try:
-            async with httpx.AsyncClient(timeout=timeout) as client:
-                payload: dict[str, Any] = {
-                    "model": model,
-                    "messages": [{"role": "user", "content": prompt}],
-                    "max_tokens": 8192,
-                }
-                if enable_thinking is False:
-                    # LM Studio / vLLM Qwen3 extension — disables the <think> phase
-                    # so the model always returns a direct content response.
-                    payload["enable_thinking"] = False
+        """Inner coroutine — executed inside asyncio.wait_for by generate().
 
-                response = await client.post(url, json=payload)
+        Runs the blocking httpx.Client call in a thread via asyncio.to_thread so
+        that asyncio.wait_for can reliably cancel it on Python 3.12+.
+
+        Background: asyncio.wait_for cannot cancel an httpx.AsyncClient request
+        on Python 3.12 because the event loop waits for the coroutine to
+        acknowledge cancellation, which it never does while mid-read.  Running
+        the same request synchronously in a thread allows wait_for to cancel the
+        awaitable wrapper immediately; the background thread finishes on its own
+        within httpx's own timeout window.
+        """
+        payload: dict[str, Any] = {
+            "model": model,
+            "messages": [{"role": "user", "content": prompt}],
+            "max_tokens": 8192,
+        }
+        if enable_thinking is False:
+            # LM Studio / vLLM Qwen3 extension — disables the <think> phase
+            # so the model always returns a direct content response.
+            payload["enable_thinking"] = False
+
+        def _sync_post() -> dict[str, Any]:
+            """Synchronous httpx POST — safe to run in a thread pool."""
+            with httpx.Client(timeout=timeout) as client:
+                response = client.post(url, json=payload)
                 response.raise_for_status()
-                data = response.json()
+                return response.json()
 
-                choices = data.get("choices", [])
-                if not choices:
-                    raise RuntimeError(f"No choices in response: {data}")
-
-                message = choices[0].get("message", {})
-                content = message.get("content", "")
-
-                if not content:
-                    # Thinking models sometimes produce only reasoning_content
-                    # with an empty content field.  Returning the raw thinking
-                    # trace as a response breaks all downstream parsing, so we
-                    # raise instead — the retry loop in model_router will retry
-                    # or fall back to another model.
-                    reasoning = message.get("reasoning_content", "")
-                    if reasoning:
-                        self.logger.warning(
-                            "empty_content_with_reasoning",
-                            model=model,
-                            reasoning_preview=reasoning[:120],
-                        )
-                        raise RuntimeError(
-                            f"Model {model!r} returned empty content (reasoning-only response). "
-                            "Set enable_thinking: false in models.yaml for this model."
-                        )
-                    raise RuntimeError(f"Model {model!r} returned empty content and no reasoning")
-
-                self.logger.info("ollama_generate_success", content_len=len(content))
-                return content
-
+        try:
+            data = await asyncio.to_thread(_sync_post)
         except httpx.TimeoutException:
             self.logger.error("ollama_timeout", url=url, timeout=timeout)
             raise RuntimeError(f"Ollama timeout after {timeout:.0f}s for model {model!r}")
@@ -147,12 +132,38 @@ class OllamaClient:
                     f"Model {model!r} is not loaded (HTTP {e.response.status_code}): {body[:200]}"
                 )
             raise RuntimeError(f"Ollama HTTP {e.response.status_code}: {body[:200]}")
-        except asyncio.CancelledError:
-            # Propagate cancellation (from asyncio.wait_for) without wrapping.
-            raise
         except Exception as e:
             self.logger.error("ollama_error", error=str(e), error_type=type(e).__name__)
             raise
+
+        choices = data.get("choices", [])
+        if not choices:
+            raise RuntimeError(f"No choices in response: {data}")
+
+        message = choices[0].get("message", {})
+        content = message.get("content", "")
+
+        if not content:
+            # Thinking models sometimes produce only reasoning_content
+            # with an empty content field.  Returning the raw thinking
+            # trace as a response breaks all downstream parsing, so we
+            # raise instead — the retry loop in model_router will retry
+            # or fall back to another model.
+            reasoning = message.get("reasoning_content", "")
+            if reasoning:
+                self.logger.warning(
+                    "empty_content_with_reasoning",
+                    model=model,
+                    reasoning_preview=reasoning[:120],
+                )
+                raise RuntimeError(
+                    f"Model {model!r} returned empty content (reasoning-only response). "
+                    "Set enable_thinking: false in models.yaml for this model."
+                )
+            raise RuntimeError(f"Model {model!r} returned empty content and no reasoning")
+
+        self.logger.info("ollama_generate_success", content_len=len(content))
+        return content
 
     async def stream_generate(
         self, prompt: str, model: str
@@ -182,6 +193,21 @@ class OllamaClient:
                                 yield content
                         except json.JSONDecodeError:
                             continue
+
+    async def list_all_models(self) -> list[dict]:
+        """Return all models known to LM Studio via /api/v0/models.
+
+        Each entry has at least ``id`` and ``state`` ("loaded" | "not-loaded").
+        Returns an empty list when the endpoint is unavailable.
+        """
+        try:
+            async with httpx.AsyncClient(timeout=5.0) as client:
+                r = await client.get(f"{self.base_url}/api/v0/models")
+                if r.status_code != 200:
+                    return []
+                return r.json().get("data", [])
+        except Exception:
+            return []
 
     async def check_model_state(self, model: str) -> Optional[str]:
         """Return the LM Studio model state string ("loaded", "not-loaded", etc.).

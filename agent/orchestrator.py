@@ -453,11 +453,13 @@ class AgentOrchestrator:
         if not config:
             raise RuntimeError("No model configured")
 
-        # Pass timeout_s directly to httpx so the connection is forcibly closed
-        # if the model doesn't respond in time.  asyncio.wait_for() is unreliable
-        # for this in Python 3.12+ because it waits for cancellation to complete,
-        # which can hang indefinitely when httpx is mid-request.
-        raw = await self.model_router.generate(prompt, config, timeout=timeout_s)
+        # Disable thinking for the classifier: it only needs one word back.
+        # A Qwen3 thinking trace for a one-word answer can run 10-30 minutes,
+        # burning the entire timeout budget before the actual classification
+        # arrives.  Thinking is still enabled for all real coding/planning calls.
+        raw = await self.model_router.generate(
+            prompt, config, timeout=timeout_s, enable_thinking=False
+        )
 
         # Extract first word on first non-empty line
         first_line = next((ln.strip() for ln in raw.splitlines() if ln.strip()), "")
@@ -960,6 +962,14 @@ class AgentOrchestrator:
                     result_summary = response_text[:300]
                     if task_id:
                         self.task_store.update_task(task_id, "done", result_summary)
+
+                    # Persist subtask learnings to wiki so later tasks can reference them.
+                    try:
+                        await self.skill_executor.execute_post(
+                            "wiki-compile", description, result, self.model_router
+                        )
+                    except Exception as _we:
+                        self.logger.warning("subtask_wiki_compile_failed", task_num=task_num, error=str(_we))
                 else:
                     error = result.get("error", "agent failed")
                     all_responses.append(

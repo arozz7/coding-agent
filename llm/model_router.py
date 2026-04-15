@@ -197,9 +197,22 @@ class ModelRouter:
         max_retries: int = 3,
         _is_fallback: bool = False,
         timeout: float = 600.0,
+        enable_thinking: bool | None = None,
     ) -> str:
+        """Generate a completion.
+
+        ``enable_thinking`` overrides the per-model ``enable_thinking`` setting
+        in models.yaml for this single call.  Pass ``False`` for lightweight
+        classification calls where a thinking trace is wasteful (e.g. the task
+        type classifier that only needs one word back).  Leave as ``None``
+        (default) to use the model's own setting.
+        """
         import asyncio
         await self.rate_limiter.acquire(config.name)
+
+        # Resolve effective enable_thinking: call-site override wins, then
+        # per-model config, then None (let the model decide).
+        effective_thinking = enable_thinking if enable_thinking is not None else config.enable_thinking
 
         model_reload_attempts = 0
 
@@ -209,7 +222,7 @@ class ModelRouter:
                     result = await self.ollama.generate(
                         prompt,
                         config.name,
-                        enable_thinking=config.enable_thinking,
+                        enable_thinking=effective_thinking,
                         timeout=timeout,
                     )
                 else:
@@ -308,6 +321,11 @@ class ModelRouter:
                     attempt=attempt,
                 )
                 self.health_checker.record_failure(config.name)
+                # Timeout errors are not retryable: if the model didn't respond
+                # within the deadline once, repeating the same request will just
+                # burn the full timeout window again.  Fail fast instead.
+                if "hard timeout" in str(e) or "timeout" in str(e).lower():
+                    raise
                 if attempt == max_retries - 1:
                     raise
                 await asyncio.sleep(2**attempt)
