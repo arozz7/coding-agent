@@ -19,30 +19,68 @@ class OllamaClient:
     def _get_chat_endpoint(self) -> str:
         return f"{self.base_url}/v1/chat/completions"
 
-    async def generate(self, prompt: str, model: str) -> str:
+    async def generate(
+        self,
+        prompt: str,
+        model: str,
+        enable_thinking: Optional[bool] = None,
+        timeout: float = 600.0,
+    ) -> str:
+        """Generate a completion.
+
+        Args:
+            prompt: The user prompt.
+            model: Model name as served by LM Studio / Ollama.
+            enable_thinking: Pass False to disable extended reasoning on
+                Qwen3/DeepSeek-R1 thinking models.  When these models return
+                an empty ``content`` field (reasoning only, no actual response),
+                we raise RuntimeError so the caller's retry loop handles it.
+        """
         url = self._get_chat_endpoint()
         self.logger.info("ollama_generate_start", model=model, prompt_len=len(prompt), url=url)
-        
+
         try:
-            async with httpx.AsyncClient(timeout=600.0) as client:
-                payload = {
+            async with httpx.AsyncClient(timeout=timeout) as client:
+                payload: dict[str, Any] = {
                     "model": model,
                     "messages": [{"role": "user", "content": prompt}],
                     "max_tokens": 8192,
                 }
+                if enable_thinking is False:
+                    # LM Studio / vLLM Qwen3 extension — disables the <think> phase
+                    # so the model always returns a direct content response.
+                    payload["enable_thinking"] = False
+
                 response = await client.post(url, json=payload)
                 response.raise_for_status()
                 data = response.json()
-                
+
                 choices = data.get("choices", [])
                 if not choices:
                     raise RuntimeError(f"No choices in response: {data}")
-                
+
                 message = choices[0].get("message", {})
                 content = message.get("content", "")
+
                 if not content:
-                    content = message.get("reasoning_content", "")
-                    
+                    # Thinking models sometimes produce only reasoning_content
+                    # with an empty content field.  Returning the raw thinking
+                    # trace as a response breaks all downstream parsing, so we
+                    # raise instead — the retry loop in model_router will retry
+                    # or fall back to another model.
+                    reasoning = message.get("reasoning_content", "")
+                    if reasoning:
+                        self.logger.warning(
+                            "empty_content_with_reasoning",
+                            model=model,
+                            reasoning_preview=reasoning[:120],
+                        )
+                        raise RuntimeError(
+                            f"Model {model!r} returned empty content (reasoning-only response). "
+                            "Set enable_thinking: false in models.yaml for this model."
+                        )
+                    raise RuntimeError(f"Model {model!r} returned empty content and no reasoning")
+
                 self.logger.info("ollama_generate_success", content_len=len(content))
                 return content
                 

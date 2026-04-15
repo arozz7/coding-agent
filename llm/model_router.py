@@ -189,13 +189,19 @@ class ModelRouter:
         config: ModelConfig,
         max_retries: int = 3,
         _is_fallback: bool = False,
+        timeout: float = 600.0,
     ) -> str:
         await self.rate_limiter.acquire(config.name)
 
         for attempt in range(max_retries):
             try:
                 if config.type == "local":
-                    result = await self.ollama.generate(prompt, config.name)
+                    result = await self.ollama.generate(
+                        prompt,
+                        config.name,
+                        enable_thinking=config.enable_thinking,
+                        timeout=timeout,
+                    )
                 else:
                     result = await self.cloud.generate(prompt, config)
 

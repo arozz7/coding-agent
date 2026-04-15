@@ -16,6 +16,7 @@ import os
 import re
 import subprocess
 import time
+from pathlib import Path
 from typing import Optional
 
 import discord
@@ -25,6 +26,10 @@ from discord.ext import commands
 
 API_URL = os.getenv("AGENT_API_URL", "http://localhost:5005")
 POLL_INTERVAL = int(os.getenv("BOT_POLL_INTERVAL", "5"))  # seconds
+
+# State directory shared with supervisor.py (one level up from api/)
+_STATE_DIR = Path(__file__).parent.parent / ".state"
+_LAST_CHANNEL_FILE = _STATE_DIR / "last_channel"
 
 # ---------------------------------------------------------------------------
 # Reconnect / retry helpers
@@ -222,6 +227,9 @@ class AgentClient:
     async def delete_session(self, session_id: str) -> dict:
         return await self._delete(f"/sessions/{session_id}")
 
+    async def restart(self) -> dict:
+        return await self._post("/restart", {}, timeout=10.0)
+
     async def wait_until_reachable(self) -> None:
         """Poll /health until the API responds. Never gives up.
 
@@ -262,6 +270,16 @@ class DiscordAgentBot(commands.Bot):
 
     async def on_ready(self):
         print(f"[bot] Logged in as {self.user}  |  API: {API_URL}")
+        # After a supervisor-triggered restart, notify the channel that asked for it.
+        if _LAST_CHANNEL_FILE.exists():
+            try:
+                channel_id = int(_LAST_CHANNEL_FILE.read_text().strip())
+                _LAST_CHANNEL_FILE.unlink(missing_ok=True)
+                channel = self.get_channel(channel_id)
+                if channel:
+                    await channel.send("Services restarted and back online.")
+            except Exception:
+                _LAST_CHANNEL_FILE.unlink(missing_ok=True)
 
     async def on_message(self, message: Message):
         if message.author == self.user:
@@ -303,6 +321,30 @@ _PHASE_LABELS: dict[str, str] = {
 _HEARTBEAT_INTERVAL = 60     # seconds between "still working…" edits when server is silent
 
 
+async def _safe_edit(msg: discord.Message, content: str) -> None:
+    """Edit a Discord message, swallowing transient Discord server errors.
+
+    Discord occasionally returns 503 during upstream hiccups. Dropping one
+    status-message edit is fine — the next poll cycle will update it.
+    Non-transient errors (4xx) are re-raised so real bugs surface.
+    """
+    try:
+        await msg.edit(content=content)
+    except discord.errors.DiscordServerError:
+        pass  # 5xx from Discord's infrastructure — skip, retry next cycle
+    except discord.errors.HTTPException as exc:
+        if exc.status >= 500:
+            pass  # Other 5xx — same treatment
+        else:
+            raise
+
+
+def _on_poll_done(fut: asyncio.Future) -> None:
+    """Log any exception that escaped _poll_job so it isn't silently dropped."""
+    if not fut.cancelled() and (exc := fut.exception()):
+        print(f"[bot] _poll_job unhandled exception: {type(exc).__name__}: {exc}")
+
+
 async def _poll_job(ctx: commands.Context, status_msg: discord.Message, job_id: str):
     """Edit *status_msg* until the job finishes, then post the result.
 
@@ -332,17 +374,16 @@ async def _poll_job(ctx: commands.Context, status_msg: discord.Message, job_id: 
             job = await bot.client.get_job(job_id)
             if consecutive_failures > 0:
                 consecutive_failures = 0
-                await status_msg.edit(content=f"{last_label}… ({elapsed}s) — reconnected")
+                await _safe_edit(status_msg, f"{last_label}… ({elapsed}s) — reconnected")
         except Exception as exc:
             # _http_retry re-raises only non-retriable errors (e.g. 404).
             # Show the error but keep polling so a temporary outage recovers.
             consecutive_failures += 1
             delay = _backoff(consecutive_failures - 1)
-            await status_msg.edit(
-                content=(
-                    f"{last_label}… ({elapsed}s) — "
-                    f"connection lost, next retry in {delay:.0f}s"
-                )
+            await _safe_edit(
+                status_msg,
+                f"{last_label}… ({elapsed}s) — "
+                f"connection lost, next retry in {delay:.0f}s",
             )
             await asyncio.sleep(delay)
             continue
@@ -393,15 +434,15 @@ async def _poll_job(ctx: commands.Context, status_msg: discord.Message, job_id: 
                     full = (result_data.get("result") or "").strip()
                 except Exception as exc:
                     full = ""
-                    await status_msg.edit(content=f"Done [{task_type}] · {elapsed}s (could not fetch result: {exc})")
+                    await _safe_edit(status_msg, f"Done [{task_type}] · {elapsed}s (could not fetch result: {exc})")
                     return
 
                 if not full:
-                    await status_msg.edit(content=f"Done [{task_type}] · {elapsed}s — (empty response)")
+                    await _safe_edit(status_msg, f"Done [{task_type}] · {elapsed}s — (empty response)")
                     return
 
                 # Edit the status message to a short header, then send chunks.
-                await status_msg.edit(content=f"**Done** [{task_type}] · {elapsed}s")
+                await _safe_edit(status_msg, f"**Done** [{task_type}] · {elapsed}s")
                 chunks = _chunk(full)
                 for chunk in chunks:
                     await ctx.send(chunk)
@@ -417,7 +458,7 @@ async def _poll_job(ctx: commands.Context, status_msg: discord.Message, job_id: 
                 lines.append(
                     "\n`!result` — full response  ·  `!files` — file list  ·  `!show <path>` — view a file"
                 )
-                await status_msg.edit(content=_truncate("\n".join(lines)))
+                await _safe_edit(status_msg, _truncate("\n".join(lines)))
 
             # Send screenshot as attachment if the SDLC workflow produced one
             if screenshot_path:
@@ -426,15 +467,15 @@ async def _poll_job(ctx: commands.Context, status_msg: discord.Message, job_id: 
 
         elif job_status == "failed":
             error = (job.get("error") or "unknown error")[:400]
-            await status_msg.edit(content=f"**Task failed** after {elapsed}s:\n```\n{error}\n```")
+            await _safe_edit(status_msg, f"**Task failed** after {elapsed}s:\n```\n{error}\n```")
             return
 
         elif job_status == "cancelled":
-            await status_msg.edit(content=f"Task cancelled after {elapsed}s.")
+            await _safe_edit(status_msg, f"Task cancelled after {elapsed}s.")
             return
 
         else:
-            await status_msg.edit(content=f"{label}… ({elapsed}s elapsed)")
+            await _safe_edit(status_msg, f"{label}… ({elapsed}s elapsed)")
 
 
 # ---------------------------------------------------------------------------
@@ -465,7 +506,7 @@ async def ask(ctx: commands.Context, *, task: str):
 
     task_type = resp.get("task_type", "")
     await status_msg.edit(content=f"Got it [{task_type}] — working on it…")
-    asyncio.create_task(_poll_job(ctx, status_msg, job_id))
+    asyncio.create_task(_poll_job(ctx, status_msg, job_id)).add_done_callback(_on_poll_done)
 
 
 @bot.command(name="status")
@@ -1006,6 +1047,24 @@ async def skills_cmd(ctx: commands.Context, action: str = "list"):
     await ctx.send("\n".join(lines))
 
 
+@bot.command(name="restart", aliases=["reboot"])
+async def restart_services(ctx: commands.Context):
+    """Restart both the API and bot via the supervisor (!reboot also works)."""
+    # Persist the channel ID so the bot can announce when it's back online.
+    try:
+        _STATE_DIR.mkdir(parents=True, exist_ok=True)
+        _LAST_CHANNEL_FILE.write_text(str(ctx.channel.id))
+    except Exception as exc:
+        print(f"[bot] Could not write last_channel: {exc}")
+
+    await ctx.send("Restarting services — back in ~15 seconds...")
+
+    try:
+        await bot.client.restart()
+    except Exception:
+        pass  # Expected: the API may be killed before the response completes
+
+
 @bot.command(name="helpme")
 async def helpme(ctx: commands.Context):
     """Show available commands."""
@@ -1042,6 +1101,7 @@ async def helpme(ctx: commands.Context):
         "`!skills fetch` — Download latest skills from remote registry\n\n"
         "**Utilities:**\n"
         "`!git <status|log|diff|branch>` — Safe read-only git commands\n"
+        "`!restart` (or `!reboot`) — Restart both the API and bot via the supervisor\n"
         "`!helpme` — This help text\n"
     )
     await ctx.send(help_text)

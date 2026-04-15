@@ -1,4 +1,4 @@
-from fastapi import FastAPI, HTTPException, BackgroundTasks, Response
+from fastapi import FastAPI, HTTPException, BackgroundTasks, Response, Request
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from typing import Optional, List, Dict
@@ -990,6 +990,33 @@ async def get_llm_health():
         "resilience": diagnostics,
         "rate_limiter": rate_status,
         "cost": cost_summary,
+    }
+
+
+@app.post("/restart", status_code=202)
+async def request_restart(req: Request):
+    """Signal the supervisor to restart both services.
+
+    Writes .state/restart.flag at the project root; the supervisor polls for
+    it and performs an ordered shutdown → restart of the API and bot.
+
+    Only accepted from localhost — remote callers receive 403.
+    """
+    client_host = req.client.host if req.client else ""
+    if client_host not in ("127.0.0.1", "::1", "localhost"):
+        raise HTTPException(
+            status_code=403,
+            detail="Restart is only allowed from localhost",
+        )
+
+    flag = Path(__file__).parent.parent / ".state" / "restart.flag"
+    flag.parent.mkdir(parents=True, exist_ok=True)
+    flag.touch()
+
+    logger.info("restart_requested", client=client_host)
+    return {
+        "status": "restarting",
+        "message": "Restart flag written. Supervisor will restart services shortly.",
     }
 
 

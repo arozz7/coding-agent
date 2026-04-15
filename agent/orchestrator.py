@@ -449,10 +449,11 @@ class AgentOrchestrator:
         if not config:
             raise RuntimeError("No model configured")
 
-        raw = await asyncio.wait_for(
-            self.model_router.generate(prompt, config),
-            timeout=timeout_s,
-        )
+        # Pass timeout_s directly to httpx so the connection is forcibly closed
+        # if the model doesn't respond in time.  asyncio.wait_for() is unreliable
+        # for this in Python 3.12+ because it waits for cancellation to complete,
+        # which can hang indefinitely when httpx is mid-request.
+        raw = await self.model_router.generate(prompt, config, timeout=timeout_s)
 
         # Extract first word on first non-empty line
         first_line = next((ln.strip() for ln in raw.splitlines() if ln.strip()), "")
