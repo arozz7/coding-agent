@@ -69,6 +69,12 @@ _HEARTBEAT_INTERVAL = 5  # seconds
 _STALE_JOB_THRESHOLD = 45 * 60  # 45 minutes in seconds
 _JOBS_DB = None  # set after ROOT is known
 
+# API-unreachable watchdog: if GET /jobs has failed this many consecutive
+# stale-check cycles (each cycle is 5 min), assume the event loop is blocked
+# (e.g. httpx AsyncClient blocking the asyncio loop) and force a restart.
+_API_UNREACHABLE_MAX_CYCLES = 3   # 3 × 5 min = 15 min of unreachable API
+_api_unreachable_cycles: int = 0
+
 
 # ── Heartbeat & watchdog helpers ─────────────────────────────────────────────
 
@@ -81,18 +87,27 @@ def _write_heartbeat() -> None:
 
 
 def _check_stale_job() -> bool:
-    """Return True if any running job has been stuck in the same phase for
-    longer than _STALE_JOB_THRESHOLD seconds.
+    """Return True if any running job has been stuck for too long, OR if the
+    API has been unreachable for _API_UNREACHABLE_MAX_CYCLES consecutive checks.
+
+    A blocked asyncio event loop (e.g. httpx.AsyncClient stuck mid-read) makes
+    the entire FastAPI server unresponsive — GET /jobs will time out.  After
+    _API_UNREACHABLE_MAX_CYCLES consecutive failures we assume the server is
+    hung and force a restart.
 
     Uses the GET /jobs API endpoint so we don't need a direct SQLite import.
     """
+    global _api_unreachable_cycles
     try:
         with urllib.request.urlopen(
             f"{API_URL}/jobs?limit=5", timeout=3
         ) as resp:
             data = json.loads(resp.read())
+
+        # API is reachable — reset the unreachable counter.
+        _api_unreachable_cycles = 0
+
         jobs = data.get("jobs", [])
-        now = time.time()
         for job in jobs:
             if job.get("status") != "running":
                 continue
@@ -119,8 +134,23 @@ def _check_stale_job() -> bool:
                     return True
             except Exception:
                 pass
+
     except Exception:
-        pass
+        # GET /jobs failed — API may be unreachable (hung event loop, crash, etc.)
+        _api_unreachable_cycles += 1
+        print(
+            f"[supervisor] API unreachable during stale-check "
+            f"(cycle {_api_unreachable_cycles}/{_API_UNREACHABLE_MAX_CYCLES})"
+        )
+        if _api_unreachable_cycles >= _API_UNREACHABLE_MAX_CYCLES:
+            print(
+                "[supervisor] API has been unreachable for "
+                f"{_API_UNREACHABLE_MAX_CYCLES} consecutive checks "
+                "— event loop may be blocked, forcing restart"
+            )
+            _api_unreachable_cycles = 0
+            return True
+
     return False
 
 

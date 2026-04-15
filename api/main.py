@@ -560,19 +560,42 @@ async def list_models():
 
     router = _orchestrator.model_router
     active = router.get_active_model_name()
+
+    # Fetch live LM Studio model list once; fall back gracefully to empty.
+    lm_all: list[dict] = await router.ollama.list_all_models()
+    lm_state_by_id: dict[str, str] = {
+        m.get("id", ""): m.get("state", "unknown")
+        for m in lm_all
+    }
+
+    # Build configured-model entries with live state for local models.
+    configured_names: set[str] = set()
+    configured_entries = []
+    for c in router.configs:
+        configured_names.add(c.name)
+        entry: dict = {
+            "name": c.name,
+            "type": c.type,
+            "endpoint": c.endpoint,
+            "coding_optimized": c.is_coding_optimized,
+            "context_window": c.context_window,
+            "is_active": c.name == active,
+        }
+        if c.type == "local":
+            entry["state"] = lm_state_by_id.get(c.name, "unknown")
+        configured_entries.append(entry)
+
+    # LM Studio models that are downloaded but not yet in models.yaml.
+    lm_available = [
+        {"id": m.get("id", ""), "state": m.get("state", "unknown")}
+        for m in lm_all
+        if m.get("id", "") not in configured_names
+    ]
+
     return {
         "active_model": active,
-        "models": [
-            {
-                "name": c.name,
-                "type": c.type,
-                "endpoint": c.endpoint,
-                "coding_optimized": c.is_coding_optimized,
-                "context_window": c.context_window,
-                "is_active": c.name == active,
-            }
-            for c in router.configs
-        ],
+        "models": configured_entries,
+        "lm_studio_available": lm_available,
     }
 
 

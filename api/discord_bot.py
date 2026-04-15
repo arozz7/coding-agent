@@ -987,7 +987,7 @@ async def git_cmd(ctx: commands.Context, *, args: str):
 
 @bot.command(name="models")
 async def list_models(ctx: commands.Context):
-    """List all configured models and show which one is active."""
+    """List configured models with LM Studio state, plus all downloaded-but-unconfigured models."""
     try:
         data = await bot.client._get("/models")
     except Exception as exc:
@@ -995,15 +995,33 @@ async def list_models(ctx: commands.Context):
         return
 
     active = data.get("active_model") or "(default)"
-    lines = [f"**Models** · active: `{active}`\n"]
+    lines = [f"**Configured Models** · active: `{active}`\n"]
+
     for m in data.get("models", []):
         marker = "**[active]**" if m.get("is_active") else "       "
         name = m["name"]
         mtype = m.get("type", "?")
         ctx_k = m.get("context_window", 0) // 1000
-        lines.append(f"{marker} `{name}` — {mtype} · {ctx_k}k ctx")
+        state = m.get("state")
+        state_icon = " 🟢" if state == "loaded" else (" ⚪" if state == "not-loaded" else "")
+        lines.append(f"{marker} `{name}` — {mtype} · {ctx_k}k ctx{state_icon}")
+
     lines.append("\nUse `!model <name>` to switch · `!model reset` to restore default")
-    await ctx.send("\n".join(lines))
+
+    lm_available = data.get("lm_studio_available", [])
+    if lm_available:
+        lines.append("\n**Available in LM Studio (not configured)**")
+        for m in lm_available:
+            mid = m.get("id", "?")
+            state = m.get("state", "")
+            state_icon = " 🟢" if state == "loaded" else (" ⚪" if state == "not-loaded" else "")
+            lines.append(f"  `{mid}`{state_icon}")
+
+    # Discord message limit is 2000 chars; truncate if needed.
+    message = "\n".join(lines)
+    if len(message) > 1900:
+        message = message[:1900] + "\n…(truncated)"
+    await ctx.send(message)
 
 
 @bot.command(name="model")
