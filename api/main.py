@@ -385,7 +385,7 @@ async def start_task_background(request: TaskRequest):
                     phase="complete",
                     task_type=inner.get("task_type", task_type),
                     files_created=inner.get("files_created", []),
-                    summary=_summarize_response(full_response),
+                    summary=inner.get("job_summary") or _summarize_response(full_response),
                     _full_response=full_response,
                     screenshot_path=inner.get("screenshot_path"),
                 )

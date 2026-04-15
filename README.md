@@ -89,6 +89,7 @@ python -m api.discord_bot
 |---------|-------------|
 | `!ask <task>` | Submit a task — auto-classifies type, polls in background |
 | `!dev <task>` | Force develop path — bypasses classifier, guaranteed to run/fix/build |
+| `!research <task>` | Force research path — web search, codebase investigation, analysis; full report via `!result` |
 | `!continue [note]` | Resume the current debugging session with an optional note |
 
 ### Job Monitoring
@@ -173,7 +174,7 @@ Logan [APP]: Configured Models · active: qwen3.5-35b-a3b
 | `architect` | system design, write an ADR | High-level design and architecture decisions |
 | `chat` | everything else | General questions and conversation |
 
-> **Tip:** Use `!dev <task>` to force the develop path if the classifier picks the wrong type.
+> **Tip:** Use `!dev <task>` to force the develop path, or `!research <task>` to force the research path, if the classifier picks the wrong type.
 
 ---
 

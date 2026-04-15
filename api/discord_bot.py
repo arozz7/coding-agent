@@ -375,7 +375,8 @@ async def _poll_job(ctx: commands.Context, status_msg: discord.Message, job_id: 
     _last_phase = ""
 
     # Task types whose full response should be shown inline in the channel.
-    _INLINE_TYPES = {"chat", "research", "plan"}
+    # Research is intentionally excluded — long reports go via !result.
+    _INLINE_TYPES = {"chat", "plan"}
 
     while True:
         await asyncio.sleep(POLL_INTERVAL)
@@ -560,6 +561,17 @@ async def dev(ctx: commands.Context, *, task: str):
     build task — e.g. `!dev fix the TypeScript errors and get the game running`.
     """
     await _submit_task(ctx, task, force_task_type="develop")
+
+
+@bot.command(name="research")
+async def research(ctx: commands.Context, *, task: str):
+    """Submit a task and force it to be treated as a research task (bypass classifier).
+
+    Use this for web searches, codebase investigations, and analysis tasks —
+    e.g. `!research how does the context bridge work in orchestrator.py`.
+    The full report is available via `!result`.
+    """
+    await _submit_task(ctx, task, force_task_type="research")
 
 
 @bot.command(name="continue")

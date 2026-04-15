@@ -885,6 +885,7 @@ class AgentOrchestrator:
 
         all_responses: list[str] = []
         all_files: list[str] = []
+        task_summaries: list[str] = []
         screenshot_path: Optional[str] = None
         task_num = 0
 
@@ -963,6 +964,11 @@ class AgentOrchestrator:
                     if task_id:
                         self.task_store.update_task(task_id, "done", result_summary)
 
+                    # Collect a one-line summary per task for the Discord Done message.
+                    completion_summary = result.get("completion_summary", "").strip()
+                    short = completion_summary or response_text[:80].replace("\n", " ").strip()
+                    task_summaries.append(f"✅ **{description[:60]}** — {short}")
+
                     # Persist subtask learnings to wiki so later tasks can reference them.
                     try:
                         await self.skill_executor.execute_post(
@@ -975,6 +981,7 @@ class AgentOrchestrator:
                     all_responses.append(
                         f"**Task {task_num}: {description[:60]}** — failed: {error}"
                     )
+                    task_summaries.append(f"❌ **{description[:60]}** — {error[:80]}")
                     if task_id:
                         self.task_store.update_task(task_id, "failed", error)
                     self.logger.warning(
@@ -994,12 +1001,14 @@ class AgentOrchestrator:
                 all_responses.append(
                     f"**Task {task_num}: {description[:60]}** — error: {exc}"
                 )
+                task_summaries.append(f"❌ **{description[:60]}** — {str(exc)[:80]}")
 
             # Safety guard for no-persistence mode
             if not job_id and task_num >= len(task_specs):
                 break
 
         combined = "\n\n---\n\n".join(all_responses) if all_responses else "(no output)"
+        job_summary = "\n".join(task_summaries) if task_summaries else ""
         # Deduplicate files while preserving order
         seen: set[str] = set()
         unique_files: list[str] = []
@@ -1019,6 +1028,7 @@ class AgentOrchestrator:
             "files_created": unique_files,
             "screenshot_path": screenshot_path,
             "task_count": total,
+            "job_summary": job_summary,
         }
 
     def _build_context_from_events(self, session_id: str) -> str:
@@ -1200,6 +1210,7 @@ class AgentOrchestrator:
                         "skill_reports": post_skill_reports,
                         "screenshot_path": result.get("screenshot_path"),
                         "handover_bridge": handover_bridge,
+                        "job_summary": result.get("job_summary", ""),
                     },
                 }
             else:

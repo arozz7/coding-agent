@@ -158,6 +158,21 @@ This phase hardened the runtime reliability of the coding agent across four area
 
 ---
 
+### Discord Output Summary + `!research` Command
+
+#### `agent/orchestrator.py`
+- `_run_task_loop`: collects a one-line `completion_summary` per task (from the developer agent's `## DONE` block, falling back to the first 80 chars of response text). Appends `✅/❌ **description** — summary` to `task_summaries`. Builds `job_summary` from all entries; returned as `"job_summary"` in the result dict.
+- `run_task` inner result dict: passes `"job_summary": result.get("job_summary", "")` through so `main.py` can read it.
+
+#### `api/main.py`
+- `_run()`: `summary` field in the job-store update now prefers `inner.get("job_summary")` over `_summarize_response(full_response)`. For multi-task dev/research jobs, Discord's Done message now shows a structured per-task status list instead of the first 500 chars of verbose agent output.
+
+#### `api/discord_bot.py`
+- Added `!research <task>` command: forces `force_task_type="research"`, analogous to `!dev` for the develop path.
+- Removed `"research"` from `_INLINE_TYPES` (was `{"chat", "research", "plan"}`). Research responses now use the summary+`!result` flow — the full report is available via `!result` rather than streamed inline.
+
+---
+
 ## Root Causes Fixed (Follow-on)
 
 | Bug | Root Cause | Fix |
