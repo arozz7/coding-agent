@@ -41,7 +41,7 @@ RESTART_FLAG = STATE_DIR / "restart.flag"
 
 # ── Configuration ─────────────────────────────────────────────────────────────
 
-API_URL = os.getenv("AGENT_API_URL", "http://localhost:5005")
+API_URL = os.getenv("AGENT_API_URL", "http://127.0.0.1:5005")
 _HEALTH_URL = f"{API_URL}/health"
 RESTART_DELAY = int(os.getenv("RESTART_DELAY_SECS", "3"))
 API_STARTUP_TIMEOUT = int(os.getenv("API_STARTUP_TIMEOUT", "120"))

@@ -24,7 +24,7 @@ import httpx
 from discord import Intents, Message, File
 from discord.ext import commands
 
-API_URL = os.getenv("AGENT_API_URL", "http://localhost:5005")
+API_URL = os.getenv("AGENT_API_URL", "http://127.0.0.1:5005")
 POLL_INTERVAL = int(os.getenv("BOT_POLL_INTERVAL", "5"))  # seconds
 
 # State directory shared with supervisor.py (one level up from api/)
