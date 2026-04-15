@@ -3,6 +3,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 import os
+import re
 import subprocess
 import structlog
 
@@ -318,12 +319,15 @@ class AgentOrchestrator:
             "run the app", "run the server", "run the project", "run the code",
             "run and test", "launch the", "start the app", "start the server",
             "start the game", "start the project",
-            "debug the", "debug it", "debugging the",
+            "debug the", "debug it", "debug and", "debugging",
             "fix the runtime", "fix the error", "fix the errors", "fix the bug",
             "fix the bugs", "fix and run", "fix this error", "fix these errors",
+            "fix the code errors", "fix code errors", "fix all errors",
             "there are still errors", "still not running", "not starting",
             "can't run", "cannot run", "won't run", "fails to run",
             "fails to start", "failing to run",
+            "get it running", "get the game running", "get the app running",
+            "get the server running", "get the project running", "get it working",
             # Execution / build phrases commonly missed by above
             "run the build", "running the build", "try running", "run it",
             "run with verbose", "run with", "run verbose",
@@ -464,12 +468,44 @@ class AgentOrchestrator:
 
         return candidate
 
+    # Strong develop signals that the LLM classifier sometimes mislabels as chat.
+    # If any of these match we skip the LLM call entirely and return "develop".
+    _DEFINITIVE_DEVELOP = re.compile(
+        r"""
+        \b(
+            fix\s+the\s+(code\s+)?errors?         # "fix the errors" / "fix the code errors"
+          | fix\s+(all\s+)?the\s+bugs?             # "fix the bugs"
+          | fix\s+(?:and\s+)?run                   # "fix and run"
+          | get\s+\S+\s+running                    # "get the game running"
+          | get\s+it\s+running                     # "get it running"
+          | debugging                              # bare "debugging"
+          | debug\s+(?:and|the|it|this)            # "debug the", "debug it"
+          | run\s+the\s+(app|game|server|project|code|build|application|program)
+          | npm\s+(run|install|start|build)
+          | (start|launch)\s+the\s+(app|server|game|bot|project)
+          | build\s+(the\s+)?(app|project|code|game|server|it)
+          | compile\s+the
+          | there\s+are\s+(still\s+)?errors?
+          | still\s+(not\s+)?(?:running|working|compiling|building)
+          | can.?t\s+(run|start|launch|compile|build)
+          | won.?t\s+(run|start|launch|compile|build)
+        )\b
+        """,
+        re.VERBOSE | re.IGNORECASE,
+    )
+
     async def _detect_task_type(self, task: str) -> str:
         """Return the most appropriate agent role for this task.
 
-        Tries the LLM classifier first; falls back to keyword matching on
-        any failure (timeout, model unavailable, unexpected output).
+        Runs a definitive-develop regex first (fast, no LLM call) to catch
+        common patterns the LLM mislabels.  If that matches, returns "develop"
+        immediately.  Otherwise tries the LLM classifier and falls back to
+        keyword matching on any failure.
         """
+        if self._DEFINITIVE_DEVELOP.search(task):
+            self.logger.info("task_type_definitive", task_type="develop")
+            return "develop"
+
         try:
             result = await self._detect_task_type_llm(task)
             self.logger.info("task_type_llm", task_type=result)
@@ -1014,6 +1050,7 @@ class AgentOrchestrator:
         include_history: bool = True,
         on_phase: Optional[Callable[[str], None]] = None,
         job_id: Optional[str] = None,
+        force_task_type: Optional[str] = None,
     ) -> dict:
         """Run a task and return the agent result.
 
@@ -1072,13 +1109,19 @@ class AgentOrchestrator:
                 self.logger.error("handover_failed", error=str(_he))
                 # Continue with the old session rather than aborting the task.
 
-        # Run LLM classifier and context building in parallel to save wall time.
+        # Resolve task type.  force_task_type bypasses the classifier entirely —
+        # useful for Discord commands like !dev that guarantee the type is known.
+        # Otherwise run the LLM classifier and context building in parallel.
         _emit_phase("preparing")
         import asyncio as _asyncio
-        task_type, _ = await _asyncio.gather(
-            self._detect_task_type(task),
-            self._build_enriched_context(task),  # warm the RAG cache
-        )
+        if force_task_type:
+            task_type = force_task_type
+            await self._build_enriched_context(task)   # warm cache only
+        else:
+            task_type, _ = await _asyncio.gather(
+                self._detect_task_type(task),
+                self._build_enriched_context(task),  # warm the RAG cache
+            )
         # Re-build properly below (we discard the result here; context is
         # re-built inside _run_specialized_agent to pass it correctly).
 

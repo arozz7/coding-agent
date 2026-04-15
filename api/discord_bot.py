@@ -194,10 +194,17 @@ class AgentClient:
             r.raise_for_status()
             return r.json()
 
-    async def start_task(self, task: str, session_id: Optional[str] = None) -> dict:
+    async def start_task(
+        self,
+        task: str,
+        session_id: Optional[str] = None,
+        force_task_type: Optional[str] = None,
+    ) -> dict:
         payload: dict = {"task": task}
         if session_id:
             payload["session_id"] = session_id
+        if force_task_type:
+            payload["force_task_type"] = force_task_type
         return await self._post("/task/start", payload)
 
     async def get_job(self, job_id: str) -> dict:
@@ -482,16 +489,19 @@ async def _poll_job(ctx: commands.Context, status_msg: discord.Message, job_id: 
 # Commands
 # ---------------------------------------------------------------------------
 
-@bot.command(name="ask")
-async def ask(ctx: commands.Context, *, task: str):
-    """Submit a task. The agent works in the background — this message updates live."""
+async def _submit_task(
+    ctx: commands.Context,
+    task: str,
+    force_task_type: Optional[str] = None,
+) -> None:
+    """Shared submit logic for !ask and !dev."""
     user_id = str(ctx.author.id)
     session_id = bot.user_sessions.get(user_id, user_id)
 
     status_msg = await ctx.send("Submitting…")
 
     try:
-        resp = await bot.client.start_task(task, session_id)
+        resp = await bot.client.start_task(task, session_id, force_task_type=force_task_type)
     except Exception as exc:
         await status_msg.edit(content=f"Could not reach agent: {exc}")
         return
@@ -507,6 +517,54 @@ async def ask(ctx: commands.Context, *, task: str):
     task_type = resp.get("task_type", "")
     await status_msg.edit(content=f"Got it [{task_type}] — working on it…")
     asyncio.create_task(_poll_job(ctx, status_msg, job_id)).add_done_callback(_on_poll_done)
+
+
+@bot.command(name="ask")
+async def ask(ctx: commands.Context, *, task: str):
+    """Submit a task. The agent works in the background — this message updates live."""
+    await _submit_task(ctx, task)
+
+
+@bot.command(name="dev")
+async def dev(ctx: commands.Context, *, task: str):
+    """Submit a task and force it to be treated as a develop task (bypass classifier).
+
+    Use this when the classifier keeps picking chat/research for a debugging or
+    build task — e.g. `!dev fix the TypeScript errors and get the game running`.
+    """
+    await _submit_task(ctx, task, force_task_type="develop")
+
+
+@bot.command(name="continue")
+async def continue_task(ctx: commands.Context, *, note: str = ""):
+    """Continue fixing the last task.  Use when the build still has errors after !ask/!dev.
+
+    Optionally pass extra guidance: `!continue focus on the webpack config errors`.
+    The session context carries forward so the agent knows what was already tried.
+    """
+    user_id = str(ctx.author.id)
+    last_job_id = bot.user_jobs.get(user_id)
+    if not last_job_id:
+        await ctx.send("No previous job found. Use `!ask` or `!dev` to start one.")
+        return
+
+    # Fetch the last job to pull the original task text
+    try:
+        last_job = await bot.client.get_job(last_job_id)
+    except Exception as exc:
+        await ctx.send(f"Could not fetch last job: {exc}")
+        return
+
+    original_task = last_job.get("task", "the previous task")
+    continuation = (
+        f"Continue debugging from where we left off. "
+        f"The original task was: {original_task}. "
+        f"The build still has errors. Keep fixing until it compiles and runs cleanly."
+    )
+    if note:
+        continuation += f" Additional guidance: {note}"
+
+    await _submit_task(ctx, continuation, force_task_type="develop")
 
 
 @bot.command(name="status")
@@ -1072,6 +1130,8 @@ async def helpme(ctx: commands.Context):
         "**Agent Commands**\n\n"
         "**Core workflow:**\n"
         "`!ask <task>` — Submit a task. Agent works in background; this message updates live.\n"
+        "`!dev <task>` — Same as !ask but forces develop mode (use for debug/build/fix tasks).\n"
+        "`!continue [note]` — Continue fixing the last job when errors remain.\n"
         "`!status` — Check your current job's status and phase\n"
         "`!cancel` — Cancel your running job\n\n"
         "**Viewing results:**\n"

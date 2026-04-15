@@ -117,6 +117,7 @@ class TaskRequest(BaseModel):
     task: str
     session_id: Optional[str] = None
     include_history: bool = True
+    force_task_type: Optional[str] = None  # bypass classifier when set
 
 
 class TaskResponse(BaseModel):
@@ -296,9 +297,13 @@ async def start_task_background(request: TaskRequest):
     job_id = f"job_{uuid.uuid4().hex[:12]}"
     session_id = request.session_id or f"session_{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}"
 
-    # Use keyword classifier for instant response (0 ms) — the LLM classifier
-    # runs later inside run_task() in parallel with context building.
-    task_type = _orchestrator._detect_task_type_keyword(request.task)
+    # Use force_task_type when provided; otherwise keyword-classify for instant
+    # response (0 ms) — the LLM classifier runs later inside run_task() in
+    # parallel with context building.
+    if request.force_task_type:
+        task_type = request.force_task_type
+    else:
+        task_type = _orchestrator._detect_task_type_keyword(request.task)
     _phase_labels = {
         "develop": "developing",
         "review": "reviewing",
@@ -330,6 +335,7 @@ async def start_task_background(request: TaskRequest):
                 include_history=request.include_history,
                 on_phase=_on_phase,
                 job_id=job_id,
+                force_task_type=request.force_task_type,
             )
             if result.get("success"):
                 inner = result.get("result", {})

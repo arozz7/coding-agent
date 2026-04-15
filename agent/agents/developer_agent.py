@@ -17,7 +17,17 @@ _INLINE_CMD_RE = re.compile(
     re.MULTILINE | re.IGNORECASE,
 )
 
-MAX_FIX_ITERATIONS = 5
+MAX_FIX_ITERATIONS = 10
+
+# Maximum characters of error output sent to the LLM per iteration.
+# TypeScript / webpack errors repeat the same stack endlessly — cap them
+# so we don't blow up the context window on iteration 3+.
+_MAX_ERROR_CHARS = 4000
+
+# Maximum number of fix-attempt prose blocks accumulated into the response
+# string.  Older blocks are replaced with a placeholder to keep the string
+# from growing unboundedly across 10 iterations.
+_MAX_RESPONSE_HISTORY = 3
 
 # Screenshot is triggered only when the task explicitly requests a browser capture.
 _SCREENSHOT_RE = re.compile(
@@ -294,9 +304,16 @@ Summary: <one sentence>
                 verify_cmd = first_line[2:].strip()
 
             files_fixed_history: list[str] = []
+            # Track how many fix-attempt blocks have been appended to response.
+            fix_attempt_blocks: int = 0
 
             for _attempt in range(MAX_FIX_ITERATIONS):
-                error_summary = "\n\n".join(failed_outputs)
+                # Trim error text: TypeScript / webpack errors can be thousands of
+                # repeated lines.  Keep the tail (most recent errors) not the head.
+                raw_errors = "\n\n".join(failed_outputs)
+                if len(raw_errors) > _MAX_ERROR_CHARS:
+                    raw_errors = "…(truncated)…\n" + raw_errors[-_MAX_ERROR_CHARS:]
+
                 history_note = (
                     f"\nFiles already modified in prior fix attempts: {', '.join(files_fixed_history)}\n"
                     if files_fixed_history
@@ -308,7 +325,7 @@ Summary: <one sentence>
                     f"The following commands are still failing (attempt {_attempt + 1}/{MAX_FIX_ITERATIONS}).\n"
                     f"{history_note}"
                     f"Fix the source files:\n\n"
-                    f"```\n{error_summary}\n```\n\n"
+                    f"```\n{raw_errors}\n```\n\n"
                     f"Write ONLY FILE: blocks to fix the errors. "
                     f"Do NOT include shell blocks — the system will re-run the build automatically after your fixes.\n"
                     f"Fix ALL errors shown above, not just the first one."
@@ -333,7 +350,24 @@ Summary: <one sentence>
 
                 files_fixed_history.extend(f for f in iteration_files if f not in files_fixed_history)
 
-                response += f"\n\n**Fix attempt {_attempt + 1}:**\n" + fix_response
+                # Cap accumulated fix-attempt prose to avoid unbounded growth.
+                # Once we hit the limit, replace the oldest block with a summary.
+                if fix_attempt_blocks < _MAX_RESPONSE_HISTORY:
+                    response += f"\n\n**Fix attempt {_attempt + 1}:**\n" + fix_response
+                    fix_attempt_blocks += 1
+                else:
+                    # Drop the oldest block by rewriting from the N-th marker.
+                    marker = "\n\n**Fix attempt "
+                    # Find the first fix-attempt marker and remove up to the second.
+                    first = response.find(marker)
+                    second = response.find(marker, first + 1) if first != -1 else -1
+                    if second != -1:
+                        response = (
+                            response[:first]
+                            + f"\n\n*(earlier fix attempts omitted)*"
+                            + response[second:]
+                        )
+                    response += f"\n\n**Fix attempt {_attempt + 1}:**\n" + fix_response
 
                 # Always re-run the original failing command to verify — do not
                 # rely on the LLM including a shell block in its fix response.
