@@ -72,20 +72,30 @@ class InteractiveShellTool:
         # AGENT_EFFECTIVE_WORKSPACE may point at a project subdir and is mutable,
         # so we anchor validation to WORKSPACE_PATH.
         configured_root = os.getenv("WORKSPACE_PATH", "./workspace")
-        allowed_root_real = os.path.realpath(configured_root)
-        if not os.path.isdir(allowed_root_real):
+        try:
+            allowed_root = Path(configured_root).resolve(strict=True)
+        except FileNotFoundError as e:
+            raise ValueError("Configured workspace root does not exist") from e
+
+        if not allowed_root.is_dir():
             raise ValueError("Configured workspace root does not exist")
 
         # Canonicalize and validate workspace_path at the sink (defense in depth).
-        # realpath resolves symlinks and normalizes traversal segments before checks.
-        candidate_real = os.path.realpath(workspace_path)
-        if not os.path.isdir(candidate_real):
+        # resolve(strict=True) normalizes traversal and resolves symlinks.
+        try:
+            candidate = Path(workspace_path).resolve(strict=True)
+        except FileNotFoundError as e:
+            raise ValueError("workspace_path must be an existing directory") from e
+
+        if not candidate.is_dir():
             raise ValueError("workspace_path must be an existing directory")
 
-        if os.path.commonpath([allowed_root_real, candidate_real]) != allowed_root_real:
-            raise ValueError("workspace_path must be within the configured workspace root")
+        try:
+            candidate.relative_to(allowed_root)
+        except ValueError as e:
+            raise ValueError("workspace_path must be within the configured workspace root") from e
 
-        self.workspace = Path(candidate_real)
+        self.workspace = candidate
         self.logger = logger.bind(component="interactive_shell_tool")
 
     async def run(
