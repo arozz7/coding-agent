@@ -68,8 +68,10 @@ class InteractiveShellTool:
     """
 
     def __init__(self, workspace_path: str):
-        candidate = Path(workspace_path).resolve()
-        allowed_root = Path(os.getenv("WORKSPACE_PATH", "./workspace")).resolve()
+        # Resolve both paths before comparison to prevent traversal/symlink tricks.
+        candidate = Path(workspace_path).resolve(strict=False)
+        configured_root = os.getenv("AGENT_EFFECTIVE_WORKSPACE") or os.getenv("WORKSPACE_PATH", "./workspace")
+        allowed_root = Path(configured_root).resolve(strict=False)
         try:
             candidate.relative_to(allowed_root)
         except ValueError:
