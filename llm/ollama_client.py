@@ -61,6 +61,19 @@ class OllamaClient:
         url = self._get_chat_endpoint()
         self.logger.info("ollama_generate_start", model=model, prompt_len=len(prompt), url=url)
 
+        # Pre-flight: check the LM Studio model state before committing to a
+        # 600-second httpx timeout.  If the model is not "loaded" we raise
+        # ModelNotReadyError immediately so model_router applies its 120s
+        # patience retry loop instead of burning the full timeout window
+        # (~10 min) per attempt.  check_model_state has a 5-second timeout so
+        # it adds negligible overhead on the happy path.
+        state = await self.check_model_state(model)
+        if state is not None and state != "loaded":
+            raise ModelNotReadyError(
+                f"Model {model!r} is not loaded (state={state!r}); "
+                "will retry after LM Studio reload"
+            )
+
         # Use asyncio.wait_for as a hard wall-clock guard.  httpx's per-operation
         # timeout resets whenever LM Studio sends a byte (e.g. chunked keepalives
         # while reloading a TTL-expired model), so it alone cannot prevent multi-hour

@@ -209,6 +209,7 @@ This phase hardened the runtime reliability of the coding agent across four area
 | Timeout retries waste 1800s (3× 600s) before failing | Generic `except Exception` in `model_router.generate` retried all errors including timeouts | Timeout errors (containing "timeout" in message) now fail fast without retry |
 | Shell commands block event loop; `/health` becomes unreachable; supervisor kills API | `tool_executor.py` called sync `tool_func(input)` directly on the asyncio thread; `subprocess.run(timeout=60)` blocks the loop for up to 60s | `await asyncio.to_thread(tool_func, input)` moves sync tools off the event loop |
 | LM Studio model crash treated as retriable error with 1-2s backoff instead of 120s patience | HTTP 400 body contains "crashed" but string not in `_MODEL_NOT_READY_HINTS` | Added `"crashed"` to `_MODEL_NOT_READY_HINTS`; crash errors now raise `ModelNotReadyError` → 120s wait × 3 |
+| LM Studio crash during generation causes 10-min stall per task (600s hard timeout) | `generate()` commits to httpx call before checking whether the model is loaded; unresponsive LM Studio burns the full timeout window per attempt | Pre-flight `check_model_state()` (5s timeout) in `ollama_client.generate()`; raises `ModelNotReadyError` immediately if state ≠ "loaded" so the 120s patience loop triggers instead of the 600s timeout path |
 
 ---
 
