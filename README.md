@@ -10,6 +10,7 @@ An autonomous coding agent with LLM integration, multi-agent orchestration, SDLC
 - **SDLC Pipeline** — Full plan → build → test → debug → run → verify workflow
 - **Autonomous Run & Debug** — Agent runs shell commands, reads errors, fixes code, re-runs automatically; configurable iteration limit (default 50, set `MAX_FIX_ITERATIONS` in `.env`)
 - **Multi-Agent Routing** — Tasks routed to the right agent automatically: developer, researcher, planner, tester, reviewer, architect, chat
+- **Iterative Research** — Research agent decomposes queries into sub-questions, runs parallel web searches, identifies gaps, and synthesises a structured report; fast-path for local codebase queries
 - **Context Bridge** — Monitors token budget; at 82 % generates a structured handover and continues in a fresh session silently; Discord notifies at 75 %
 - **LM Studio Integration** — Live model state (loaded / not-loaded) from `/api/v0/models`; discovers downloaded-but-unconfigured models; per-call thinking mode control
 - **Local & Cloud LLM** — Flexible routing between LM Studio / Ollama (local) and OpenRouter / OpenAI-compatible APIs; circuit breaker, rate limiting, auto-fallback
@@ -151,6 +152,18 @@ Logan [APP]: Done [develop] · 92s
               Fixed TypeError: cannot read property 'length' of undefined
               Files: src/game.js
 
+Zeus: !research compare LangChain and LlamaIndex for RAG pipelines
+
+Logan [APP]: Preparing… (2s)
+Logan [APP]: researching:planning (3s)
+Logan [APP]: researching:searching (5 questions) (8s)
+Logan [APP]: researching:checking gaps (42s)
+Logan [APP]: researching:follow-up (2 queries) (58s)
+Logan [APP]: researching:synthesizing (74s)
+Logan [APP]: Done [research] · 89s
+              ✅ Compare LangChain and LlamaIndex for RAG pipelines — see !result for full report
+Logan [APP]: Use `!result` to read the full report.
+
 Zeus: !models
 Logan [APP]: Configured Models · active: qwen3.5-35b-a3b
               **[active]** `qwen3.5-35b-a3b` — local · 262k ctx 🟢
@@ -166,7 +179,7 @@ Logan [APP]: Configured Models · active: qwen3.5-35b-a3b
 | Type | Triggered by | What it does |
 |------|-------------|--------------|
 | `develop` | implement, fix, run, build, debug, npm, compile, execute | Writes files, runs shell commands, auto-fixes errors (up to 10 iterations) |
-| `research` | search for, find where, how does, investigate | Reads files, searches web, synthesises reports |
+| `research` | search for, find where, how does, investigate | **Iterative research**: decomposes query → parallel web searches → gap analysis → synthesis. Fast-path for local-only tasks. Full report via `!result` |
 | `sdlc` | build me a complete, end-to-end | Full plan→build→test→debug→run→verify pipeline |
 | `plan` | plan first, show me a plan, before we build | Architecture plan before any code is written |
 | `test` | write tests, run tests, pytest | Writes and runs test suites |

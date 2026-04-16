@@ -162,6 +162,17 @@ Force the **develop** path — bypasses the LLM classifier entirely. Use this wh
 !dev fix the TypeScript errors in src/index.ts
 ```
 
+#### `!research <task>`
+Force the **research** path — bypasses the LLM classifier. Runs the full iterative research flow (decompose → parallel search → gap analysis → synthesize). Use when the classifier routes a research task to chat or develop.
+
+```
+!research how does the context bridge work in orchestrator.py
+!research compare Playwright vs Puppeteer for automated browser testing
+!research latest breaking changes in Next.js 15
+```
+
+The Done message shows a one-line summary. Use `!result` to read the full report.
+
 #### `!continue [note]`
 Resume the current active debugging session. Optionally attach a note to guide the next iteration.
 
@@ -308,7 +319,7 @@ The agent auto-classifies every `!ask` task into one of these types:
 | Type | When it fires | What happens |
 |------|--------------|--------------|
 | `develop` | Write, fix, run, build, debug, compile, npm, execute | `DeveloperAgent` — writes files, runs shell, fix loop up to 10 iterations |
-| `research` | Investigate, find, explain, search for, how does | `ResearchAgent` — reads files, web search, synthesis report |
+| `research` | Investigate, find, explain, search for, how does | `ResearchAgent` — iterative: decomposes → parallel web search → gap analysis → synthesis. Fast-path for local file tasks. Full report via `!result` |
 | `plan` | Plan first, show me a plan, roadmap | `PlanAgent` — creates implementation plan without writing code |
 | `sdlc` | Build me a complete app, end-to-end | Full SDLC pipeline: plan → build → test → debug → run → verify |
 | `test` | Write tests, pytest, unit tests | `TesterAgent` — writes and runs test suites |
@@ -316,7 +327,58 @@ The agent auto-classifies every `!ask` task into one of these types:
 | `architect` | System design, write an ADR | `ArchitectAgent` — high-level design decisions |
 | `chat` | Everything else | `ChatAgent` — conversational Q&A (no file tools) |
 
-**Pre-LLM keyword fast-path:** Common develop patterns (fix, run, npm, build, compile, debug) are classified immediately without an LLM call. Use `!dev` to force the develop path if auto-classification is wrong.
+**Pre-LLM keyword fast-path:** Common develop patterns (fix, run, npm, build, compile, debug) are classified immediately without an LLM call. Use `!dev` to force the develop path, or `!research` to force the research path, if auto-classification is wrong.
+
+---
+
+## Iterative Research
+
+The research agent uses a multi-step approach inspired by deep-research systems for web-facing tasks:
+
+### Flow
+
+```
+1. Decompose   LLM breaks the task into 3–5 focused sub-questions
+                (thinking disabled — structured output, no trace needed)
+
+2. Search      asyncio.gather runs web search + top-page deep-fetch
+                for each sub-question in parallel
+                (one failed search doesn't block the others)
+
+3. Gap check   LLM reviews gathered content and identifies up to 2
+                follow-up queries for missing information
+                (thinking disabled)
+
+4. Follow-up   Parallel searches for the identified gaps (max 2)
+
+5. Synthesize  Single LLM call over all gathered content produces
+                a structured report (Summary / Sources / Findings / Dependencies)
+```
+
+### Fast path
+
+If the task references local files and contains no web-trigger keywords (latest, news, released, search for…), the agent skips decomposition and runs a single-pass synthesis directly. This keeps simple codebase questions fast.
+
+Examples:
+- **Iterative path:** `!research best practices for async Python error handling` → decomposes + 5 parallel web searches
+- **Fast path:** `!research how does orchestrator.py handle the context bridge` → reads the file, single synthesis
+
+### Limits
+
+| Parameter | Value |
+|-----------|-------|
+| Max sub-questions | 5 |
+| Max follow-up queries | 2 |
+| Total web content budget | 14 000 chars |
+| Per search-result snippet | 1 200 chars |
+| Per deep-fetched page | 1 500 chars |
+
+### Viewing the full report
+
+The Done message shows a one-line summary. The full structured report is always available via:
+```
+!result
+```
 
 ---
 
@@ -352,6 +414,7 @@ The agent handles this automatically:
 - **Classifier calls** always pass `enable_thinking=False` — no 10-30 min thinking trace for a one-word answer
 - **All coding, planning, and review calls** use the model's default thinking setting (enabled)
 - **Wiki synthesis** passes `enable_thinking=False` — structured output doesn't benefit from deep reasoning
+- **Research decompose & gap-analysis calls** pass `enable_thinking=False` — both produce structured lists (numbered queries), not prose reasoning
 
 You should not set `enable_thinking: false` in `models.yaml` — that would disable thinking globally for all tasks.
 
@@ -566,4 +629,4 @@ Get-Content logs\bot-20260415-120005.log -Wait   # tail the latest bot log
 
 ---
 
-*Last updated: 2026-04-15 — Phase 18*
+*Last updated: 2026-04-15 — Phase 18 (iterative research agent)*
