@@ -80,10 +80,16 @@ class InteractiveShellTool:
         if not allowed_root.is_dir():
             raise ValueError("Configured workspace root does not exist")
 
+        # Validate untrusted input shape/content before path construction.
+        if not isinstance(workspace_path, str) or not workspace_path.strip():
+            raise ValueError("workspace_path must be a non-empty string")
+        if "\x00" in workspace_path:
+            raise ValueError("workspace_path contains invalid characters")
+
         # Canonicalize and validate workspace_path at the sink (defense in depth).
         # resolve(strict=True) normalizes traversal and resolves symlinks.
         try:
-            candidate = Path(workspace_path).resolve(strict=True)
+            candidate = Path(workspace_path.strip()).resolve(strict=True)
         except FileNotFoundError as e:
             raise ValueError("workspace_path must be an existing directory") from e
 
