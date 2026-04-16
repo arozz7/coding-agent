@@ -64,14 +64,16 @@ python -m pip install -e .
 | `API_STARTUP_TIMEOUT` | No | `120` | Seconds supervisor waits for `/health` on startup |
 | `RESTART_DELAY_SECS` | No | `3` | Seconds between stop and start during a supervisor restart |
 | `MAX_FIX_ITERATIONS` | No | `50` | Maximum fix-loop iterations the developer agent will attempt before giving up on a build error |
+| `BOT_STATUS_CHANNEL_ID` | No | — | Discord channel ID for model-switch alerts (e.g. when the agent falls back from local to remote). Leave unset to disable |
 
 ### Model Configuration (`config/models.yaml`)
 
 ```yaml
 models:
-  # Local model via LM Studio or Ollama
+  # Local model via LM Studio
   - name: qwen3.5-35b-a3b
     type: local
+    provider: lmstudio             # lmstudio | ollama | llama_cpp
     endpoint: ${LM_STUDIO_URL:-http://127.0.0.1:1234}  # supports ${VAR:-default}
     context_window: 262144
     is_coding_optimized: true
@@ -91,6 +93,13 @@ defaults:
   coding_model: qwen3.5-35b-a3b      # used for all develop/plan/test tasks
   planning_model: google_gemma-4-31b-it
   fallback_model: openai/gpt-oss-120b:free
+
+  # Local model runtime behaviour
+  local_runtime:
+    single_model_only: true          # unload other local models before loading a new one
+    load_timeout_secs: 300           # how long to wait for a model to become loaded
+    load_poll_interval_secs: 10      # polling cadence while waiting
+    max_load_attempts: 2             # attempts before switching to remote fallback
 ```
 
 **Key fields:**
@@ -98,7 +107,8 @@ defaults:
 | Field | Description |
 |-------|-------------|
 | `name` | Must exactly match the model ID in LM Studio / OpenRouter |
-| `type` | `local` (Ollama/LM Studio) or `remote` (OpenRouter/OpenAI-compatible) |
+| `type` | `local` (LM Studio/Ollama) or `remote` (OpenRouter/OpenAI-compatible) |
+| `provider` | Backend for local models: `lmstudio` (default), `ollama`, or `llama_cpp`. Controls whether the programmatic load/unload API is available |
 | `endpoint` | API base URL; supports `${ENV_VAR:-default}` syntax |
 | `context_window` | Token limit — used by the context bridge to decide when to hand over |
 | `is_coding_optimized` | Marks model as preferred for coding tasks |
@@ -420,12 +430,26 @@ You should not set `enable_thinking: false` in `models.yaml` — that would disa
 
 ### Model Fallback
 
-If a local model is unavailable (HTTP 503 / "model not loaded"):
-1. Supervisor logs `model_not_ready_waiting`, waits 120s, retries up to 3 times
-2. After 3 failed attempts, falls back to the next available local model
-3. If no local fallback, falls back to the configured `fallback_model` in `models.yaml`
+When a local model is `not-loaded` (pre-flight check via LM Studio `/api/v0/models`):
 
-Timeout errors fail immediately without retry (a second attempt at 600s is wasteful).
+**LM Studio provider** (`provider: lmstudio`):
+1. The agent calls `POST /api/v1/models/unload` for any other loaded local models (when `single_model_only: true`) to free VRAM
+2. Calls `POST /api/v1/models/load` to trigger the load
+3. Polls `check_model_state()` every `load_poll_interval_secs` until `"loaded"` or `load_timeout_secs` expires
+4. If loaded: retries the original request immediately
+5. After `max_load_attempts` failures: walks the **full fallback chain** (other local models first, then remote models in config order — only remotes with a valid API key are used)
+
+**Other backends** (`provider: ollama` / `llama_cpp`):
+- Falls back to blind 120s wait + retry (programmatic load API not available)
+
+**Fallback chain ordering:** `[other locals...] → [remotes with API keys in config order]`
+
+**Discord notification:** When the router switches to a fallback model:
+- The Discord status message shows `⚠️ Model switch: <from> → <to>` inline during a running task
+- A separate channel message is posted in the active job channel
+- If `BOT_STATUS_CHANNEL_ID` is set, out-of-job switches are also posted to that channel
+
+Timeout errors fail immediately without retry (repeating a 600s timed-out request is wasteful).
 
 ### Switching Models at Runtime
 
@@ -522,6 +546,11 @@ GET /models
 POST /models/active
   Body: {"model": "model-name"}
 
+GET /events/model-switches
+  Returns and clears pending model-switch events (out-of-job switches).
+  {"events": [{"from_model", "to_model", "reason", "timestamp"}, ...]}
+  The Discord bot polls this every 30s to surface switches to BOT_STATUS_CHANNEL_ID.
+
 GET /llm/health
   Returns detailed health: circuit breaker states, rate limiter, cost summary
 ```
@@ -579,7 +608,18 @@ The task classifier is waiting for the LLM. Possible causes:
 
 ### "Model not ready" / HTTP 503 from LM Studio
 
-The model was evicted from VRAM (TTL expiry). The agent waits 120s and retries up to 3 times automatically. You'll see `model_not_ready_waiting` in the logs. If it keeps happening, increase LM Studio's model TTL or keep the model pinned.
+The model was evicted from VRAM (TTL expiry or LM Studio restart). The agent now handles this automatically:
+
+1. **Pre-flight check** detects `state='not-loaded'` before sending the request
+2. Any other loaded models are unloaded (if `single_model_only: true`) to free VRAM
+3. `POST /api/v1/models/load` is called to trigger the load
+4. The agent polls every 10s until the model is loaded (up to 300s)
+5. If the model loads: request proceeds immediately
+6. If it times out after `max_load_attempts`: falls back to remote models and **posts a Discord alert**
+
+You'll see `model_not_ready_loading` in the logs during the load attempt and `model_switch_fallback` if it falls through to remote.
+
+To prevent eviction: increase LM Studio's model TTL (Settings → Runtime → Model TTL) or set it to 0.
 
 ### npm / node / git not found in shell commands
 
@@ -629,4 +669,4 @@ Get-Content logs\bot-20260415-120005.log -Wait   # tail the latest bot log
 
 ---
 
-*Last updated: 2026-04-15 — Phase 18 (iterative research agent)*
+*Last updated: 2026-04-16 — Phase 19 (LM Studio programmatic load/unload, single-model enforcement, remote fallback chain, Discord model-switch notifications)*

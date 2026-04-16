@@ -17,3 +17,7 @@ class ModelConfig(BaseModel):
     # Set to False for Qwen3/DeepSeek-R1 thinking models that return empty content
     # when extended reasoning is enabled.  Passes enable_thinking=false to the API.
     enable_thinking: Optional[bool] = None
+    # Inference backend for local models.  Used to decide whether programmatic
+    # load/unload via the LM Studio REST API is available.
+    # Values: "lmstudio" | "ollama" | "llama_cpp"
+    provider: str = "lmstudio"

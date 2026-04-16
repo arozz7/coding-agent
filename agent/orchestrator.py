@@ -108,6 +108,11 @@ class AgentOrchestrator:
         from api.task_store import TaskStore
         self.task_store = TaskStore("data/jobs.db")
 
+        # Collect model-switch notices emitted by the router during task execution.
+        # Drained at each task-loop boundary and surfaced in job phase + response text.
+        self._model_switch_notices: list[str] = []
+        self.model_router.register_switch_callback(self._on_model_switch)
+
         # Subagent management
         self.subagents: dict[str, "SubagentSession"] = {}
         
@@ -282,6 +287,41 @@ class AgentOrchestrator:
             for sa in self.subagents.values()
         ]
     
+    def _on_model_switch(self, event) -> None:
+        """Callback registered on ModelRouter — accumulates switch notices."""
+        notice = (
+            f"⚠️ Model switch: `{event.from_model}` → `{event.to_model}` "
+            f"(reason: {event.reason})"
+        )
+        self._model_switch_notices.append(notice)
+        self.logger.warning(
+            "model_switch_detected",
+            from_model=event.from_model,
+            to_model=event.to_model,
+            reason=event.reason,
+        )
+
+    def _drain_switch_notices(self, on_phase: Optional[Callable[[str], None]] = None) -> list[str]:
+        """Return accumulated model-switch notices and clear the buffer.
+
+        If *on_phase* is provided, also emits a ``model_switch:`` phase label
+        so the job-store poller (and Discord bot) can surface it in real time.
+        """
+        if not self._model_switch_notices:
+            return []
+        notices = list(self._model_switch_notices)
+        self._model_switch_notices.clear()
+        if on_phase and notices:
+            # Emit a single phase update with the first switch summary.
+            first = notices[0]
+            # Strip the emoji prefix for the compact phase label
+            compact = first.replace("⚠️ ", "")
+            try:
+                on_phase(f"model_switch:{compact}")
+            except Exception:
+                pass
+        return notices
+
     def _detect_task_type_keyword(self, task: str) -> str:
         """Keyword-based task classifier — used as fallback when LLM is unavailable.
 
@@ -930,6 +970,13 @@ class AgentOrchestrator:
                     job_id=None,     # prevent re-entering the loop
                     _direct=True,    # go straight to agent
                 )
+
+                # Surface any model-switch events that fired during this step.
+                switch_notices = self._drain_switch_notices(on_phase)
+                if switch_notices:
+                    for notice in switch_notices:
+                        all_responses.append(notice)
+                        task_summaries.append(notice)
 
                 if result.get("success"):
                     response_text = result.get("response", "")

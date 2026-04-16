@@ -288,6 +288,45 @@ class DiscordAgentBot(commands.Bot):
             except Exception:
                 _LAST_CHANNEL_FILE.unlink(missing_ok=True)
 
+        # Start background poller for out-of-job model-switch events.
+        asyncio.create_task(self._poll_model_switch_events())
+
+    async def _poll_model_switch_events(self) -> None:
+        """Poll /events/model-switches every 30 s and post to the status channel.
+
+        Covers switches that happen outside a running job (e.g. task classifier).
+        Set BOT_STATUS_CHANNEL_ID in .env to enable; silently skips if unset.
+        """
+        status_channel_id = os.getenv("BOT_STATUS_CHANNEL_ID", "").strip()
+        if not status_channel_id:
+            return  # feature disabled
+
+        try:
+            channel_id = int(status_channel_id)
+        except ValueError:
+            print(f"[bot] BOT_STATUS_CHANNEL_ID is not a valid integer: {status_channel_id!r}")
+            return
+
+        while True:
+            await asyncio.sleep(30)
+            channel = self.get_channel(channel_id)
+            if not channel:
+                continue
+            try:
+                async with httpx.AsyncClient(timeout=5.0) as client:
+                    r = await client.get(f"{API_URL}/events/model-switches")
+                    if r.status_code != 200:
+                        continue
+                    events = r.json().get("events", [])
+                for ev in events:
+                    await channel.send(
+                        f"⚠️ **Model switch:** `{ev['from_model']}` → `{ev['to_model']}` "
+                        f"(reason: `{ev['reason']}`)\n"
+                        f"Local model could not be loaded. Use `!model <name>` to override."
+                    )
+            except Exception as e:
+                print(f"[bot] model-switch poll error: {e}")
+
     async def on_message(self, message: Message):
         if message.author == self.user:
             return
@@ -416,6 +455,15 @@ async def _poll_job(ctx: commands.Context, status_msg: discord.Message, job_id: 
             label = "Planning tasks…"
         elif phase.startswith("sdlc:debugging:"):
             label = f"SDLC — Debugging ({phase.rsplit(':', 1)[-1]})"
+        elif phase.startswith("model_switch:"):
+            summary = phase[len("model_switch:"):]
+            label = f"⚠️ {summary}"
+            # Also post a one-time notice to the channel so users don't miss it.
+            if phase != _last_phase:
+                await ctx.send(
+                    f"⚠️ **Model switch during your task:** {summary}\n"
+                    f"Use `!model <name>` to manually override if needed."
+                )
         else:
             label = _PHASE_LABELS.get(phase, phase or "Working")
 

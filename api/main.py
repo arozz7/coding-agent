@@ -140,6 +140,10 @@ class SessionInfo(BaseModel):
 _model_router: Optional[ModelRouter] = None
 _orchestrator: Optional[AgentOrchestrator] = None
 
+# Model-switch events emitted outside of a running job (e.g. task classifier).
+# Drained by GET /events/model-switches so the Discord bot can notify the user.
+_pending_switch_events: list[dict] = []
+
 # Effective workspace: WORKSPACE_PATH/PROJECT_DIR when PROJECT_DIR is set,
 # otherwise bare WORKSPACE_PATH.  GitTool reads WORKSPACE_PATH from os.environ,
 # so we update it here to match the effective path.
@@ -243,6 +247,17 @@ async def _init_agent_background() -> None:
             )
             attempt += 1
             await asyncio.sleep(delay)
+
+    # Register a module-level switch callback so events that fire outside of a
+    # running task (e.g. the task-type classifier) still surface via the API.
+    def _api_switch_callback(event) -> None:
+        _pending_switch_events.append({
+            "from_model": event.from_model,
+            "to_model": event.to_model,
+            "reason": event.reason,
+            "timestamp": event.timestamp.isoformat(),
+        })
+    _orchestrator.model_router.register_switch_callback(_api_switch_callback)
 
     # Probe the primary local model.  This is intentionally fire-and-forget:
     # a failed probe does not block startup — the ModelNotReadyError retry
@@ -563,6 +578,18 @@ async def wake_session(session_id: str):
     if not result.get("success"):
         raise HTTPException(status_code=404, detail=result.get("error", "Session not found"))
     return result
+
+
+@app.get("/events/model-switches")
+async def get_model_switch_events():
+    """Return and clear pending model-switch events.
+
+    The Discord bot polls this endpoint to notify users when the router
+    has fallen back from a local model to a remote one.
+    """
+    events = list(_pending_switch_events)
+    _pending_switch_events.clear()
+    return {"events": events}
 
 
 @app.get("/models")
