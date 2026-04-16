@@ -66,6 +66,7 @@ python -m pip install -e .
 | `RESTART_DELAY_SECS` | No | `3` | Seconds between stop and start during a supervisor restart |
 | `MAX_FIX_ITERATIONS` | No | `50` | Maximum fix-loop iterations the developer agent will attempt before giving up on a build error |
 | `BOT_STATUS_CHANNEL_ID` | No | — | Discord channel ID for model-switch alerts (e.g. when the agent falls back from local to remote). Leave unset to disable |
+| `STALE_JOB_THRESHOLD_SECS` | No | `2700` | Seconds before the watchdog kills a stuck job (45 min default). The timer automatically resets on task progress updates. |
 
 ### Model Configuration (`config/models.yaml`)
 
@@ -184,8 +185,8 @@ Force the **research** path — bypasses the LLM classifier. Runs the full itera
 
 The Done message shows a one-line summary. Use `!result` to read the full report.
 
-#### `!continue [note]`
-Resume the current active debugging session. Optionally attach a note to guide the next iteration.
+#### `!continue [job_id] [note]`
+Resume the current active debugging session. Optionally attach a note to guide the next iteration. If the bot restarted, you can pass your `job_id` explicitly to recover state.
 
 ```
 !continue
@@ -196,10 +197,10 @@ Resume the current active debugging session. Optionally attach a note to guide t
 
 ### Job Monitoring
 
-#### `!status`
-Shows the current job's phase, elapsed time, and job ID.
+#### `!status [job_id]`
+Shows the current job's phase, elapsed time, and job ID. If the bot restarted, passing `job_id` recovers the state.
 
-#### `!tasks`
+#### `!tasks [job_id]`
 Shows the full task plan with status for each subtask:
 
 ```
@@ -210,16 +211,16 @@ Task plan (3/4 done)
 🔄 4. [develop] Verify fix with npm start
 ```
 
-#### `!result`
+#### `!result [job_id]`
 Returns the full response text from the most recent completed job.
 
-#### `!files`
+#### `!files [job_id]`
 Lists all files created or modified by the last task.
 
 #### `!jobs [n]`
 Lists the last N jobs (default 10) with status, type, and elapsed time.
 
-#### `!cancel`
+#### `!cancel [job_id]`
 Cancels the currently running job.
 
 ---

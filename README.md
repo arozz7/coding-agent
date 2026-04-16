@@ -101,18 +101,18 @@ python -m api.discord_bot
 | `!ask <task>` | Submit a task — auto-classifies type, polls in background |
 | `!dev <task>` | Force develop path — bypasses classifier, guaranteed to run/fix/build |
 | `!research <task>` | Force research path — web search, codebase investigation, analysis; full report via `!result` |
-| `!continue [note]` | Resume the current debugging session with an optional note |
+| `!continue [job_id] [note]` | Resume the current debugging session. Passing `job_id` recovers state after a bot restart |
 
 ### Job Monitoring
 
 | Command | Description |
 |---------|-------------|
-| `!status` | Current job phase and elapsed time |
-| `!tasks` | Task plan with per-task status (✅ / 🔄 / ❌) |
-| `!result` | Full prose response from the last completed job |
-| `!files` | Files created or modified by the last task |
+| `!status [job_id]` | Current job phase and elapsed time. Pass `job_id` to recover state |
+| `!tasks [job_id]` | Task plan with per-task status (✅ / 🔄 / ❌) |
+| `!result [job_id]` | Full prose response from the last completed job |
+| `!files [job_id]` | Files created or modified by the last task |
 | `!jobs [n]` | List last N jobs (default 10) |
-| `!cancel` | Cancel the running job |
+| `!cancel [job_id]` | Cancel the running job |
 
 ### File Access
 
@@ -224,6 +224,7 @@ Environment variables:
 | `API_STARTUP_TIMEOUT` | `120` | Seconds to wait for `/health` on startup |
 | `RESTART_DELAY_SECS` | `3` | Seconds between stop and start during restart |
 | `BOT_PYTHON` | `sys.executable` | Python interpreter for the bot (set when bot uses a different venv) |
+| `STALE_JOB_THRESHOLD_SECS` | `2700` | Seconds before watchdog kills a stuck job (45 min deafult). Progress updates automatically reset the timer |
 
 ---
 

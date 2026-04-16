@@ -65,8 +65,8 @@ _BOT_BACKOFF_STEPS = [2, 5, 15, 30, 60]
 _HEARTBEAT_FILE = None  # set after STATE_DIR is known
 _HEARTBEAT_INTERVAL = 5  # seconds
 
-# Stale-job watchdog: if a job stays running longer than this, force restart.
-_STALE_JOB_THRESHOLD = 45 * 60  # 45 minutes in seconds
+# Stale-job watchdog: if a job stays running longer than this without updates, force restart.
+_STALE_JOB_THRESHOLD = int(os.getenv("STALE_JOB_THRESHOLD_SECS", 45 * 60))
 
 # Continuous health probe — runs every 30 s.
 # If the API process is alive but /health is unreachable for this many
@@ -107,15 +107,15 @@ def _check_stale_job() -> bool:
         for job in jobs:
             if job.get("status") != "running":
                 continue
-            created_raw = job.get("created_at", "")
-            if not created_raw:
+            last_activity_raw = job.get("updated_at") or job.get("created_at", "")
+            if not last_activity_raw:
                 continue
             from datetime import datetime, timezone
             try:
-                created_dt = datetime.fromisoformat(
-                    created_raw.replace("Z", "+00:00")
+                last_activity_dt = datetime.fromisoformat(
+                    last_activity_raw.replace("Z", "+00:00")
                 )
-                age = (datetime.now(timezone.utc) - created_dt).total_seconds()
+                age = (datetime.now(timezone.utc) - last_activity_dt).total_seconds()
                 if age > _STALE_JOB_THRESHOLD:
                     print(
                         f"[supervisor] Stale job detected: {job.get('job_id')} "

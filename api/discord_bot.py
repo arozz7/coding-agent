@@ -627,19 +627,33 @@ async def continue_task(ctx: commands.Context, *, note: str = ""):
     """Continue fixing the last task.  Use when the build still has errors after !ask/!dev.
 
     Optionally pass extra guidance: `!continue focus on the webpack config errors`.
+    Or pass a specific job ID if the bot restarted: `!continue job_123 xyz`
     The session context carries forward so the agent knows what was already tried.
     """
     user_id = str(ctx.author.id)
-    last_job_id = bot.user_jobs.get(user_id)
+    
+    # Check if user explicitly passed a job ID: `!continue job_123... some note`
+    job_id_override = None
+    if note.startswith("job_"):
+        parts = note.split(" ", 1)
+        job_id_override = parts[0].strip()
+        note = parts[1].strip() if len(parts) > 1 else ""
+
+    last_job_id = job_id_override or bot.user_jobs.get(user_id)
+
     if not last_job_id:
-        await ctx.send("No previous job found. Use `!ask` or `!dev` to start one.")
+        await ctx.send("No previous job found in memory. Use `!jobs` to find your job ID, then run `!continue <job_id>`.")
         return
 
     # Fetch the last job to pull the original task text
     try:
         last_job = await bot.client.get_job(last_job_id)
+        # Re-hydrate the bot's memory in case it restarted
+        bot.user_jobs[user_id] = last_job_id
+        if last_job.get("session_id"):
+             bot.user_sessions[user_id] = last_job["session_id"]
     except Exception as exc:
-        await ctx.send(f"Could not fetch last job: {exc}")
+        await ctx.send(f"Could not fetch job `{last_job_id}`: {exc}")
         return
 
     original_task = last_job.get("task", "the previous task")
@@ -655,12 +669,12 @@ async def continue_task(ctx: commands.Context, *, note: str = ""):
 
 
 @bot.command(name="status")
-async def status(ctx: commands.Context):
-    """Show the status of your current background job."""
+async def status(ctx: commands.Context, job_id: Optional[str] = None):
+    """Show the status of your current background job. Specify a job_id if the bot restarted."""
     user_id = str(ctx.author.id)
-    job_id = bot.user_jobs.get(user_id)
+    job_id = job_id or bot.user_jobs.get(user_id)
     if not job_id:
-        await ctx.send("No active job. Use `!ask <task>` to start one.")
+        await ctx.send("No active job. Use `!ask <task>` to start one, or pass an explicit job ID: `!status <job_id>`.")
         return
     try:
         job = await bot.client.get_job(job_id)
@@ -677,12 +691,12 @@ async def status(ctx: commands.Context):
 
 
 @bot.command(name="cancel")
-async def cancel(ctx: commands.Context):
-    """Cancel your current running job."""
+async def cancel(ctx: commands.Context, job_id: Optional[str] = None):
+    """Cancel your current running job. Specify a job_id if the bot restarted."""
     user_id = str(ctx.author.id)
-    job_id = bot.user_jobs.get(user_id)
+    job_id = job_id or bot.user_jobs.get(user_id)
     if not job_id:
-        await ctx.send("No active job to cancel.")
+        await ctx.send("No active job to cancel. Pass an explicit job ID: `!cancel <job_id>`.")
         return
     try:
         await bot.client.cancel_job(job_id)
@@ -692,12 +706,12 @@ async def cancel(ctx: commands.Context):
 
 
 @bot.command(name="result")
-async def result(ctx: commands.Context):
-    """Show the agent's prose response from the last job (code blocks stripped)."""
+async def result(ctx: commands.Context, job_id: Optional[str] = None):
+    """Show the agent's prose response from the last job (code blocks stripped). Specify a job_id if the bot restarted."""
     user_id = str(ctx.author.id)
-    job_id = bot.user_jobs.get(user_id)
+    job_id = job_id or bot.user_jobs.get(user_id)
     if not job_id:
-        await ctx.send("No recent job. Use `!ask <task>` first.")
+        await ctx.send("No recent job. Use `!ask <task>` first, or pass an explicit job ID.")
         return
     try:
         data = await bot.client.get_job_result(job_id)
@@ -725,12 +739,12 @@ async def result(ctx: commands.Context):
 
 
 @bot.command(name="files")
-async def files(ctx: commands.Context):
-    """List files created or modified by the last task."""
+async def files(ctx: commands.Context, job_id: Optional[str] = None):
+    """List files created or modified by the last task. Specify a job_id if the bot restarted."""
     user_id = str(ctx.author.id)
-    job_id = bot.user_jobs.get(user_id)
+    job_id = job_id or bot.user_jobs.get(user_id)
     if not job_id:
-        await ctx.send("No recent job. Use `!ask <task>` first.")
+        await ctx.send("No recent job. Use `!ask <task>` first, or pass an explicit job ID.")
         return
     try:
         job = await bot.client.get_job(job_id)
@@ -758,12 +772,12 @@ _STATUS_ICONS = {
 
 
 @bot.command(name="tasks")
-async def tasks_cmd(ctx: commands.Context):
-    """Show the task list for the current job."""
+async def tasks_cmd(ctx: commands.Context, job_id: Optional[str] = None):
+    """Show the task list for the current job. Specify a job_id if the bot restarted."""
     user_id = str(ctx.author.id)
-    job_id = bot.user_jobs.get(user_id)
+    job_id = job_id or bot.user_jobs.get(user_id)
     if not job_id:
-        await ctx.send("No recent job. Use `!ask <task>` first.")
+        await ctx.send("No recent job. Use `!ask <task>` first, or pass an explicit job ID.")
         return
 
     try:
@@ -1246,12 +1260,12 @@ async def helpme(ctx: commands.Context):
         "**Core workflow:**\n"
         "`!ask <task>` — Submit a task. Agent works in background; this message updates live.\n"
         "`!dev <task>` — Same as !ask but forces develop mode (use for debug/build/fix tasks).\n"
-        "`!continue [note]` — Continue fixing the last job when errors remain.\n"
-        "`!status` — Check your current job's status and phase\n"
-        "`!cancel` — Cancel your running job\n\n"
+        "`!continue [job_id] [note]` — Continue fixing the last job when errors remain.\n"
+        "`!status [job_id]` — Check your current job's status and phase\n"
+        "`!cancel [job_id]` — Cancel your running job\n\n"
         "**Viewing results:**\n"
-        "`!result` — Show prose response (code blocks stripped)\n"
-        "`!files` — List files created/modified in the last task\n"
+        "`!result [job_id]` — Show prose response (code blocks stripped)\n"
+        "`!files [job_id]` — List files created/modified in the last task\n"
         "`!show <path>` — View a workspace file (attachment for large files)\n\n"
         "**Session:**\n"
         "`!history` — Last 5 messages in your session\n"
