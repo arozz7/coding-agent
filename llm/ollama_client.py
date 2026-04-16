@@ -303,10 +303,10 @@ class OllamaClient:
         error.  Swallows all exceptions so callers never crash.
         """
         try:
-            async with httpx.AsyncClient(timeout=10.0) as client:
+            async with httpx.AsyncClient(timeout=300.0) as client:
                 r = await client.post(
                     f"{self.base_url}/api/v1/models/load",
-                    json={"identifier": identifier},
+                    json={"model": identifier},
                 )
                 accepted = r.status_code in (200, 201)
                 if accepted:
@@ -330,9 +330,16 @@ class OllamaClient:
         """
         try:
             async with httpx.AsyncClient(timeout=10.0) as client:
+                instance_id = identifier
+                list_r = await client.get(f"{self.base_url}/v1/models")
+                if list_r.status_code == 200:
+                    for m in list_r.json().get("data", []):
+                        if m.get("id") == identifier or m.get("root") == identifier or (m.get("id") and identifier in m.get("id")):
+                            instance_id = m.get("id")
+                            break
                 r = await client.post(
                     f"{self.base_url}/api/v1/models/unload",
-                    json={"identifier": identifier},
+                    json={"instance_id": instance_id},
                 )
                 accepted = r.status_code in (200, 201)
                 if accepted:
