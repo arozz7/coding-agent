@@ -16,6 +16,8 @@ An autonomous coding agent with LLM integration, multi-agent orchestration, SDLC
 - **Local & Cloud LLM** — Flexible routing between LM Studio / Ollama (local) and OpenRouter / OpenAI-compatible APIs; circuit breaker, rate limiting, **full remote fallback chain** (locals first, then remotes in config order)
 - **Single-Model Enforcement** — Optional `single_model_only: true` in `config/models.yaml` automatically unloads other local models before loading a new one — protects limited VRAM
 - **Model Switch Notifications** — Discord bot alerts when the router falls back from a local to a remote model mid-task (inline during task loops; background poll for out-of-job switches via `BOT_STATUS_CHANNEL_ID`)
+- **Interactive CLI Testing** — `interactive_shell` tool spawns any process and drives it via `expect`/`send`/`wait` scripts (REPLs, text adventures, wizard prompts); cross-platform asyncio subprocess
+- **Browser Interaction** — `browser_interact` tool drives Playwright (Chromium) to `navigate`, `click`, `fill`, `press`, `screenshot`, and read `text` on any web app; cross-platform (Windows/macOS/Linux)
 - **Workspace Scoping** — `PROJECT_DIR` env var focuses all file operations on an active project subdirectory; no path double-nesting
 - **Agent Wiki Memory** — `.agent-wiki/` knowledge base compiled per task; later subtasks query earlier ones; index deduplication; `!skills` to inspect
 - **RAG Memory** — Codebase indexed in ChromaDB; retrieved context injected into every task
@@ -278,11 +280,12 @@ coding-agent/
 │   │   ├── skill_loader.py        # Lazy skill content loading
 │   │   └── wiki_manager.py        # .agent-wiki/ read/write, index upsert, lint
 │   └── tools/
-│       ├── shell_tool.py          # Shell execution, PATH auto-discovery, Windows .cmd fix
-│       ├── file_system_tool.py    # File CRUD
-│       ├── git_tool.py            # Git operations
-│       ├── browser_tool.py        # Playwright screenshots + server polling
-│       └── tool_executor.py       # Unified tool dispatch, output capping
+│       ├── shell_tool.py              # Shell execution, PATH auto-discovery, Windows .cmd fix
+│       ├── file_system_tool.py        # File CRUD
+│       ├── git_tool.py                # Git operations
+│       ├── browser_tool.py            # Playwright screenshots, server polling, browser interact
+│       ├── interactive_shell_tool.py  # asyncio expect/send driver for CLI apps
+│       └── tool_executor.py           # Unified tool dispatch, output capping
 ├── api/
 │   ├── main.py                    # FastAPI server, background init, all endpoints
 │   ├── job_store.py               # SQLite job store (write-through + in-memory cache)
@@ -311,7 +314,7 @@ coding-agent/
 ├── tests/
 │   ├── unit/                      # Unit tests
 │   └── integration/               # Integration tests
-└── aiChangeLog/                   # Per-phase change logs (phase-03 through phase-19)
+└── aiChangeLog/                   # Per-phase change logs (phase-03 through phase-20)
 ```
 
 ---

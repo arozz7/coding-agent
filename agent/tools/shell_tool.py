@@ -279,6 +279,7 @@ class ShellTool:
                 args,
                 shell=use_shell,
                 cwd=str(self.workspace),
+                stdin=subprocess.DEVNULL,   # prevent interactive apps from blocking
                 capture_output=True,
                 text=True,
                 encoding='utf-8',

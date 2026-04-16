@@ -20,6 +20,25 @@ _INLINE_CMD_RE = re.compile(
 
 MAX_FIX_ITERATIONS = int(os.getenv("MAX_FIX_ITERATIONS", "50"))
 
+
+def _looks_like_npm_missing(error_text: str) -> bool:
+    """Return True if error output suggests missing npm dependencies / node_modules."""
+    lower = error_text.lower()
+    return (
+        "cannot find module" in lower
+        or "module not found" in lower
+        or ("webpack" in lower and "not found" in lower)
+        or ("webpack" in lower and "command not found" in lower)
+        or "sh: webpack" in lower
+        or ("error: cannot find" in lower and "module" in lower)
+    )
+
+
+def _npm_install_cmd(verify_cmd: str) -> str:
+    """Return an npm install command, preserving any leading 'cd X &&' prefix."""
+    m = re.match(r'^(cd\s+\S+\s*&&\s*)', verify_cmd, re.IGNORECASE)
+    return (m.group(1) + "npm install") if m else "npm install"
+
 # Maximum characters of error output sent to the LLM per iteration.
 # TypeScript / webpack errors repeat the same stack endlessly — cap them
 # so we don't blow up the context window on iteration 3+.
@@ -307,6 +326,8 @@ Summary: <one sentence>
             files_fixed_history: list[str] = []
             # Track how many fix-attempt blocks have been appended to response.
             fix_attempt_blocks: int = 0
+            # Ensure npm install runs at most once per fix session.
+            _ran_npm_install: bool = False
 
             for _attempt in range(MAX_FIX_ITERATIONS):
                 # Trim error text: TypeScript / webpack errors can be thousands of
@@ -374,6 +395,16 @@ Summary: <one sentence>
                 # rely on the LLM including a shell block in its fix response.
                 if verify_cmd and tool_executor:
                     try:
+                        # Auto-install npm deps if the error indicates missing
+                        # node_modules (e.g. "Cannot find module 'webpack'").
+                        # Runs once per fix session to avoid repeated installs.
+                        if not _ran_npm_install and _looks_like_npm_missing(raw_errors):
+                            install_cmd = _npm_install_cmd(verify_cmd)
+                            install_out = await tool_executor.execute("shell", {"command": install_cmd})
+                            shell_outputs.append(f"$ {install_cmd}\n{install_out}")
+                            self.logger.info("npm_auto_install", cmd=install_cmd, attempt=_attempt + 1)
+                            _ran_npm_install = True
+
                         verify_out = await tool_executor.execute("shell", {"command": verify_cmd})
                         verify_entry = f"$ {verify_cmd}\n{verify_out}"
                         shell_outputs.append(verify_entry)

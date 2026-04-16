@@ -29,6 +29,20 @@ _SEARCH_TRIGGERS = re.compile(
 )
 
 
+# Patterns that indicate the task is about local workspace content — no web
+# search needed even if no specific file names are mentioned.
+_LOCAL_TASK_RE = re.compile(
+    r"\b("
+    r"in\s+the\s+(workspace|project|codebase|repo(?:sitory)?)|"
+    r"last\s+(failed\s+)?(job|error|run|task|build)|"
+    r"(?:find|show|check|look\s+at)\s+(?:the\s+)?(?:errors?|bugs?|issues?|logs?|output|files?)|"
+    r"what\s+(?:is|was|went)\s+wrong|"
+    r"why\s+(?:is|did|does)\s+it\s+fail"
+    r")\b",
+    re.IGNORECASE,
+)
+
+
 def _emit(on_phase, label: str) -> None:
     if on_phase:
         try:
@@ -116,11 +130,17 @@ Format your findings as:
                     self.logger.warning("doc_read_failed", path=dp, error=str(e))
 
         # --- Routing decision ---
+        # "local content found" = actual file/document content was retrieved, OR
+        # the workspace listing returned real entries (📄/📁 icons present).
         local_content_found = any(
             s.startswith("---") or s.startswith("[PDF") or s.startswith("[DOCX")
+            or (("📄" in s or "📁" in s) and "Workspace contents:" in s)
             for s in local_sections
         )
-        needs_web = _SEARCH_TRIGGERS.search(task) or not local_content_found
+        is_local_task = bool(_LOCAL_TASK_RE.search(task))
+        needs_web = _SEARCH_TRIGGERS.search(task) or (
+            not local_content_found and not is_local_task
+        )
 
         if not needs_web:
             # Fast path: task is about local code/files — single-pass synthesis.

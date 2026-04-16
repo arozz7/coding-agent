@@ -13,8 +13,9 @@ A comprehensive guide to using the Local Coding Agent.
 7. [Model Management](#model-management)
 8. [Context Bridge](#context-bridge)
 9. [Agent Wiki Memory](#agent-wiki-memory)
-10. [REST API Reference](#rest-api-reference)
-11. [Troubleshooting](#troubleshooting)
+10. [Interactive Testing Tools](#interactive-testing-tools)
+11. [REST API Reference](#rest-api-reference)
+12. [Troubleshooting](#troubleshooting)
 
 ---
 
@@ -506,6 +507,116 @@ Use `!skills` to see available wiki skills. The wiki accumulates over time and i
 
 ---
 
+## Interactive Testing Tools
+
+In addition to running shell commands non-interactively, the agent has two tools for
+testing apps that require real interaction — CLI prompts and browser clicks.
+
+### `interactive_shell` — Drive CLI apps via stdin/stdout
+
+Use this when the app is a readline-based program (REPL, text adventure, setup wizard,
+interactive installer) that blocks waiting for keyboard input.
+
+**How it works:** The tool spawns the process with piped stdin/stdout, then follows a
+script of `expect`/`send`/`wait` steps. Each `expect` waits (regex match, case-insensitive)
+for a pattern in stdout before proceeding. After the script, stdin is closed and remaining
+output is drained.
+
+**Script step fields** (all optional, combine freely):
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `expect` | string | Regex to wait for in stdout before continuing |
+| `send` | string | Text to write to stdin (newline appended automatically) |
+| `wait` | float | Sleep N seconds — useful after a `send` that triggers async work |
+
+**Example — test a Node.js text adventure:**
+
+```python
+result = await executor.execute("interactive_shell", {
+    "command": "npm start",
+    "script": [
+        {"expect": "name",   "send": "Alice"},
+        {"expect": "option", "send": "1"},
+        {"expect": "option", "send": "3"},
+    ],
+    "timeout": 15,
+})
+# result["transcript"] shows interleaved stdout + [sent] markers
+# result["returncode"] is the process exit code
+```
+
+**Return value:**
+
+```json
+{
+  "success": true,
+  "transcript": "Welcome! What is your name?\n[sent] 'Alice'\nHello Alice!\n...",
+  "returncode": 0
+}
+```
+
+**Platform notes:** Works on Windows, macOS, and Linux. Apps that require a real TTY
+(ncurses, raw-terminal mode) won't behave correctly — use `browser_interact` for those
+or wrap them in a web interface first.
+
+---
+
+### `browser_interact` — Drive web apps with Playwright
+
+Use this to test or operate any web app by navigating, clicking, filling forms, reading
+text, and taking screenshots — the same actions a human would perform in a browser.
+
+**Requires:** `playwright` Python package and Chromium installed.
+If not present: `pip install playwright && playwright install chromium`
+
+**Action types:**
+
+| Type | Required fields | Optional | Description |
+|------|----------------|----------|-------------|
+| `navigate` | `url` | — | Go to a URL |
+| `click` | `selector` | — | Click a CSS selector |
+| `fill` | `selector`, `value` | — | Type into an input |
+| `press` | `key` | `selector` | Press a key (globally or on an element) |
+| `screenshot` | — | `path` | Save a screenshot (auto-named if no path) |
+| `text` | `selector` | — | Read and log the element's text content |
+| `wait_for` | `selector` | `state` (`visible`) | Wait for an element to appear |
+| `wait` | `ms` | — | Sleep N milliseconds |
+
+**Example — log in and check the dashboard:**
+
+```python
+result = await executor.execute("browser_interact", {
+    "url": "http://localhost:3000",
+    "actions": [
+        {"type": "fill",     "selector": "#username", "value": "admin"},
+        {"type": "fill",     "selector": "#password", "value": "secret"},
+        {"type": "click",    "selector": "button[type=submit]"},
+        {"type": "wait_for", "selector": ".dashboard-header"},
+        {"type": "text",     "selector": "h1"},
+        {"type": "screenshot"},
+    ],
+    "timeout": 30,
+})
+# result["transcript"] is a human-readable log of every step
+# result["screenshots"] lists saved screenshot paths
+```
+
+**Return value:**
+
+```json
+{
+  "success": true,
+  "transcript": "[navigate] http://localhost:3000\n[fill] #username = 'admin'\n...\n[screenshot] saved to screenshot_1713270000_5.png",
+  "screenshots": ["screenshot_1713270000_5.png"]
+}
+```
+
+**Platform notes:** Playwright's Chromium driver is fully cross-platform. The same
+action scripts run unchanged on Windows, macOS, and Linux.
+
+---
+
 ## REST API Reference
 
 The API runs on port 5005 by default. All endpoints accept/return JSON.
@@ -651,6 +762,23 @@ The bridge triggers at 82% of `context_window`. If it fires too often, increase 
 
 The agent automatically falls back to your local model when a cloud provider returns 429. Logged as `using_local_fallback`. To reduce rate limiting, lower `rate_limit_rpm` in `models.yaml` or add more fallback models.
 
+### npm dependencies missing ("Cannot find module …")
+
+The developer agent now detects this automatically and runs `npm install` once before
+retrying. If you see it recurring across multiple jobs, the workspace may not have a
+`package.json` or the registry may be unreachable. Check with:
+
+```
+!dev npm install
+```
+
+### Interactive shell times out without matching the expected pattern
+
+The `expect` field is a Python regex matched against **accumulated** stdout, case-insensitively. Common causes:
+- The prompt uses a special regex character (e.g. `?`, `(`) — escape it or use a simpler pattern
+- The app buffers output and never flushes — increase `timeout` or add a `{"wait": 1}` step before the expect
+- The app exits before the pattern appears — check `result["transcript"]` for what was actually printed
+
 ### Web search returns no results
 
 The search chain tries: **Brave → DuckDuckGo → Playwright Google → Google CSE**.
@@ -669,4 +797,4 @@ Get-Content logs\bot-20260415-120005.log -Wait   # tail the latest bot log
 
 ---
 
-*Last updated: 2026-04-16 — Phase 19 (LM Studio programmatic load/unload, single-model enforcement, remote fallback chain, Discord model-switch notifications)*
+*Last updated: 2026-04-16 — Phase 20 (bug fixes: path double-nesting, redundant cd, npm auto-install, research routing; interactive testing: `interactive_shell` + `browser_interact`)*

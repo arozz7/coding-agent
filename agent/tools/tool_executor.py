@@ -15,6 +15,8 @@ events to SessionMemory for observability and crash recovery.
 """
 import asyncio
 import inspect
+import re
+from pathlib import Path
 from typing import Any, Callable, Dict, Optional
 import structlog
 
@@ -22,6 +24,24 @@ logger = structlog.get_logger()
 
 _SHELL_MAX_LINES = 500
 _SHELL_MAX_BYTES = 20_000
+
+# Matches a leading "cd <name> && " or "cd <name>; " in a shell command.
+_CD_PREFIX_RE = re.compile(r'^cd\s+(\S+)\s*(?:&&|;)\s*', re.IGNORECASE)
+
+
+def _strip_redundant_cd(command: str, workspace_name: str) -> str:
+    """Strip 'cd <workspace_name> &&' prefix when the workspace is already that directory.
+
+    The agent often emits 'cd my-project && npm run build' even when the shell
+    tool's cwd is already set to 'my-project/'. Stripping the redundant cd
+    prevents the command from navigating one level too deep into a double-nested
+    directory.  Only strips when the cd target literally equals the workspace
+    root's last component so legitimate cd-into-subdirectory commands are preserved.
+    """
+    m = _CD_PREFIX_RE.match(command)
+    if m and m.group(1).strip('/\\') == workspace_name:
+        return command[m.end():].strip()
+    return command
 
 
 def _cap_shell_output(text: str) -> str:
@@ -64,12 +84,14 @@ class ToolExecutor:
         from agent.tools.browser_tool import BrowserTool
         from agent.tools.web_tool import WebTool
         from agent.tools.document_tool import DocumentTool
+        from agent.tools.interactive_shell_tool import InteractiveShellTool
 
         self.shell_tool = ShellTool(self.workspace_path)
         self.fs_tool = FileSystemTool(self.workspace_path)
         self.browser_tool = BrowserTool(self.workspace_path)
         self.web_tool = WebTool()
         self.document_tool = DocumentTool()
+        self.interactive_shell_tool = InteractiveShellTool(self.workspace_path)
         self.code_analyzer = code_analyzer
         self.pytest_tool = pytest_tool
 
@@ -91,6 +113,10 @@ class ToolExecutor:
         # Document tools
         self.tools["read_document"] = self._read_document  # PDF/DOCX/XLSX/CSV
 
+        # Interactive testing tools
+        self.tools["interactive_shell"] = self._run_interactive_shell   # CLI apps via stdin/stdout
+        self.tools["browser_interact"] = self._browser_interact         # browser click/fill/etc.
+
         if code_analyzer is not None:
             self.tools["analyze"] = self._analyze_code
         if pytest_tool is not None:
@@ -99,6 +125,9 @@ class ToolExecutor:
     def _run_shell(self, input: Dict[str, Any]) -> str:
         """Execute a shell command and return stdout + stderr with exit code on failure."""
         command = input.get("command", "")
+        # Strip "cd <project> &&" when workspace is already scoped to that project.
+        workspace_name = Path(self.workspace_path).name
+        command = _strip_redundant_cd(command, workspace_name)
         result = self.shell_tool.run(command)
         stdout = (result.get("stdout") or "").strip()
         stderr = (result.get("stderr") or "").strip()
@@ -140,8 +169,9 @@ class ToolExecutor:
         path = input.get("path", "")
         try:
             items = []
-            full_path = self.fs_tool.workspace / path if path else self.fs_tool.workspace
-            for item in full_path.iterdir():
+            base = Path(self.workspace_path)
+            full_path = base / path if path else base
+            for item in sorted(full_path.iterdir()):
                 items.append(f"{'📁' if item.is_dir() else '📄'} {item.name}")
             return "\n".join(items) if items else "No files found"
         except Exception as e:
@@ -250,6 +280,57 @@ class ToolExecutor:
                 return str(result)
         except Exception as e:
             return f"Error reading document {path}: {e}"
+
+    async def _run_interactive_shell(self, input: Dict[str, Any]) -> str:
+        """Spawn a process and follow an expect/send script via stdin/stdout pipes.
+
+        Input keys
+        ----------
+        ``command`` (str)  — the process to launch (e.g. ``"node src/index.js"``)
+        ``script``  (list) — list of step dicts with optional ``expect``, ``send``,
+                             and ``wait`` keys (see InteractiveShellTool for details)
+        ``timeout`` (int)  — per-step and overall timeout in seconds (default 30)
+        """
+        command = input.get("command", "")
+        script = input.get("script", [])
+        timeout = int(input.get("timeout", 30))
+        if not command:
+            return "Error: 'command' is required"
+        result = await self.interactive_shell_tool.run(command, script, timeout=timeout)
+        if result.get("success"):
+            rc = result.get("returncode", 0)
+            transcript = result.get("transcript", "")
+            return f"Exit code: {rc}\n\n{transcript}"
+        return f"interactive_shell failed: {result.get('error', 'unknown')}\n\n{result.get('transcript', '')}"
+
+    async def _browser_interact(self, input: Dict[str, Any]) -> str:
+        """Drive a browser page through a sequence of actions.
+
+        Input keys
+        ----------
+        ``url``     (str)  — starting URL to open
+        ``actions`` (list) — action dicts; each has a ``type`` key plus type-specific
+                             fields (navigate/click/fill/press/screenshot/text/wait_for/wait)
+        ``timeout`` (int)  — per-action Playwright timeout in seconds (default 30)
+        ``width``   (int)  — viewport width  (default 1280)
+        ``height``  (int)  — viewport height (default 720)
+        """
+        url = input.get("url", "")
+        actions = input.get("actions", [])
+        timeout = int(input.get("timeout", 30))
+        width = int(input.get("width", 1280))
+        height = int(input.get("height", 720))
+        if not url:
+            return "Error: 'url' is required"
+        result = await self.browser_tool.interact(
+            url, actions, timeout=timeout, width=width, height=height
+        )
+        if result.get("success"):
+            shots = result.get("screenshots", [])
+            transcript = result.get("transcript", "")
+            shots_line = f"\nScreenshots: {shots}" if shots else ""
+            return f"{transcript}{shots_line}"
+        return f"browser_interact failed: {result.get('error', 'unknown')}\n\n{result.get('transcript', '')}"
 
     def _analyze_code(self, input: Dict[str, Any]) -> str:
         """Analyze a source file for structure and dependencies."""
