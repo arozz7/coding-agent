@@ -747,17 +747,24 @@ async def set_project(request: dict):
 
     raw_name = (request.get("name") or "").strip()
 
-    # Allow only a single safe directory name (no separators/traversal).
-    if raw_name and not re.fullmatch(r"[A-Za-z0-9._-]+", raw_name):
-        raise HTTPException(status_code=400, detail="Invalid project name")
-
     workspace_root = Path(WORKSPACE_PATH).resolve()
     target = (workspace_root / raw_name) if raw_name else workspace_root
+        # Allow only safe project path characters and reject dangerous segments.
+        if not re.fullmatch(r"[A-Za-z0-9._\-/]+", raw_name):
+            raise HTTPException(status_code=400, detail="Invalid project name")
+        parts = Path(raw_name).parts
+        if any(part in ("", ".", "..") for part in parts):
+            raise HTTPException(status_code=400, detail="Invalid project name")
     resolved_target = target.resolve()
 
     # Enforce containment within the configured workspace root.
     try:
         resolved_target.relative_to(workspace_root)
+    try:
+        resolved_target.relative_to(workspace_root)
+    except ValueError:
+        raise HTTPException(status_code=403, detail="Path not allowed")
+
     except ValueError:
         raise HTTPException(status_code=403, detail="Path not allowed")
 
