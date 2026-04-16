@@ -819,6 +819,7 @@ class AgentOrchestrator:
             "model_router": self.model_router,
             "tool_executor": session_executor,
             "enriched_context": enriched_context + history,
+            "on_phase": on_phase,
         }
 
         if task_type == "plan":

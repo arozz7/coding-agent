@@ -158,6 +158,23 @@ This phase hardened the runtime reliability of the coding agent across four area
 
 ---
 
+### Iterative Research Agent
+
+#### `agent/agents/research_agent.py` (rewrite)
+- **Routing decision:** tasks with no web-search trigger keywords that reference local files use the original fast-path (single-pass). Web-facing tasks enter the new iterative path.
+- **Step 1 — Decompose:** LLM breaks the task into 3-5 focused sub-questions (`enable_thinking=False`; falls back to raw task on parse failure).
+- **Step 2 — Parallel search:** `asyncio.gather(..., return_exceptions=True)` runs a web search + top-page deep-fetch for each sub-question concurrently. A failed sub-search does not block the others.
+- **Step 3 — Gap analysis:** LLM reviews gathered snippets and identifies up to 2 follow-up queries (`enable_thinking=False`). Returns nothing if content is sufficient.
+- **Step 4 — Follow-up searches:** parallel deep-fetch for gap queries (capped at 2).
+- **Step 5 — Synthesis:** single LLM call over all gathered + local content.
+- **Context budget:** total web content capped at 14 000 chars via `_trim_to_budget()`; per-source caps of 1 200 (search) + 1 500 (page).
+- **`on_phase` threading:** emits `researching:planning`, `researching:searching (N questions)`, `researching:checking gaps`, `researching:follow-up (N queries)`, `researching:synthesizing` — visible in Discord live status.
+
+#### `agent/orchestrator.py`
+- `_run_specialized_agent` context dict now includes `"on_phase": on_phase` so research (and other) agents can emit live phase updates.
+
+---
+
 ### Discord Output Summary + `!research` Command
 
 #### `agent/orchestrator.py`
