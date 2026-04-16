@@ -747,17 +747,20 @@ async def set_project(request: dict):
 
     raw_name = (request.get("name") or "").strip()
 
-    # Reject names that try to escape the workspace root.
-    if ".." in raw_name or raw_name.startswith(("/", "\\")):
+    # Allow only a single safe directory name (no separators/traversal).
+    if raw_name and not re.fullmatch(r"[A-Za-z0-9._-]+", raw_name):
         raise HTTPException(status_code=400, detail="Invalid project name")
 
     workspace_root = Path(WORKSPACE_PATH).resolve()
-    if raw_name:
-        target = workspace_root / raw_name
-    else:
-        target = workspace_root
-
+    target = (workspace_root / raw_name) if raw_name else workspace_root
     resolved_target = target.resolve()
+
+    # Enforce containment within the configured workspace root.
+    try:
+        resolved_target.relative_to(workspace_root)
+    except ValueError:
+        raise HTTPException(status_code=403, detail="Path not allowed")
+
     if not _is_path_allowed(str(resolved_target)):
         raise HTTPException(status_code=403, detail="Path not allowed")
 
@@ -789,8 +792,15 @@ async def set_workspace(request: dict):
     if not new_path:
         raise HTTPException(status_code=400, detail="path is required")
 
+    workspace_root = Path(WORKSPACE_PATH).resolve()
+
     # Canonicalize first, then enforce allow-list boundary on the resolved path.
     path = Path(new_path).resolve()  # lgtm[py/path-injection]
+    try:
+        path.relative_to(workspace_root)
+    except ValueError:
+        raise HTTPException(status_code=403, detail="Cannot set workspace outside configured root")
+
     if not _is_path_allowed(str(path)):
         raise HTTPException(status_code=403, detail="Cannot set workspace to system folder")
 
