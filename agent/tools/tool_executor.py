@@ -308,7 +308,7 @@ class ToolExecutor:
             if inspect.iscoroutinefunction(tool_func):
                 result = await tool_func(input)
             else:
-                result = tool_func(input)
+                result = await asyncio.to_thread(tool_func, input)
             return result
         except Exception as e:
             self.logger.error("tool_execution_failed", tool=tool_name, error=str(e))

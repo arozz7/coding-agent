@@ -17,6 +17,7 @@ _MODEL_NOT_READY_HINTS = (
     "failed to load",
     "model is loading",
     "not available",
+    "crashed",
 )
 
 
