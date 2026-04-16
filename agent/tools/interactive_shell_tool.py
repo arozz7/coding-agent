@@ -68,21 +68,28 @@ class InteractiveShellTool:
     """
 
     def __init__(self, workspace_path: str):
-        # Canonicalize and validate workspace_path at the sink (defense in depth).
-        candidate = Path(workspace_path).resolve(strict=False)
-
         # Use the configured workspace root as the trust boundary.
         # AGENT_EFFECTIVE_WORKSPACE may point at a project subdir and is mutable,
         # so we anchor validation to WORKSPACE_PATH.
         configured_root = os.getenv("WORKSPACE_PATH", "./workspace")
-        allowed_root = Path(configured_root).resolve(strict=False)
+        try:
+            allowed_root = Path(configured_root).resolve(strict=True)
+        except FileNotFoundError as exc:
+            raise ValueError("Configured workspace root does not exist") from exc
+
+        # Canonicalize and validate workspace_path at the sink (defense in depth).
+        # strict=True ensures the target exists and resolves symlinks before checks.
+        try:
+            candidate = Path(workspace_path).resolve(strict=True)
+        except FileNotFoundError as exc:
+            raise ValueError("workspace_path must be an existing directory") from exc
 
         try:
             candidate.relative_to(allowed_root)
         except ValueError as exc:
             raise ValueError("workspace_path must be within the configured workspace root") from exc
 
-        if not candidate.exists() or not candidate.is_dir():
+        if not candidate.is_dir():
             raise ValueError("workspace_path must be an existing directory")
 
         self.workspace = candidate
