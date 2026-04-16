@@ -108,6 +108,11 @@ class AgentOrchestrator:
         from api.task_store import TaskStore
         self.task_store = TaskStore("data/jobs.db")
 
+        # Collect model-switch notices emitted by the router during task execution.
+        # Drained at each task-loop boundary and surfaced in job phase + response text.
+        self._model_switch_notices: list[str] = []
+        self.model_router.register_switch_callback(self._on_model_switch)
+
         # Subagent management
         self.subagents: dict[str, "SubagentSession"] = {}
         
@@ -282,6 +287,41 @@ class AgentOrchestrator:
             for sa in self.subagents.values()
         ]
     
+    def _on_model_switch(self, event) -> None:
+        """Callback registered on ModelRouter — accumulates switch notices."""
+        notice = (
+            f"⚠️ Model switch: `{event.from_model}` → `{event.to_model}` "
+            f"(reason: {event.reason})"
+        )
+        self._model_switch_notices.append(notice)
+        self.logger.warning(
+            "model_switch_detected",
+            from_model=event.from_model,
+            to_model=event.to_model,
+            reason=event.reason,
+        )
+
+    def _drain_switch_notices(self, on_phase: Optional[Callable[[str], None]] = None) -> list[str]:
+        """Return accumulated model-switch notices and clear the buffer.
+
+        If *on_phase* is provided, also emits a ``model_switch:`` phase label
+        so the job-store poller (and Discord bot) can surface it in real time.
+        """
+        if not self._model_switch_notices:
+            return []
+        notices = list(self._model_switch_notices)
+        self._model_switch_notices.clear()
+        if on_phase and notices:
+            # Emit a single phase update with the first switch summary.
+            first = notices[0]
+            # Strip the emoji prefix for the compact phase label
+            compact = first.replace("⚠️ ", "")
+            try:
+                on_phase(f"model_switch:{compact}")
+            except Exception:
+                pass
+        return notices
+
     def _detect_task_type_keyword(self, task: str) -> str:
         """Keyword-based task classifier — used as fallback when LLM is unavailable.
 
@@ -819,6 +859,7 @@ class AgentOrchestrator:
             "model_router": self.model_router,
             "tool_executor": session_executor,
             "enriched_context": enriched_context + history,
+            "on_phase": on_phase,
         }
 
         if task_type == "plan":
@@ -885,6 +926,7 @@ class AgentOrchestrator:
 
         all_responses: list[str] = []
         all_files: list[str] = []
+        task_summaries: list[str] = []
         screenshot_path: Optional[str] = None
         task_num = 0
 
@@ -929,6 +971,13 @@ class AgentOrchestrator:
                     _direct=True,    # go straight to agent
                 )
 
+                # Surface any model-switch events that fired during this step.
+                switch_notices = self._drain_switch_notices(on_phase)
+                if switch_notices:
+                    for notice in switch_notices:
+                        all_responses.append(notice)
+                        task_summaries.append(notice)
+
                 if result.get("success"):
                     response_text = result.get("response", "")
                     all_responses.append(
@@ -963,6 +1012,11 @@ class AgentOrchestrator:
                     if task_id:
                         self.task_store.update_task(task_id, "done", result_summary)
 
+                    # Collect a one-line summary per task for the Discord Done message.
+                    completion_summary = result.get("completion_summary", "").strip()
+                    short = completion_summary or response_text[:80].replace("\n", " ").strip()
+                    task_summaries.append(f"✅ **{description[:60]}** — {short}")
+
                     # Persist subtask learnings to wiki so later tasks can reference them.
                     try:
                         await self.skill_executor.execute_post(
@@ -975,6 +1029,7 @@ class AgentOrchestrator:
                     all_responses.append(
                         f"**Task {task_num}: {description[:60]}** — failed: {error}"
                     )
+                    task_summaries.append(f"❌ **{description[:60]}** — {error[:80]}")
                     if task_id:
                         self.task_store.update_task(task_id, "failed", error)
                     self.logger.warning(
@@ -994,12 +1049,14 @@ class AgentOrchestrator:
                 all_responses.append(
                     f"**Task {task_num}: {description[:60]}** — error: {exc}"
                 )
+                task_summaries.append(f"❌ **{description[:60]}** — {str(exc)[:80]}")
 
             # Safety guard for no-persistence mode
             if not job_id and task_num >= len(task_specs):
                 break
 
         combined = "\n\n---\n\n".join(all_responses) if all_responses else "(no output)"
+        job_summary = "\n".join(task_summaries) if task_summaries else ""
         # Deduplicate files while preserving order
         seen: set[str] = set()
         unique_files: list[str] = []
@@ -1019,6 +1076,7 @@ class AgentOrchestrator:
             "files_created": unique_files,
             "screenshot_path": screenshot_path,
             "task_count": total,
+            "job_summary": job_summary,
         }
 
     def _build_context_from_events(self, session_id: str) -> str:
@@ -1200,6 +1258,7 @@ class AgentOrchestrator:
                         "skill_reports": post_skill_reports,
                         "screenshot_path": result.get("screenshot_path"),
                         "handover_bridge": handover_bridge,
+                        "job_summary": result.get("job_summary", ""),
                     },
                 }
             else:

@@ -38,6 +38,24 @@ class FileSystemTool:
     def _validate_path(self, path: str) -> Path:
         try:
             if not os.path.isabs(path):
+                # Strip redundant workspace-name prefix: if the LLM writes
+                # "my-project/src/main.py" but the workspace is already scoped
+                # to "my-project/", remove the leading component so the file
+                # lands in the right place instead of being double-nested.
+                # NOTE: this assumes the project root name is not intentionally
+                # repeated as a subdirectory (e.g. Python src-layout mylib/mylib/
+                # would be stripped). For this codebase (game/web projects) that
+                # pattern does not arise.
+                parts = Path(path).parts
+                if parts and parts[0] == self.allowed_base.name and len(parts) > 1:
+                    stripped = str(Path(*parts[1:]))
+                    self.logger.debug(
+                        "stripped_redundant_project_prefix",
+                        original=path,
+                        stripped=stripped,
+                        workspace_name=self.allowed_base.name,
+                    )
+                    path = stripped
                 resolved = (self.allowed_base / path).resolve()
             else:
                 resolved = Path(path).resolve()

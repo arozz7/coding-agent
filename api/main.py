@@ -140,6 +140,10 @@ class SessionInfo(BaseModel):
 _model_router: Optional[ModelRouter] = None
 _orchestrator: Optional[AgentOrchestrator] = None
 
+# Model-switch events emitted outside of a running job (e.g. task classifier).
+# Drained by GET /events/model-switches so the Discord bot can notify the user.
+_pending_switch_events: list[dict] = []
+
 # Effective workspace: WORKSPACE_PATH/PROJECT_DIR when PROJECT_DIR is set,
 # otherwise bare WORKSPACE_PATH.  GitTool reads WORKSPACE_PATH from os.environ,
 # so we update it here to match the effective path.
@@ -243,6 +247,17 @@ async def _init_agent_background() -> None:
             )
             attempt += 1
             await asyncio.sleep(delay)
+
+    # Register a module-level switch callback so events that fire outside of a
+    # running task (e.g. the task-type classifier) still surface via the API.
+    def _api_switch_callback(event) -> None:
+        _pending_switch_events.append({
+            "from_model": event.from_model,
+            "to_model": event.to_model,
+            "reason": event.reason,
+            "timestamp": event.timestamp.isoformat(),
+        })
+    _orchestrator.model_router.register_switch_callback(_api_switch_callback)
 
     # Probe the primary local model.  This is intentionally fire-and-forget:
     # a failed probe does not block startup — the ModelNotReadyError retry
@@ -385,7 +400,7 @@ async def start_task_background(request: TaskRequest):
                     phase="complete",
                     task_type=inner.get("task_type", task_type),
                     files_created=inner.get("files_created", []),
-                    summary=_summarize_response(full_response),
+                    summary=inner.get("job_summary") or _summarize_response(full_response),
                     _full_response=full_response,
                     screenshot_path=inner.get("screenshot_path"),
                 )
@@ -565,6 +580,18 @@ async def wake_session(session_id: str):
     return result
 
 
+@app.get("/events/model-switches")
+async def get_model_switch_events():
+    """Return and clear pending model-switch events.
+
+    The Discord bot polls this endpoint to notify users when the router
+    has fallen back from a local model to a remote one.
+    """
+    events = list(_pending_switch_events)
+    _pending_switch_events.clear()
+    return {"events": events}
+
+
 @app.get("/models")
 async def list_models():
     if not _orchestrator:
@@ -720,20 +747,32 @@ async def set_project(request: dict):
 
     raw_name = (request.get("name") or "").strip()
 
-    # Reject names that try to escape the workspace root.
-    if ".." in raw_name or raw_name.startswith(("/", "\\")):
-        raise HTTPException(status_code=400, detail="Invalid project name")
+    workspace_root = Path(WORKSPACE_PATH).resolve()
+    target = (workspace_root / raw_name) if raw_name else workspace_root
+        # Allow only safe project path characters and reject dangerous segments.
+        if not re.fullmatch(r"[A-Za-z0-9._\-/]+", raw_name):
+            raise HTTPException(status_code=400, detail="Invalid project name")
+        parts = Path(raw_name).parts
+        if any(part in ("", ".", "..") for part in parts):
+            raise HTTPException(status_code=400, detail="Invalid project name")
+    resolved_target = target.resolve()
 
-    if raw_name:
-        target = Path(WORKSPACE_PATH) / raw_name
-    else:
-        target = Path(WORKSPACE_PATH)
-
-    if not _is_path_allowed(str(target)):
+    # Enforce containment within the configured workspace root.
+    try:
+        resolved_target.relative_to(workspace_root)
+    try:
+        resolved_target.relative_to(workspace_root)
+    except ValueError:
         raise HTTPException(status_code=403, detail="Path not allowed")
 
-    target.mkdir(parents=True, exist_ok=True)  # lgtm[py/path-injection]
-    _current_workspace = str(target.resolve())  # lgtm[py/path-injection]
+    except ValueError:
+        raise HTTPException(status_code=403, detail="Path not allowed")
+
+    if not _is_path_allowed(str(resolved_target)):
+        raise HTTPException(status_code=403, detail="Path not allowed")
+
+    resolved_target.mkdir(parents=True, exist_ok=True)  # lgtm[py/path-injection]
+    _current_workspace = str(resolved_target)  # lgtm[py/path-injection]
     os.environ["AGENT_EFFECTIVE_WORKSPACE"] = _current_workspace
 
     from local_coding_agent import create_agent
@@ -759,22 +798,24 @@ async def set_workspace(request: dict):
     new_path = request.get("path")
     if not new_path:
         raise HTTPException(status_code=400, detail="path is required")
-    
-    # Security: Check if path is allowed
-    if not _is_path_allowed(new_path):
-        raise HTTPException(status_code=403, detail="Cannot set workspace to system folder")
-    
-    # Validate path exists and is a directory
-    # _is_path_allowed() checked above; resolve() + second check below prevent symlink escapes.
+
+    workspace_root = Path(WORKSPACE_PATH).resolve()
+
+    # Canonicalize first, then enforce allow-list boundary on the resolved path.
     path = Path(new_path).resolve()  # lgtm[py/path-injection]
+    try:
+        path.relative_to(workspace_root)
+    except ValueError:
+        raise HTTPException(status_code=403, detail="Cannot set workspace outside configured root")
+
+    if not _is_path_allowed(str(path)):
+        raise HTTPException(status_code=403, detail="Cannot set workspace to system folder")
+
+    # Validate path exists and is a directory
     if not path.exists():
         raise HTTPException(status_code=404, detail="Path does not exist")
     if not path.is_dir():
         raise HTTPException(status_code=400, detail="Path is not a directory")
-
-    # Double-check after resolve (catches symlink traversal)
-    if not _is_path_allowed(str(path)):
-        raise HTTPException(status_code=403, detail="Cannot set workspace to system folder")
 
     _current_workspace = str(path)
     # Keep GitTool in sync with the new workspace.

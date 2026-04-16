@@ -158,6 +158,38 @@ This phase hardened the runtime reliability of the coding agent across four area
 
 ---
 
+### Iterative Research Agent
+
+#### `agent/agents/research_agent.py` (rewrite)
+- **Routing decision:** tasks with no web-search trigger keywords that reference local files use the original fast-path (single-pass). Web-facing tasks enter the new iterative path.
+- **Step 1 — Decompose:** LLM breaks the task into 3-5 focused sub-questions (`enable_thinking=False`; falls back to raw task on parse failure).
+- **Step 2 — Parallel search:** `asyncio.gather(..., return_exceptions=True)` runs a web search + top-page deep-fetch for each sub-question concurrently. A failed sub-search does not block the others.
+- **Step 3 — Gap analysis:** LLM reviews gathered snippets and identifies up to 2 follow-up queries (`enable_thinking=False`). Returns nothing if content is sufficient.
+- **Step 4 — Follow-up searches:** parallel deep-fetch for gap queries (capped at 2).
+- **Step 5 — Synthesis:** single LLM call over all gathered + local content.
+- **Context budget:** total web content capped at 14 000 chars via `_trim_to_budget()`; per-source caps of 1 200 (search) + 1 500 (page).
+- **`on_phase` threading:** emits `researching:planning`, `researching:searching (N questions)`, `researching:checking gaps`, `researching:follow-up (N queries)`, `researching:synthesizing` — visible in Discord live status.
+
+#### `agent/orchestrator.py`
+- `_run_specialized_agent` context dict now includes `"on_phase": on_phase` so research (and other) agents can emit live phase updates.
+
+---
+
+### Discord Output Summary + `!research` Command
+
+#### `agent/orchestrator.py`
+- `_run_task_loop`: collects a one-line `completion_summary` per task (from the developer agent's `## DONE` block, falling back to the first 80 chars of response text). Appends `✅/❌ **description** — summary` to `task_summaries`. Builds `job_summary` from all entries; returned as `"job_summary"` in the result dict.
+- `run_task` inner result dict: passes `"job_summary": result.get("job_summary", "")` through so `main.py` can read it.
+
+#### `api/main.py`
+- `_run()`: `summary` field in the job-store update now prefers `inner.get("job_summary")` over `_summarize_response(full_response)`. For multi-task dev/research jobs, Discord's Done message now shows a structured per-task status list instead of the first 500 chars of verbose agent output.
+
+#### `api/discord_bot.py`
+- Added `!research <task>` command: forces `force_task_type="research"`, analogous to `!dev` for the develop path.
+- Removed `"research"` from `_INLINE_TYPES` (was `{"chat", "research", "plan"}`). Research responses now use the summary+`!result` flow — the full report is available via `!result` rather than streamed inline.
+
+---
+
 ## Root Causes Fixed (Follow-on)
 
 | Bug | Root Cause | Fix |
@@ -175,6 +207,9 @@ This phase hardened the runtime reliability of the coding agent across four area
 | Job stuck at "preparing" for 26+ minutes | Qwen3 generates `<think>` block before every response, including 1-word classifier answers, which can take 10-30 min; `asyncio.wait_for` cannot cancel httpx mid-read on Python 3.12 | (1) `_do_generate` now uses `asyncio.to_thread` + sync `httpx.Client` so `wait_for` can cancel on Python 3.12; (2) `model_router.generate` accepts `enable_thinking` override; classifier passes `enable_thinking=False` since it only needs one word — all real coding/planning calls keep thinking enabled |
 | Task stuck for 1+ hour; entire API server frozen | `httpx.AsyncClient` blocks the asyncio event loop when stuck mid-read — all FastAPI endpoints (incl. `/health`, `/jobs`) become unreachable; supervisor watchdog can't reach API to detect stale job | `asyncio.to_thread` fix moves httpx off the event loop; supervisor `_check_stale_job` now counts consecutive API-unreachable cycles and forces restart after 15 min of unreachable API |
 | Timeout retries waste 1800s (3× 600s) before failing | Generic `except Exception` in `model_router.generate` retried all errors including timeouts | Timeout errors (containing "timeout" in message) now fail fast without retry |
+| Shell commands block event loop; `/health` becomes unreachable; supervisor kills API | `tool_executor.py` called sync `tool_func(input)` directly on the asyncio thread; `subprocess.run(timeout=60)` blocks the loop for up to 60s | `await asyncio.to_thread(tool_func, input)` moves sync tools off the event loop |
+| LM Studio model crash treated as retriable error with 1-2s backoff instead of 120s patience | HTTP 400 body contains "crashed" but string not in `_MODEL_NOT_READY_HINTS` | Added `"crashed"` to `_MODEL_NOT_READY_HINTS`; crash errors now raise `ModelNotReadyError` → 120s wait × 3 |
+| LM Studio crash during generation causes 10-min stall per task (600s hard timeout) | `generate()` commits to httpx call before checking whether the model is loaded; unresponsive LM Studio burns the full timeout window per attempt | Pre-flight `check_model_state()` (5s timeout) in `ollama_client.generate()`; raises `ModelNotReadyError` immediately if state ≠ "loaded" so the 120s patience loop triggers instead of the 600s timeout path |
 
 ---
 

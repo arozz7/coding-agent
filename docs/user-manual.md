@@ -13,8 +13,9 @@ A comprehensive guide to using the Local Coding Agent.
 7. [Model Management](#model-management)
 8. [Context Bridge](#context-bridge)
 9. [Agent Wiki Memory](#agent-wiki-memory)
-10. [REST API Reference](#rest-api-reference)
-11. [Troubleshooting](#troubleshooting)
+10. [Interactive Testing Tools](#interactive-testing-tools)
+11. [REST API Reference](#rest-api-reference)
+12. [Troubleshooting](#troubleshooting)
 
 ---
 
@@ -63,14 +64,17 @@ python -m pip install -e .
 | `BOT_PYTHON` | No | `sys.executable` | Python interpreter for the bot subprocess (set when bot uses a different venv than the API) |
 | `API_STARTUP_TIMEOUT` | No | `120` | Seconds supervisor waits for `/health` on startup |
 | `RESTART_DELAY_SECS` | No | `3` | Seconds between stop and start during a supervisor restart |
+| `MAX_FIX_ITERATIONS` | No | `50` | Maximum fix-loop iterations the developer agent will attempt before giving up on a build error |
+| `BOT_STATUS_CHANNEL_ID` | No | — | Discord channel ID for model-switch alerts (e.g. when the agent falls back from local to remote). Leave unset to disable |
 
 ### Model Configuration (`config/models.yaml`)
 
 ```yaml
 models:
-  # Local model via LM Studio or Ollama
+  # Local model via LM Studio
   - name: qwen3.5-35b-a3b
     type: local
+    provider: lmstudio             # lmstudio | ollama | llama_cpp
     endpoint: ${LM_STUDIO_URL:-http://127.0.0.1:1234}  # supports ${VAR:-default}
     context_window: 262144
     is_coding_optimized: true
@@ -90,6 +94,13 @@ defaults:
   coding_model: qwen3.5-35b-a3b      # used for all develop/plan/test tasks
   planning_model: google_gemma-4-31b-it
   fallback_model: openai/gpt-oss-120b:free
+
+  # Local model runtime behaviour
+  local_runtime:
+    single_model_only: true          # unload other local models before loading a new one
+    load_timeout_secs: 300           # how long to wait for a model to become loaded
+    load_poll_interval_secs: 10      # polling cadence while waiting
+    max_load_attempts: 2             # attempts before switching to remote fallback
 ```
 
 **Key fields:**
@@ -97,7 +108,8 @@ defaults:
 | Field | Description |
 |-------|-------------|
 | `name` | Must exactly match the model ID in LM Studio / OpenRouter |
-| `type` | `local` (Ollama/LM Studio) or `remote` (OpenRouter/OpenAI-compatible) |
+| `type` | `local` (LM Studio/Ollama) or `remote` (OpenRouter/OpenAI-compatible) |
+| `provider` | Backend for local models: `lmstudio` (default), `ollama`, or `llama_cpp`. Controls whether the programmatic load/unload API is available |
 | `endpoint` | API base URL; supports `${ENV_VAR:-default}` syntax |
 | `context_window` | Token limit — used by the context bridge to decide when to hand over |
 | `is_coding_optimized` | Marks model as preferred for coding tasks |
@@ -160,6 +172,17 @@ Force the **develop** path — bypasses the LLM classifier entirely. Use this wh
 !dev run npm install and fix any errors
 !dev fix the TypeScript errors in src/index.ts
 ```
+
+#### `!research <task>`
+Force the **research** path — bypasses the LLM classifier. Runs the full iterative research flow (decompose → parallel search → gap analysis → synthesize). Use when the classifier routes a research task to chat or develop.
+
+```
+!research how does the context bridge work in orchestrator.py
+!research compare Playwright vs Puppeteer for automated browser testing
+!research latest breaking changes in Next.js 15
+```
+
+The Done message shows a one-line summary. Use `!result` to read the full report.
 
 #### `!continue [note]`
 Resume the current active debugging session. Optionally attach a note to guide the next iteration.
@@ -307,7 +330,7 @@ The agent auto-classifies every `!ask` task into one of these types:
 | Type | When it fires | What happens |
 |------|--------------|--------------|
 | `develop` | Write, fix, run, build, debug, compile, npm, execute | `DeveloperAgent` — writes files, runs shell, fix loop up to 10 iterations |
-| `research` | Investigate, find, explain, search for, how does | `ResearchAgent` — reads files, web search, synthesis report |
+| `research` | Investigate, find, explain, search for, how does | `ResearchAgent` — iterative: decomposes → parallel web search → gap analysis → synthesis. Fast-path for local file tasks. Full report via `!result` |
 | `plan` | Plan first, show me a plan, roadmap | `PlanAgent` — creates implementation plan without writing code |
 | `sdlc` | Build me a complete app, end-to-end | Full SDLC pipeline: plan → build → test → debug → run → verify |
 | `test` | Write tests, pytest, unit tests | `TesterAgent` — writes and runs test suites |
@@ -315,7 +338,58 @@ The agent auto-classifies every `!ask` task into one of these types:
 | `architect` | System design, write an ADR | `ArchitectAgent` — high-level design decisions |
 | `chat` | Everything else | `ChatAgent` — conversational Q&A (no file tools) |
 
-**Pre-LLM keyword fast-path:** Common develop patterns (fix, run, npm, build, compile, debug) are classified immediately without an LLM call. Use `!dev` to force the develop path if auto-classification is wrong.
+**Pre-LLM keyword fast-path:** Common develop patterns (fix, run, npm, build, compile, debug) are classified immediately without an LLM call. Use `!dev` to force the develop path, or `!research` to force the research path, if auto-classification is wrong.
+
+---
+
+## Iterative Research
+
+The research agent uses a multi-step approach inspired by deep-research systems for web-facing tasks:
+
+### Flow
+
+```
+1. Decompose   LLM breaks the task into 3–5 focused sub-questions
+                (thinking disabled — structured output, no trace needed)
+
+2. Search      asyncio.gather runs web search + top-page deep-fetch
+                for each sub-question in parallel
+                (one failed search doesn't block the others)
+
+3. Gap check   LLM reviews gathered content and identifies up to 2
+                follow-up queries for missing information
+                (thinking disabled)
+
+4. Follow-up   Parallel searches for the identified gaps (max 2)
+
+5. Synthesize  Single LLM call over all gathered content produces
+                a structured report (Summary / Sources / Findings / Dependencies)
+```
+
+### Fast path
+
+If the task references local files and contains no web-trigger keywords (latest, news, released, search for…), the agent skips decomposition and runs a single-pass synthesis directly. This keeps simple codebase questions fast.
+
+Examples:
+- **Iterative path:** `!research best practices for async Python error handling` → decomposes + 5 parallel web searches
+- **Fast path:** `!research how does orchestrator.py handle the context bridge` → reads the file, single synthesis
+
+### Limits
+
+| Parameter | Value |
+|-----------|-------|
+| Max sub-questions | 5 |
+| Max follow-up queries | 2 |
+| Total web content budget | 14 000 chars |
+| Per search-result snippet | 1 200 chars |
+| Per deep-fetched page | 1 500 chars |
+
+### Viewing the full report
+
+The Done message shows a one-line summary. The full structured report is always available via:
+```
+!result
+```
 
 ---
 
@@ -351,17 +425,32 @@ The agent handles this automatically:
 - **Classifier calls** always pass `enable_thinking=False` — no 10-30 min thinking trace for a one-word answer
 - **All coding, planning, and review calls** use the model's default thinking setting (enabled)
 - **Wiki synthesis** passes `enable_thinking=False` — structured output doesn't benefit from deep reasoning
+- **Research decompose & gap-analysis calls** pass `enable_thinking=False` — both produce structured lists (numbered queries), not prose reasoning
 
 You should not set `enable_thinking: false` in `models.yaml` — that would disable thinking globally for all tasks.
 
 ### Model Fallback
 
-If a local model is unavailable (HTTP 503 / "model not loaded"):
-1. Supervisor logs `model_not_ready_waiting`, waits 120s, retries up to 3 times
-2. After 3 failed attempts, falls back to the next available local model
-3. If no local fallback, falls back to the configured `fallback_model` in `models.yaml`
+When a local model is `not-loaded` (pre-flight check via LM Studio `/api/v0/models`):
 
-Timeout errors fail immediately without retry (a second attempt at 600s is wasteful).
+**LM Studio provider** (`provider: lmstudio`):
+1. The agent calls `POST /api/v1/models/unload` for any other loaded local models (when `single_model_only: true`) to free VRAM
+2. Calls `POST /api/v1/models/load` to trigger the load
+3. Polls `check_model_state()` every `load_poll_interval_secs` until `"loaded"` or `load_timeout_secs` expires
+4. If loaded: retries the original request immediately
+5. After `max_load_attempts` failures: walks the **full fallback chain** (other local models first, then remote models in config order — only remotes with a valid API key are used)
+
+**Other backends** (`provider: ollama` / `llama_cpp`):
+- Falls back to blind 120s wait + retry (programmatic load API not available)
+
+**Fallback chain ordering:** `[other locals...] → [remotes with API keys in config order]`
+
+**Discord notification:** When the router switches to a fallback model:
+- The Discord status message shows `⚠️ Model switch: <from> → <to>` inline during a running task
+- A separate channel message is posted in the active job channel
+- If `BOT_STATUS_CHANNEL_ID` is set, out-of-job switches are also posted to that channel
+
+Timeout errors fail immediately without retry (repeating a 600s timed-out request is wasteful).
 
 ### Switching Models at Runtime
 
@@ -418,6 +507,116 @@ Use `!skills` to see available wiki skills. The wiki accumulates over time and i
 
 ---
 
+## Interactive Testing Tools
+
+In addition to running shell commands non-interactively, the agent has two tools for
+testing apps that require real interaction — CLI prompts and browser clicks.
+
+### `interactive_shell` — Drive CLI apps via stdin/stdout
+
+Use this when the app is a readline-based program (REPL, text adventure, setup wizard,
+interactive installer) that blocks waiting for keyboard input.
+
+**How it works:** The tool spawns the process with piped stdin/stdout, then follows a
+script of `expect`/`send`/`wait` steps. Each `expect` waits (regex match, case-insensitive)
+for a pattern in stdout before proceeding. After the script, stdin is closed and remaining
+output is drained.
+
+**Script step fields** (all optional, combine freely):
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `expect` | string | Regex to wait for in stdout before continuing |
+| `send` | string | Text to write to stdin (newline appended automatically) |
+| `wait` | float | Sleep N seconds — useful after a `send` that triggers async work |
+
+**Example — test a Node.js text adventure:**
+
+```python
+result = await executor.execute("interactive_shell", {
+    "command": "npm start",
+    "script": [
+        {"expect": "name",   "send": "Alice"},
+        {"expect": "option", "send": "1"},
+        {"expect": "option", "send": "3"},
+    ],
+    "timeout": 15,
+})
+# result["transcript"] shows interleaved stdout + [sent] markers
+# result["returncode"] is the process exit code
+```
+
+**Return value:**
+
+```json
+{
+  "success": true,
+  "transcript": "Welcome! What is your name?\n[sent] 'Alice'\nHello Alice!\n...",
+  "returncode": 0
+}
+```
+
+**Platform notes:** Works on Windows, macOS, and Linux. Apps that require a real TTY
+(ncurses, raw-terminal mode) won't behave correctly — use `browser_interact` for those
+or wrap them in a web interface first.
+
+---
+
+### `browser_interact` — Drive web apps with Playwright
+
+Use this to test or operate any web app by navigating, clicking, filling forms, reading
+text, and taking screenshots — the same actions a human would perform in a browser.
+
+**Requires:** `playwright` Python package and Chromium installed.
+If not present: `pip install playwright && playwright install chromium`
+
+**Action types:**
+
+| Type | Required fields | Optional | Description |
+|------|----------------|----------|-------------|
+| `navigate` | `url` | — | Go to a URL |
+| `click` | `selector` | — | Click a CSS selector |
+| `fill` | `selector`, `value` | — | Type into an input |
+| `press` | `key` | `selector` | Press a key (globally or on an element) |
+| `screenshot` | — | `path` | Save a screenshot (auto-named if no path) |
+| `text` | `selector` | — | Read and log the element's text content |
+| `wait_for` | `selector` | `state` (`visible`) | Wait for an element to appear |
+| `wait` | `ms` | — | Sleep N milliseconds |
+
+**Example — log in and check the dashboard:**
+
+```python
+result = await executor.execute("browser_interact", {
+    "url": "http://localhost:3000",
+    "actions": [
+        {"type": "fill",     "selector": "#username", "value": "admin"},
+        {"type": "fill",     "selector": "#password", "value": "secret"},
+        {"type": "click",    "selector": "button[type=submit]"},
+        {"type": "wait_for", "selector": ".dashboard-header"},
+        {"type": "text",     "selector": "h1"},
+        {"type": "screenshot"},
+    ],
+    "timeout": 30,
+})
+# result["transcript"] is a human-readable log of every step
+# result["screenshots"] lists saved screenshot paths
+```
+
+**Return value:**
+
+```json
+{
+  "success": true,
+  "transcript": "[navigate] http://localhost:3000\n[fill] #username = 'admin'\n...\n[screenshot] saved to screenshot_1713270000_5.png",
+  "screenshots": ["screenshot_1713270000_5.png"]
+}
+```
+
+**Platform notes:** Playwright's Chromium driver is fully cross-platform. The same
+action scripts run unchanged on Windows, macOS, and Linux.
+
+---
+
 ## REST API Reference
 
 The API runs on port 5005 by default. All endpoints accept/return JSON.
@@ -457,6 +656,11 @@ GET /models
 
 POST /models/active
   Body: {"model": "model-name"}
+
+GET /events/model-switches
+  Returns and clears pending model-switch events (out-of-job switches).
+  {"events": [{"from_model", "to_model", "reason", "timestamp"}, ...]}
+  The Discord bot polls this every 30s to surface switches to BOT_STATUS_CHANNEL_ID.
 
 GET /llm/health
   Returns detailed health: circuit breaker states, rate limiter, cost summary
@@ -515,7 +719,18 @@ The task classifier is waiting for the LLM. Possible causes:
 
 ### "Model not ready" / HTTP 503 from LM Studio
 
-The model was evicted from VRAM (TTL expiry). The agent waits 120s and retries up to 3 times automatically. You'll see `model_not_ready_waiting` in the logs. If it keeps happening, increase LM Studio's model TTL or keep the model pinned.
+The model was evicted from VRAM (TTL expiry or LM Studio restart). The agent now handles this automatically:
+
+1. **Pre-flight check** detects `state='not-loaded'` before sending the request
+2. Any other loaded models are unloaded (if `single_model_only: true`) to free VRAM
+3. `POST /api/v1/models/load` is called to trigger the load
+4. The agent polls every 10s until the model is loaded (up to 300s)
+5. If the model loads: request proceeds immediately
+6. If it times out after `max_load_attempts`: falls back to remote models and **posts a Discord alert**
+
+You'll see `model_not_ready_loading` in the logs during the load attempt and `model_switch_fallback` if it falls through to remote.
+
+To prevent eviction: increase LM Studio's model TTL (Settings → Runtime → Model TTL) or set it to 0.
 
 ### npm / node / git not found in shell commands
 
@@ -547,6 +762,23 @@ The bridge triggers at 82% of `context_window`. If it fires too often, increase 
 
 The agent automatically falls back to your local model when a cloud provider returns 429. Logged as `using_local_fallback`. To reduce rate limiting, lower `rate_limit_rpm` in `models.yaml` or add more fallback models.
 
+### npm dependencies missing ("Cannot find module …")
+
+The developer agent now detects this automatically and runs `npm install` once before
+retrying. If you see it recurring across multiple jobs, the workspace may not have a
+`package.json` or the registry may be unreachable. Check with:
+
+```
+!dev npm install
+```
+
+### Interactive shell times out without matching the expected pattern
+
+The `expect` field is a Python regex matched against **accumulated** stdout, case-insensitively. Common causes:
+- The prompt uses a special regex character (e.g. `?`, `(`) — escape it or use a simpler pattern
+- The app buffers output and never flushes — increase `timeout` or add a `{"wait": 1}` step before the expect
+- The app exits before the pattern appears — check `result["transcript"]` for what was actually printed
+
 ### Web search returns no results
 
 The search chain tries: **Brave → DuckDuckGo → Playwright Google → Google CSE**.
@@ -565,4 +797,4 @@ Get-Content logs\bot-20260415-120005.log -Wait   # tail the latest bot log
 
 ---
 
-*Last updated: 2026-04-15 — Phase 18*
+*Last updated: 2026-04-16 — Phase 20 (bug fixes: path double-nesting, redundant cd, npm auto-install, research routing; interactive testing: `interactive_shell` + `browser_interact`)*

@@ -8,11 +8,16 @@ An autonomous coding agent with LLM integration, multi-agent orchestration, SDLC
 - **Discord Remote Control** — Submit tasks, monitor progress, switch models, manage sessions, and restart services from any device
 - **Agentic Task Manager** — Objectives decomposed into ordered task lists; agents execute sequentially, can add tasks dynamically, wiki knowledge persists between subtasks
 - **SDLC Pipeline** — Full plan → build → test → debug → run → verify workflow
-- **Autonomous Run & Debug** — Agent runs shell commands, reads errors, fixes code, re-runs (up to 10 iterations); explicit verify re-run after each fix
+- **Autonomous Run & Debug** — Agent runs shell commands, reads errors, fixes code, re-runs automatically; configurable iteration limit (default 50, set `MAX_FIX_ITERATIONS` in `.env`)
 - **Multi-Agent Routing** — Tasks routed to the right agent automatically: developer, researcher, planner, tester, reviewer, architect, chat
+- **Iterative Research** — Research agent decomposes queries into sub-questions, runs parallel web searches, identifies gaps, and synthesises a structured report; fast-path for local codebase queries
 - **Context Bridge** — Monitors token budget; at 82 % generates a structured handover and continues in a fresh session silently; Discord notifies at 75 %
-- **LM Studio Integration** — Live model state (loaded / not-loaded) from `/api/v0/models`; discovers downloaded-but-unconfigured models; per-call thinking mode control
-- **Local & Cloud LLM** — Flexible routing between LM Studio / Ollama (local) and OpenRouter / OpenAI-compatible APIs; circuit breaker, rate limiting, auto-fallback
+- **LM Studio Integration** — Live model state from `/api/v0/models`; discovers downloaded-but-unconfigured models; per-call thinking mode control; **programmatic load/unload** via `/api/v1/models/load` and `/api/v1/models/unload`
+- **Local & Cloud LLM** — Flexible routing between LM Studio / Ollama (local) and OpenRouter / OpenAI-compatible APIs; circuit breaker, rate limiting, **full remote fallback chain** (locals first, then remotes in config order)
+- **Single-Model Enforcement** — Optional `single_model_only: true` in `config/models.yaml` automatically unloads other local models before loading a new one — protects limited VRAM
+- **Model Switch Notifications** — Discord bot alerts when the router falls back from a local to a remote model mid-task (inline during task loops; background poll for out-of-job switches via `BOT_STATUS_CHANNEL_ID`)
+- **Interactive CLI Testing** — `interactive_shell` tool spawns any process and drives it via `expect`/`send`/`wait` scripts (REPLs, text adventures, wizard prompts); cross-platform asyncio subprocess
+- **Browser Interaction** — `browser_interact` tool drives Playwright (Chromium) to `navigate`, `click`, `fill`, `press`, `screenshot`, and read `text` on any web app; cross-platform (Windows/macOS/Linux)
 - **Workspace Scoping** — `PROJECT_DIR` env var focuses all file operations on an active project subdirectory; no path double-nesting
 - **Agent Wiki Memory** — `.agent-wiki/` knowledge base compiled per task; later subtasks query earlier ones; index deduplication; `!skills` to inspect
 - **RAG Memory** — Codebase indexed in ChromaDB; retrieved context injected into every task
@@ -48,10 +53,11 @@ python -m pip install -e .
 ```dotenv
 DISCORD_BOT_TOKEN=your-token-here
 AGENT_API_URL=http://127.0.0.1:5005
-LM_STUDIO_URL=http://127.0.0.1:1234   # default; change if LM Studio is on another port
+LM_STUDIO_URL=http://127.0.0.1:1234    # default; change if LM Studio is on another port
 WORKSPACE_PATH=J:\Projects\agent-workspace
-PROJECT_DIR=my-project                  # optional — scope agent to a subdirectory
-OPENROUTER_API_KEY=sk-or-...            # optional — enables cloud model fallback
+PROJECT_DIR=my-project                   # optional — scope agent to a subdirectory
+OPENROUTER_API_KEY=sk-or-...             # optional — enables cloud model fallback
+BOT_STATUS_CHANNEL_ID=123456789          # optional — channel for model-switch alerts
 ```
 
 **2. Edit `config/models.yaml`** to list your available models:
@@ -60,12 +66,17 @@ OPENROUTER_API_KEY=sk-or-...            # optional — enables cloud model fallb
 models:
   - name: qwen3.5-35b-a3b
     type: local
+    provider: lmstudio          # lmstudio | ollama | llama_cpp
     endpoint: ${LM_STUDIO_URL:-http://127.0.0.1:1234}
     context_window: 262144
     is_coding_optimized: true
 
 defaults:
   coding_model: qwen3.5-35b-a3b
+  local_runtime:
+    single_model_only: true     # unload others before loading (saves VRAM)
+    load_timeout_secs: 300
+    max_load_attempts: 2
 ```
 
 ### Running
@@ -89,6 +100,7 @@ python -m api.discord_bot
 |---------|-------------|
 | `!ask <task>` | Submit a task — auto-classifies type, polls in background |
 | `!dev <task>` | Force develop path — bypasses classifier, guaranteed to run/fix/build |
+| `!research <task>` | Force research path — web search, codebase investigation, analysis; full report via `!result` |
 | `!continue [note]` | Resume the current debugging session with an optional note |
 
 ### Job Monitoring
@@ -150,6 +162,18 @@ Logan [APP]: Done [develop] · 92s
               Fixed TypeError: cannot read property 'length' of undefined
               Files: src/game.js
 
+Zeus: !research compare LangChain and LlamaIndex for RAG pipelines
+
+Logan [APP]: Preparing… (2s)
+Logan [APP]: researching:planning (3s)
+Logan [APP]: researching:searching (5 questions) (8s)
+Logan [APP]: researching:checking gaps (42s)
+Logan [APP]: researching:follow-up (2 queries) (58s)
+Logan [APP]: researching:synthesizing (74s)
+Logan [APP]: Done [research] · 89s
+              ✅ Compare LangChain and LlamaIndex for RAG pipelines — see !result for full report
+Logan [APP]: Use `!result` to read the full report.
+
 Zeus: !models
 Logan [APP]: Configured Models · active: qwen3.5-35b-a3b
               **[active]** `qwen3.5-35b-a3b` — local · 262k ctx 🟢
@@ -165,7 +189,7 @@ Logan [APP]: Configured Models · active: qwen3.5-35b-a3b
 | Type | Triggered by | What it does |
 |------|-------------|--------------|
 | `develop` | implement, fix, run, build, debug, npm, compile, execute | Writes files, runs shell commands, auto-fixes errors (up to 10 iterations) |
-| `research` | search for, find where, how does, investigate | Reads files, searches web, synthesises reports |
+| `research` | search for, find where, how does, investigate | **Iterative research**: decomposes query → parallel web searches → gap analysis → synthesis. Fast-path for local-only tasks. Full report via `!result` |
 | `sdlc` | build me a complete, end-to-end | Full plan→build→test→debug→run→verify pipeline |
 | `plan` | plan first, show me a plan, before we build | Architecture plan before any code is written |
 | `test` | write tests, run tests, pytest | Writes and runs test suites |
@@ -173,7 +197,7 @@ Logan [APP]: Configured Models · active: qwen3.5-35b-a3b
 | `architect` | system design, write an ADR | High-level design and architecture decisions |
 | `chat` | everything else | General questions and conversation |
 
-> **Tip:** Use `!dev <task>` to force the develop path if the classifier picks the wrong type.
+> **Tip:** Use `!dev <task>` to force the develop path, or `!research <task>` to force the research path, if the classifier picks the wrong type.
 
 ---
 
@@ -219,6 +243,7 @@ Environment variables:
 | `GET` | `/models` | Configured models with live LM Studio state + unconfigured discovery list |
 | `GET` | `/models/active` | Currently active model |
 | `POST` | `/models/active` | Switch active model `{"model": "name"}` |
+| `GET` | `/events/model-switches` | Pending model-switch events (returns and clears queue) |
 | `GET` | `/workspace` | Current workspace path and project |
 | `GET` | `/workspace/file?path=` | Read a workspace file |
 | `POST` | `/workspace/project` | Set active project `{"project": "name"}` |
@@ -255,19 +280,20 @@ coding-agent/
 │   │   ├── skill_loader.py        # Lazy skill content loading
 │   │   └── wiki_manager.py        # .agent-wiki/ read/write, index upsert, lint
 │   └── tools/
-│       ├── shell_tool.py          # Shell execution, PATH auto-discovery, Windows .cmd fix
-│       ├── file_system_tool.py    # File CRUD
-│       ├── git_tool.py            # Git operations
-│       ├── browser_tool.py        # Playwright screenshots + server polling
-│       └── tool_executor.py       # Unified tool dispatch, output capping
+│       ├── shell_tool.py              # Shell execution, PATH auto-discovery, Windows .cmd fix
+│       ├── file_system_tool.py        # File CRUD
+│       ├── git_tool.py                # Git operations
+│       ├── browser_tool.py            # Playwright screenshots, server polling, browser interact
+│       ├── interactive_shell_tool.py  # asyncio expect/send driver for CLI apps
+│       └── tool_executor.py           # Unified tool dispatch, output capping
 ├── api/
 │   ├── main.py                    # FastAPI server, background init, all endpoints
 │   ├── job_store.py               # SQLite job store (write-through + in-memory cache)
 │   ├── task_store.py              # SQLite task store
 │   └── discord_bot.py             # Discord bot, commands, polling, _safe_edit
 ├── llm/
-│   ├── model_router.py            # Routing, fallback, enable_thinking override, timeout fail-fast
-│   ├── ollama_client.py           # LM Studio / Ollama client (asyncio.to_thread, list_all_models)
+│   ├── model_router.py            # Routing, fallback chain, load/unload, switch notifications, timeout fail-fast
+│   ├── ollama_client.py           # LM Studio / Ollama client (load, unload, poll, list_all_models)
 │   ├── cloud_api_client.py        # OpenRouter / OpenAI-compatible client
 │   ├── config.py                  # ModelConfig dataclass
 │   ├── cost_tracker.py            # Token usage and cost tracking
@@ -288,7 +314,7 @@ coding-agent/
 ├── tests/
 │   ├── unit/                      # Unit tests
 │   └── integration/               # Integration tests
-└── aiChangeLog/                   # Per-phase change logs (phase-03 through phase-18)
+└── aiChangeLog/                   # Per-phase change logs (phase-03 through phase-20)
 ```
 
 ---

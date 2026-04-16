@@ -17,6 +17,7 @@ _MODEL_NOT_READY_HINTS = (
     "failed to load",
     "model is loading",
     "not available",
+    "crashed",
 )
 
 
@@ -59,6 +60,19 @@ class OllamaClient:
         """
         url = self._get_chat_endpoint()
         self.logger.info("ollama_generate_start", model=model, prompt_len=len(prompt), url=url)
+
+        # Pre-flight: check the LM Studio model state before committing to a
+        # 600-second httpx timeout.  If the model is not "loaded" we raise
+        # ModelNotReadyError immediately so model_router applies its 120s
+        # patience retry loop instead of burning the full timeout window
+        # (~10 min) per attempt.  check_model_state has a 5-second timeout so
+        # it adds negligible overhead on the happy path.
+        state = await self.check_model_state(model)
+        if state is not None and state != "loaded":
+            raise ModelNotReadyError(
+                f"Model {model!r} is not loaded (state={state!r}); "
+                "will retry after LM Studio reload"
+            )
 
         # Use asyncio.wait_for as a hard wall-clock guard.  httpx's per-operation
         # timeout resets whenever LM Studio sends a byte (e.g. chunked keepalives
@@ -281,6 +295,107 @@ class OllamaClient:
         except Exception as e:
             self.logger.error("model_warmup_error", model=model, error=str(e))
             return False
+
+    async def load_model(self, identifier: str) -> bool:
+        """Ask LM Studio to load *identifier* via POST /api/v1/models/load.
+
+        Returns True if the request was accepted (HTTP 200/201), False on any
+        error.  Swallows all exceptions so callers never crash.
+        """
+        try:
+            async with httpx.AsyncClient(timeout=10.0) as client:
+                r = await client.post(
+                    f"{self.base_url}/api/v1/models/load",
+                    json={"identifier": identifier},
+                )
+                accepted = r.status_code in (200, 201)
+                if accepted:
+                    self.logger.info("lmstudio_load_requested", model=identifier)
+                else:
+                    self.logger.warning(
+                        "lmstudio_load_rejected",
+                        model=identifier,
+                        status=r.status_code,
+                        body=r.text[:200],
+                    )
+                return accepted
+        except Exception as e:
+            self.logger.warning("lmstudio_load_error", model=identifier, error=str(e))
+            return False
+
+    async def unload_model(self, identifier: str) -> bool:
+        """Ask LM Studio to unload *identifier* via POST /api/v1/models/unload.
+
+        Returns True if accepted.  Swallows all exceptions.
+        """
+        try:
+            async with httpx.AsyncClient(timeout=10.0) as client:
+                r = await client.post(
+                    f"{self.base_url}/api/v1/models/unload",
+                    json={"identifier": identifier},
+                )
+                accepted = r.status_code in (200, 201)
+                if accepted:
+                    self.logger.info("lmstudio_unload_requested", model=identifier)
+                else:
+                    self.logger.warning(
+                        "lmstudio_unload_rejected",
+                        model=identifier,
+                        status=r.status_code,
+                        body=r.text[:200],
+                    )
+                return accepted
+        except Exception as e:
+            self.logger.warning("lmstudio_unload_error", model=identifier, error=str(e))
+            return False
+
+    async def get_loaded_local_models(self) -> list[str]:
+        """Return model identifiers that are currently state='loaded' in LM Studio.
+
+        Returns an empty list when the endpoint is unavailable.
+        """
+        models = await self.list_all_models()
+        return [m["id"] for m in models if m.get("state") == "loaded"]
+
+    async def poll_until_loaded(
+        self,
+        identifier: str,
+        timeout: float = 300.0,
+        interval: float = 10.0,
+    ) -> bool:
+        """Poll check_model_state() until the model is 'loaded' or *timeout* expires.
+
+        Returns True when loaded, False on timeout.  Swallows all exceptions.
+        """
+        import asyncio as _asyncio
+        import time as _time
+
+        deadline = _time.monotonic() + timeout
+        attempt = 0
+        while _time.monotonic() < deadline:
+            try:
+                state = await self.check_model_state(identifier)
+                if state == "loaded":
+                    self.logger.info(
+                        "model_poll_loaded",
+                        model=identifier,
+                        attempts=attempt,
+                    )
+                    return True
+                self.logger.debug(
+                    "model_poll_waiting",
+                    model=identifier,
+                    state=state,
+                    attempt=attempt,
+                )
+            except Exception as e:
+                self.logger.warning("model_poll_error", model=identifier, error=str(e))
+            attempt += 1
+            remaining = deadline - _time.monotonic()
+            await _asyncio.sleep(min(interval, max(0, remaining)))
+
+        self.logger.warning("model_poll_timeout", model=identifier, timeout=timeout)
+        return False
 
     async def health_check(self, model: str) -> bool:
         """Return True only when the model is confirmed loaded in LM Studio.

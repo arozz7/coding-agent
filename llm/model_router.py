@@ -1,6 +1,8 @@
 import os
 import re
-from typing import Optional, List, AsyncIterator
+from dataclasses import dataclass, field
+from datetime import datetime
+from typing import Optional, List, AsyncIterator, Callable
 from pathlib import Path
 import yaml
 import structlog
@@ -16,6 +18,16 @@ from .circuit_breaker import CircuitBreakerOpenError
 logger = structlog.get_logger()
 
 
+@dataclass
+class ModelSwitchEvent:
+    """Emitted whenever the router gives up on a model and uses a fallback."""
+    from_model: str
+    to_model: str
+    reason: str          # "load_timeout" | "load_failed" | "circuit_open" | "reload_exhausted"
+    task_id: Optional[str] = None
+    timestamp: datetime = field(default_factory=datetime.utcnow)
+
+
 class ModelRouter:
     def __init__(self, config_path: str = "config/models.yaml"):
         self.configs: List[ModelConfig] = []
@@ -28,6 +40,15 @@ class ModelRouter:
         self.logger = logger.bind(component="model_router")
         self._defaults: dict = {}
         self._active_model_name: Optional[str] = None
+        # local_runtime defaults — overridden by models.yaml [local_runtime] section
+        self._local_runtime: dict = {
+            "single_model_only": True,
+            "load_timeout_secs": 300,
+            "load_poll_interval_secs": 10,
+            "max_load_attempts": 2,
+        }
+        # Registered callbacks, fired on every model switch (local→fallback).
+        self._switch_callbacks: list[Callable[[ModelSwitchEvent], None]] = []
         self._load_configs(config_path)
 
     def _configure_ollama_endpoint(self, config: ModelConfig) -> None:
@@ -76,6 +97,10 @@ class ModelRouter:
             data = yaml.safe_load(f)
 
         self._defaults = data.get("defaults", {})
+        # Merge local_runtime overrides from YAML (nested under defaults)
+        lr = self._defaults.get("local_runtime", {})
+        if lr:
+            self._local_runtime.update(lr)
 
         for m in data.get("models", []):
             try:
@@ -166,16 +191,84 @@ class ModelRouter:
         self._active_model_name = self._defaults.get("coding_model")
         self.logger.info("active_model_reset", model=self._active_model_name)
 
-    def _get_local_fallback(self, exclude_name: str) -> Optional[ModelConfig]:
-        """Return the first healthy local model that is not *exclude_name*."""
+    def register_switch_callback(self, fn: Callable[[ModelSwitchEvent], None]) -> None:
+        """Register a callback fired whenever the router switches to a fallback model.
+
+        The callback receives a :class:`ModelSwitchEvent` describing the switch.
+        It is called synchronously inside the async generate loop, so it must be
+        a plain (non-async) function — or a coroutine scheduled with
+        ``asyncio.create_task`` inside the callback body.
+        """
+        self._switch_callbacks.append(fn)
+
+    def _fire_switch_event(self, event: ModelSwitchEvent) -> None:
+        """Call all registered switch callbacks, swallowing exceptions."""
+        for fn in self._switch_callbacks:
+            try:
+                fn(event)
+            except Exception as e:
+                self.logger.warning("switch_callback_error", error=str(e))
+
+    def _get_fallback_chain(self, exclude_name: str) -> list[ModelConfig]:
+        """Return ordered fallback candidates: other locals first, then remotes.
+
+        Excludes *exclude_name* from the list.  Remotes are only included when
+        an api_key is configured (or api_key_env is set and the var is present).
+        """
+        locals_: list[ModelConfig] = []
+        remotes: list[ModelConfig] = []
         for cfg in self.configs:
-            if cfg.type == "local" and cfg.name != exclude_name:
-                return cfg
-        # If nothing else, use any local model (even the same name — better than failing)
-        for cfg in self.configs:
+            if cfg.name == exclude_name:
+                continue
             if cfg.type == "local":
-                return cfg
-        return None
+                locals_.append(cfg)
+            elif cfg.type == "remote":
+                # Only include remotes that have a usable API key
+                has_key = bool(cfg.api_key) or (
+                    bool(cfg.api_key_env) and bool(os.environ.get(cfg.api_key_env or ""))
+                )
+                if has_key:
+                    remotes.append(cfg)
+        return locals_ + remotes
+
+    async def _ensure_single_local_model(self, config: ModelConfig) -> None:
+        """Unload any other loaded local models before loading *config*.
+
+        Only runs when ``single_model_only`` is True in local_runtime config
+        and the provider is 'lmstudio' (we can only programmatically unload via
+        the LM Studio API).
+        """
+        if not self._local_runtime.get("single_model_only"):
+            return
+        if config.provider != "lmstudio":
+            return
+        try:
+            loaded = await self.ollama.get_loaded_local_models()
+            for model_id in loaded:
+                if model_id != config.name:
+                    self.logger.info(
+                        "unloading_other_model",
+                        model=model_id,
+                        reason="single_model_only",
+                    )
+                    await self.ollama.unload_model(model_id)
+        except Exception as e:
+            self.logger.warning("ensure_single_model_error", error=str(e))
+
+    async def _try_load_lmstudio_model(self, config: ModelConfig) -> bool:
+        """Unload others (if single_model_only), trigger load, then poll until ready.
+
+        Returns True when the model becomes loaded within the configured timeout.
+        """
+        await self._ensure_single_local_model(config)
+        accepted = await self.ollama.load_model(config.name)
+        if not accepted:
+            return False
+        return await self.ollama.poll_until_loaded(
+            config.name,
+            timeout=float(self._local_runtime.get("load_timeout_secs", 300)),
+            interval=float(self._local_runtime.get("load_poll_interval_secs", 10)),
+        )
 
     @staticmethod
     def _is_rate_limit_error(exc: Exception) -> bool:
@@ -183,12 +276,10 @@ class ModelRouter:
         msg = str(exc)
         return "429" in msg and ("Too Many Requests" in msg or "rate" in msg.lower())
 
-    # How long to wait between retries when the local model is not loaded.
-    # A 35B model at 3-bit can take 3–8 minutes to reload from disk.
-    # Three attempts × 120 s each = up to ~6 minutes of patience before
-    # we give up and try a fallback model.
+    # Fallback wait used for non-LM Studio local backends (ollama, llama_cpp)
+    # that don't support programmatic load.  A 35B model can take 3–8 min to
+    # load, so we give 120 s between blind retries.
     _MODEL_RELOAD_WAIT_SECS = 120
-    _MODEL_RELOAD_MAX_RETRIES = 3
 
     async def generate(
         self,
@@ -196,6 +287,7 @@ class ModelRouter:
         config: ModelConfig,
         max_retries: int = 3,
         _is_fallback: bool = False,
+        _fallback_chain: Optional[list] = None,
         timeout: float = 600.0,
         enable_thinking: bool | None = None,
     ) -> str:
@@ -214,7 +306,9 @@ class ModelRouter:
         # per-model config, then None (let the model decide).
         effective_thinking = enable_thinking if enable_thinking is not None else config.enable_thinking
 
-        model_reload_attempts = 0
+        # Track how many times we've tried to load this specific model.
+        model_load_attempts = 0
+        max_load_attempts = int(self._local_runtime.get("max_load_attempts", 2))
 
         for attempt in range(max_retries):
             try:
@@ -233,42 +327,52 @@ class ModelRouter:
                 return result
 
             except ModelNotReadyError as e:
-                # The local model was evicted (TTL expiry) and LM Studio hasn't
-                # reloaded it yet.  Use a long wait so the model has time to
-                # re-initialise before we retry.
-                model_reload_attempts += 1
                 self.health_checker.record_failure(config.name)
+                model_load_attempts += 1
 
-                if model_reload_attempts <= self._MODEL_RELOAD_MAX_RETRIES:
+                if config.provider == "lmstudio" and model_load_attempts <= max_load_attempts:
+                    # Use the LM Studio API to actively load the model, then poll.
+                    self.logger.warning(
+                        "model_not_ready_loading",
+                        model=config.name,
+                        load_attempt=model_load_attempts,
+                        error=str(e)[:120],
+                    )
+                    loaded = await self._try_load_lmstudio_model(config)
+                    if loaded:
+                        self.logger.info("model_loaded_retrying", model=config.name)
+                        attempt = 0  # noqa: PLW2901 — intentional loop-var reset
+                        continue
+                    # Load triggered but timed out — count as a failed attempt
+                    self.logger.warning(
+                        "model_load_timeout",
+                        model=config.name,
+                        load_attempt=model_load_attempts,
+                    )
+                elif config.provider != "lmstudio" and model_load_attempts <= max_load_attempts:
+                    # Non-LM Studio backend: fall back to blind wait
                     self.logger.warning(
                         "model_not_ready_waiting",
                         model=config.name,
-                        reload_attempt=model_reload_attempts,
+                        load_attempt=model_load_attempts,
                         wait_secs=self._MODEL_RELOAD_WAIT_SECS,
                         error=str(e)[:120],
                     )
                     await asyncio.sleep(self._MODEL_RELOAD_WAIT_SECS)
-                    # Reset the fast-retry loop counter so we get a fresh set
-                    # of attempts after the wait.
-                    attempt = 0  # noqa: PLW2901 — intentional loop-var reset
+                    attempt = 0  # noqa: PLW2901
                     continue
 
-                # Reload retries exhausted — try a fallback model.
-                if not _is_fallback:
-                    fallback = self._get_local_fallback(config.name)
-                    if fallback:
-                        self.logger.warning(
-                            "model_reload_exhausted_using_fallback",
-                            primary=config.name,
-                            fallback=fallback.name,
-                        )
-                        return await self.generate(
-                            prompt, fallback, max_retries=max_retries, _is_fallback=True, timeout=timeout
-                        )
-                raise LLMError(
-                    f"Model {config.name!r} failed to reload after "
-                    f"{self._MODEL_RELOAD_MAX_RETRIES} attempts and no fallback available"
-                ) from e
+                # Load attempts exhausted — walk the fallback chain.
+                return await self._run_fallback_chain(
+                    prompt=prompt,
+                    exclude=config.name,
+                    reason="load_timeout" if config.provider == "lmstudio" else "reload_exhausted",
+                    chain=_fallback_chain,
+                    max_retries=max_retries,
+                    timeout=timeout,
+                    enable_thinking=enable_thinking,
+                    original_error=e,
+                )
 
             except RateLimitExceeded as e:
                 self.logger.warning(
@@ -282,10 +386,20 @@ class ModelRouter:
 
             except CircuitBreakerOpenError:
                 self.logger.warning("circuit_breaker_open", model=config.name)
+                if not _is_fallback:
+                    return await self._run_fallback_chain(
+                        prompt=prompt,
+                        exclude=config.name,
+                        reason="circuit_open",
+                        chain=_fallback_chain,
+                        max_retries=max_retries,
+                        timeout=timeout,
+                        enable_thinking=enable_thinking,
+                        original_error=None,
+                    )
                 raise
 
             except _OpenRouterRateLimitError as e:
-                # OpenRouter 429 — respect Retry-After, then fall back to local
                 self.logger.warning(
                     "openrouter_rate_limited",
                     model=config.name,
@@ -293,11 +407,17 @@ class ModelRouter:
                 )
                 self.health_checker.record_rate_limit(config.name)
                 if not _is_fallback:
-                    fallback = self._get_local_fallback(config.name)
-                    if fallback:
-                        self.logger.info("using_local_fallback", fallback=fallback.name)
-                        return await self.generate(prompt, fallback, max_retries=max_retries, _is_fallback=True)
-                raise LLMError(f"OpenRouter model {config.name!r} is rate-limited and no local fallback available") from e
+                    return await self._run_fallback_chain(
+                        prompt=prompt,
+                        exclude=config.name,
+                        reason="rate_limited",
+                        chain=_fallback_chain,
+                        max_retries=max_retries,
+                        timeout=timeout,
+                        enable_thinking=enable_thinking,
+                        original_error=e,
+                    )
+                raise LLMError(f"OpenRouter model {config.name!r} is rate-limited and no fallback available") from e
 
             except Exception as e:
                 # Generic 429 string match (other remote providers)
@@ -308,11 +428,16 @@ class ModelRouter:
                         error=str(e)[:120],
                     )
                     self.health_checker.record_rate_limit(config.name)
-                    fallback = self._get_local_fallback(config.name)
-                    if fallback:
-                        self.logger.info("using_local_fallback", fallback=fallback.name)
-                        return await self.generate(prompt, fallback, max_retries=max_retries, _is_fallback=True)
-                    raise LLMError(f"Remote model {config.name!r} is rate-limited and no local fallback available") from e
+                    return await self._run_fallback_chain(
+                        prompt=prompt,
+                        exclude=config.name,
+                        reason="rate_limited",
+                        chain=_fallback_chain,
+                        max_retries=max_retries,
+                        timeout=timeout,
+                        enable_thinking=enable_thinking,
+                        original_error=e,
+                    )
 
                 self.logger.error(
                     "llm_error",
@@ -321,9 +446,7 @@ class ModelRouter:
                     attempt=attempt,
                 )
                 self.health_checker.record_failure(config.name)
-                # Timeout errors are not retryable: if the model didn't respond
-                # within the deadline once, repeating the same request will just
-                # burn the full timeout window again.  Fail fast instead.
+                # Timeout errors are not retryable: fail fast instead.
                 if "hard timeout" in str(e) or "timeout" in str(e).lower():
                     raise
                 if attempt == max_retries - 1:
@@ -331,6 +454,60 @@ class ModelRouter:
                 await asyncio.sleep(2**attempt)
 
         raise LLMError(f"All {max_retries} retries exhausted")
+
+    async def _run_fallback_chain(
+        self,
+        prompt: str,
+        exclude: str,
+        reason: str,
+        chain: Optional[list],
+        max_retries: int,
+        timeout: float,
+        enable_thinking: Optional[bool],
+        original_error: Optional[Exception],
+    ) -> str:
+        """Try each model in the fallback chain in order.
+
+        Fires a :class:`ModelSwitchEvent` for each switch so registered
+        callbacks (e.g. the Discord bot) can notify the user.
+        """
+        if chain is None:
+            chain = self._get_fallback_chain(exclude)
+
+        if not chain:
+            msg = (
+                f"Model {exclude!r} failed ({reason}) and no fallback models are available. "
+                "Add remote models with API keys to config/models.yaml."
+            )
+            if original_error:
+                raise LLMError(msg) from original_error
+            raise LLMError(msg)
+
+        fallback = chain[0]
+        remaining_chain = chain[1:]
+
+        self.logger.warning(
+            "model_switch_fallback",
+            from_model=exclude,
+            to_model=fallback.name,
+            reason=reason,
+            remaining_fallbacks=len(remaining_chain),
+        )
+        self._fire_switch_event(ModelSwitchEvent(
+            from_model=exclude,
+            to_model=fallback.name,
+            reason=reason,
+        ))
+
+        return await self.generate(
+            prompt,
+            fallback,
+            max_retries=max_retries,
+            _is_fallback=True,
+            _fallback_chain=remaining_chain,
+            timeout=timeout,
+            enable_thinking=enable_thinking,
+        )
 
     async def generate_stream(
         self,

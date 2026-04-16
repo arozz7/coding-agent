@@ -1,4 +1,4 @@
-from .model_router import ModelRouter
+from .model_router import ModelRouter, ModelSwitchEvent
 from .config import ModelConfig
 from .ollama_client import OllamaClient
 from .cloud_api_client import CloudAPIClient
@@ -10,6 +10,7 @@ from .retry import retry_with_backoff, RetryConfig, RetryStrategy
 
 __all__ = [
     "ModelRouter",
+    "ModelSwitchEvent",
     "ModelConfig",
     "OllamaClient",
     "CloudAPIClient",
