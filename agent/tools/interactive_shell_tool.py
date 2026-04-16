@@ -10,6 +10,7 @@ behave correctly via pipes because they can't detect terminal capabilities.
 For those, consider wrapping them in a web interface and using BrowserTool.
 """
 import asyncio
+import os
 import platform
 import re
 import shlex
@@ -67,7 +68,13 @@ class InteractiveShellTool:
     """
 
     def __init__(self, workspace_path: str):
-        self.workspace = Path(workspace_path).resolve()
+        candidate = Path(workspace_path).resolve()
+        allowed_root = Path(os.getenv("WORKSPACE_PATH", "./workspace")).resolve()
+        try:
+            candidate.relative_to(allowed_root)
+        except ValueError:
+            raise ValueError("workspace_path must be within the configured workspace root")
+        self.workspace = candidate
         self.logger = logger.bind(component="interactive_shell_tool")
 
     async def run(
