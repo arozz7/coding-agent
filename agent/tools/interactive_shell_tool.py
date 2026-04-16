@@ -68,14 +68,23 @@ class InteractiveShellTool:
     """
 
     def __init__(self, workspace_path: str):
-        # Resolve both paths before comparison to prevent traversal/symlink tricks.
+        # Canonicalize and validate workspace_path at the sink (defense in depth).
         candidate = Path(workspace_path).resolve(strict=False)
-        configured_root = os.getenv("AGENT_EFFECTIVE_WORKSPACE") or os.getenv("WORKSPACE_PATH", "./workspace")
+
+        # Use the configured workspace root as the trust boundary.
+        # AGENT_EFFECTIVE_WORKSPACE may point at a project subdir and is mutable,
+        # so we anchor validation to WORKSPACE_PATH.
+        configured_root = os.getenv("WORKSPACE_PATH", "./workspace")
         allowed_root = Path(configured_root).resolve(strict=False)
+
         try:
             candidate.relative_to(allowed_root)
-        except ValueError:
-            raise ValueError("workspace_path must be within the configured workspace root")
+        except ValueError as exc:
+            raise ValueError("workspace_path must be within the configured workspace root") from exc
+
+        if not candidate.exists() or not candidate.is_dir():
+            raise ValueError("workspace_path must be an existing directory")
+
         self.workspace = candidate
         self.logger = logger.bind(component="interactive_shell_tool")
 
