@@ -751,16 +751,18 @@ async def set_project(request: dict):
     if ".." in raw_name or raw_name.startswith(("/", "\\")):
         raise HTTPException(status_code=400, detail="Invalid project name")
 
+    workspace_root = Path(WORKSPACE_PATH).resolve()
     if raw_name:
-        target = Path(WORKSPACE_PATH) / raw_name
+        target = workspace_root / raw_name
     else:
-        target = Path(WORKSPACE_PATH)
+        target = workspace_root
 
-    if not _is_path_allowed(str(target)):
+    resolved_target = target.resolve()
+    if not _is_path_allowed(str(resolved_target)):
         raise HTTPException(status_code=403, detail="Path not allowed")
 
-    target.mkdir(parents=True, exist_ok=True)  # lgtm[py/path-injection]
-    _current_workspace = str(target.resolve())  # lgtm[py/path-injection]
+    resolved_target.mkdir(parents=True, exist_ok=True)  # lgtm[py/path-injection]
+    _current_workspace = str(resolved_target)  # lgtm[py/path-injection]
     os.environ["AGENT_EFFECTIVE_WORKSPACE"] = _current_workspace
 
     from local_coding_agent import create_agent
@@ -786,22 +788,17 @@ async def set_workspace(request: dict):
     new_path = request.get("path")
     if not new_path:
         raise HTTPException(status_code=400, detail="path is required")
-    
-    # Security: Check if path is allowed
-    if not _is_path_allowed(new_path):
-        raise HTTPException(status_code=403, detail="Cannot set workspace to system folder")
-    
-    # Validate path exists and is a directory
-    # _is_path_allowed() checked above; resolve() + second check below prevent symlink escapes.
+
+    # Canonicalize first, then enforce allow-list boundary on the resolved path.
     path = Path(new_path).resolve()  # lgtm[py/path-injection]
+    if not _is_path_allowed(str(path)):
+        raise HTTPException(status_code=403, detail="Cannot set workspace to system folder")
+
+    # Validate path exists and is a directory
     if not path.exists():
         raise HTTPException(status_code=404, detail="Path does not exist")
     if not path.is_dir():
         raise HTTPException(status_code=400, detail="Path is not a directory")
-
-    # Double-check after resolve (catches symlink traversal)
-    if not _is_path_allowed(str(path)):
-        raise HTTPException(status_code=403, detail="Cannot set workspace to system folder")
 
     _current_workspace = str(path)
     # Keep GitTool in sync with the new workspace.
