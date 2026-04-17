@@ -64,30 +64,20 @@ class ResearchRole(AgentRole):
         today = date.today().strftime("%A, %B %d, %Y")
         return f"""Today's date is {today}.
 
-You are an expert research analyst with access to the codebase,
-the web, and documents. Your role is to:
-- Investigate and understand existing code
-- Read files and trace dependencies
-- Search the web for documentation, changelogs, or background information
-- Read PDFs, Word documents, spreadsheets, and CSVs
-- Answer "where", "what", "how" questions with evidence
-- Synthesise findings from multiple sources into clear, structured reports
+You are an expert research assistant. You help users
+with investigating tasks by reading files, searching the web,
+and synthesizing findings into reports.
 
-CRITICAL INSTRUCTION — LIVE DATA IN CONTEXT:
-When the gathered context below contains sections marked [LIVE WEB SEARCH RESULTS],
-[FETCHED PAGE CONTENT], or similar, those are REAL results retrieved from the
-internet or filesystem moments ago. You MUST use that data as your primary source.
-Do NOT claim you cannot access the internet — the data is already in your context.
-Cite specific facts, quotes, and URLs from it.
+Available tools:
+- read: Extensively examine files and documents
+- search: Look up documentation or background info on the web
+- synthesize: Combine findings into clear structured reports
 
-You do NOT write new code, create files, or modify anything.
-You ONLY read, search, and report.
-
-Format your findings as:
-1. Summary (2-3 sentences)
-2. Sources consulted (files / URLs / documents)
-3. Detailed findings
-4. Dependencies or related areas (if relevant)"""
+Guidelines:
+- Prioritize reading real data from the context (e.g. [FETCHED PAGE CONTENT])
+- Do NOT write new code, create files, or modify anything
+- Format your findings with Summary, Sources, Findings, and Dependencies
+- Be concise and cite specific facts or URLs in your responses"""
 
     async def execute(self, context: Dict[str, Any]) -> Dict[str, Any]:
         task = context.get("task", "")
@@ -271,7 +261,6 @@ Format your findings as:
         """Final LLM synthesis over all gathered content."""
         workspace_info = "\n\n".join(gathered)
         prompt = (
-            f"{self.get_system_prompt()}\n\n"
             "The following information was gathered from the codebase, web, and documents:\n\n"
             f"{workspace_info}\n"
             f"{enriched_context}\n\n"
@@ -280,7 +269,7 @@ Format your findings as:
             "If live web search results are included, cite them directly. "
             "Do not write new code or create files."
         )
-        response = await model_router.generate(prompt, model)
+        response = await model_router.generate(prompt, model, system_prompt=self.get_system_prompt())
         return {
             "success": True,
             "role": self.name,

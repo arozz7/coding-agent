@@ -80,79 +80,24 @@ class DeveloperRole(AgentRole):
         self.browser_tool = browser_tool
     
     def get_system_prompt(self) -> str:
-        return """You are an expert software developer. Your role is to:
-- Write clean, efficient, and maintainable code
-- AUTONOMOUSLY run, debug, and fix code — do NOT ask the user to run commands
-- When asked to run, debug, or fix errors: execute the commands yourself, read the output, and fix issues
+        return """You are an expert coding assistant. You help users
+with coding tasks by reading files, executing commands,
+editing code, and writing new files.
 
-CAPABILITIES YOU HAVE:
-1. Write files using:
-   FILE: path/to/file.ext
-   ```language
-   file content
-   ```
-2. Run shell commands using FENCED BLOCKS (CRITICAL — must be a fenced block, NOT inline backticks):
-   ```shell
-   cd project-dir
-   npm install
-   npm run build
-   ```
-3. Read errors from shell output and fix the code
+Available tools:
+- bash: Execute bash commands
+- edit: Make surgical edits to files
+- write: Create or overwrite files
 
-AUTONOMOUS WORKFLOW for "run and debug" tasks:
-1. First run the project to see the current error:
-   ```shell
-   cd <project-dir>
-   npm run build 2>&1
-   ```
-2. Read the error output carefully
-3. Fix the relevant source files (write them with FILE: blocks)
-4. Run again to verify the fix worked:
-   ```shell
-   cd <project-dir>
-   npm run build 2>&1
-   ```
-5. Report what was fixed and what the final state is
-
-DO NOT:
-- Ask "what error are you seeing?" — just run the command and read the output yourself
-- Say "let me check..." without actually running a command
-- Describe what you would do — DO it
-
-PROJECT DIRECTORY RULE — CRITICAL:
-The workspace may already be scoped to an active project (PROJECT_DIR is set).
-When that is the case, you are ALREADY inside the project root — do NOT prefix
-paths with the project name again.
-
-Rules:
-1. If context includes "Active project: <name>", the workspace IS that project.
-   Write files at the workspace root:
-     CORRECT:  FILE: docs/narrative/01-story.md
-     WRONG:    FILE: Shadows-of-Eldoria/docs/narrative/01-story.md
-2. If starting a BRAND NEW project with no active project in context, infer a
-   short, lowercase, hyphenated name and create all files under that subdirectory:
-     FILE: <project-name>/src/main.py
-3. NEVER dump files into the workspace root for a genuinely new, standalone project.
-4. When in doubt, list existing files first before creating any subdirectory.
-
-For file writing use this exact format:
-FILE: path/to/file.ext
-```language
-file content here
-```
-
-For shell commands use FENCED SHELL BLOCKS only:
-```shell
-cd <project-dir>
-npm install
-npm run build 2>&1
-```
-
-Focus on:
-- Code correctness and edge cases
-- Proper error handling
-- Security best practices
-- Readable and self-documenting code"""
+Guidelines:
+- Use bash blocks to run commands, examine files, or search the codebase (must use ```shell)
+- Use the exact FILE: formatting block to write or overwrite files:
+  FILE: path/to/file.ext
+  ```language
+  content
+  ```
+- Use write only for new files or complete rewrites
+- Be concise in your responses"""
 
     async def _run_shell_blocks(
         self, response: str, tool_executor
@@ -225,9 +170,7 @@ Focus on:
         # Order: static system prompt → enriched context (env, skills, history) → task (dynamic)
         # Putting the task last mirrors standard chat format and lets any caching layer
         # reuse the static prefix across calls.
-        prompt = f"""{self.get_system_prompt()}
-
-{architecture if architecture else ''}{enriched_context}
+        prompt = f"""{architecture if architecture else ''}{enriched_context}
 
 ## Current Task
 {task}
@@ -248,7 +191,7 @@ Summary: <one sentence>
         if not model:
             return {"success": False, "error": "No coding model configured"}
 
-        response = await model_router.generate(prompt, model)
+        response = await model_router.generate(prompt, model, system_prompt=self.get_system_prompt())
 
         if tool_executor:
             file_writes = self._extract_file_writes(response)
@@ -278,7 +221,6 @@ Summary: <one sentence>
         if is_run_debug and not ran_app and not failed_outputs and tool_executor:
             prior_output = "\n\n".join(shell_outputs) if shell_outputs else "(no prior commands run)"
             force_run_prompt = (
-                f"{self.get_system_prompt()}\n\n"
                 f"Task: {task}\n\n"
                 f"{enriched_context}\n\n"
                 f"Project exploration so far:\n{prior_output}\n\n"
@@ -288,7 +230,7 @@ Summary: <one sentence>
                 f"Look at the package.json start script or main entry point shown above.\n"
                 f"Output ONLY a fenced shell block that runs the app. Do NOT explore further."
             )
-            force_run_response = await model_router.generate(force_run_prompt, model)
+            force_run_response = await model_router.generate(force_run_prompt, model, system_prompt=self.get_system_prompt())
 
             # Write any files the LLM generated before running
             for file_path, content in self._extract_file_writes(force_run_response):
@@ -342,7 +284,6 @@ Summary: <one sentence>
                     else ""
                 )
                 fix_prompt = (
-                    f"{self.get_system_prompt()}\n\n"
                     f"Original task: {task}\n\n"
                     f"The following commands are still failing (attempt {_attempt + 1}/{MAX_FIX_ITERATIONS}).\n"
                     f"{history_note}"
@@ -353,7 +294,7 @@ Summary: <one sentence>
                     f"Fix ALL errors shown above, not just the first one."
                 )
                 model = model_router.get_model("coding")
-                fix_response = await model_router.generate(fix_prompt, model)
+                fix_response = await model_router.generate(fix_prompt, model, system_prompt=self.get_system_prompt())
 
                 # Write any fixed files
                 iteration_files: list[str] = []

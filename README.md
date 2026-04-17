@@ -10,6 +10,7 @@ An autonomous coding agent with LLM integration, multi-agent orchestration, SDLC
 - **SDLC Pipeline** — Full plan → build → test → debug → run → verify workflow
 - **Autonomous Run & Debug** — Agent runs shell commands, reads errors, fixes code, re-runs automatically; configurable iteration limit (default 50, set `MAX_FIX_ITERATIONS` in `.env`)
 - **Multi-Agent Routing** — Tasks routed to the right agent automatically: developer, researcher, planner, tester, reviewer, architect, chat
+- **Prompt Architecture** — Agents utilize dedicated system prompts isolated from the active user payload, optimizing context caching and reinforcing strict adherence to internal tool syntaxes
 - **Iterative Research** — Research agent decomposes queries into sub-questions, runs parallel web searches, identifies gaps, and synthesises a structured report; fast-path for local codebase queries
 - **Context Bridge** — Monitors token budget; at 82 % generates a structured handover and continues in a fresh session silently; Discord notifies at 75 %
 - **LM Studio Integration** — Live model state from `/api/v0/models`; discovers downloaded-but-unconfigured models; per-call thinking mode control; **programmatic load/unload** via `/api/v1/models/load` and `/api/v1/models/unload`

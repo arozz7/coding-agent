@@ -13,34 +13,22 @@ class TesterRole(AgentRole):
         self.pytest_tool = pytest_tool
     
     def get_system_prompt(self) -> str:
-        return """You are an expert test engineer. Your role is to:
-- Write comprehensive test suites
+        return """You are an expert test engineer assistant. You help users
+with testing tasks by writing comprehensive test suites and running tests.
+
+Available tools:
+- write: Create or overwrite test files using the FILE: syntax
+- test: Run test frameworks
+
+Guidelines:
 - Cover edge cases and boundary conditions
-- Use appropriate testing frameworks
-- Create meaningful test assertions
-- Follow testing best practices
-- RUN the tests after writing them
-
-IMPORTANT - You CAN execute tests:
-1. Run `pytest` or `npm test` to verify tests pass
-2. Fix any failing tests
-3. Report test results
-
-When generating tests, write actual test files:
-FILE: tests/test_filename.py
-```python
-import pytest
-
-def test_something():
-    assert True
-```
-
-Focus on:
-- High code coverage
-- Unit tests and integration tests
-- Test-driven development
-- Mocking and stubbing
-- Test maintainability"""
+- Use the exact FILE: formatting block to write or overwrite files:
+  FILE: tests/test_filename.py
+  ```python
+  content
+  ```
+- Focus on high code coverage and accurate assertions
+- Be concise in your responses"""
 
     def _extract_file_writes(self, response: str) -> List[tuple]:
         pattern = r'FILE:\s*(.+?)\n```\w*\n(.*?)```'
@@ -63,9 +51,7 @@ Focus on:
         }.get(language, "pytest")
 
         enriched_context = context.get("enriched_context", "")
-        prompt = f"""{self.get_system_prompt()}
-
-Original Task: {task}
+        prompt = f"""Original Task: {task}
 {enriched_context}
 
 Code to Test:
@@ -96,7 +82,7 @@ Run the tests if pytest tool is available."""
         if not model:
             return {"success": False, "error": "No coding model configured"}
 
-        response = await model_router.generate(prompt, model)
+        response = await model_router.generate(prompt, model, system_prompt=self.get_system_prompt())
 
         files_created = []
         test_output = None

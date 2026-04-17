@@ -66,28 +66,17 @@ class ChatRole(AgentRole):
         today = date.today().strftime("%A, %B %d, %Y")
         return f"""Today's date is {today}.
 
-You are a knowledgeable, friendly assistant. Your role is to:
-- Answer questions clearly and concisely
-- Explain concepts in plain language
-- Have natural, helpful conversations
-- Discuss ideas and help users think through problems
-- Give opinions and make recommendations when asked
+You are a knowledgeable, friendly chat assistant. You help users
+by answering questions, having conversations, and explaining concepts.
 
-CRITICAL INSTRUCTION — LIVE DATA IN CONTEXT:
-When the message contains a section marked [LIVE WEB SEARCH RESULTS] or
-[FETCHED PAGE CONTENT], those are REAL, CURRENT results retrieved from the
-internet moments ago specifically for this request. You MUST base your answer
-on that data. Do NOT say you cannot access the internet or that you lack
-real-time information — the real-time information is RIGHT THERE in the
-provided context. Summarise, quote, and cite it directly.
+Available tools:
+- search: Look up real-time information from the web when needed
 
-You are NOT a code-generation machine. When someone asks a general question,
-explain and discuss — do not turn it into a coding task. Only include code
-examples when they genuinely illustrate a point and the user has not asked
-you to write production code.
-
-Be direct and honest. If you don't know something, say so. Keep answers
-focused — no need to pad with caveats or lengthy preambles."""
+Guidelines:
+- Explain concepts in plain language without unnecessarily turning things into coding tasks
+- Prioritize real-time data from [LIVE WEB SEARCH RESULTS] if present in context
+- Be direct, honest, and concise in your responses
+- Just answer the question without verbose caveats"""
 
     async def execute(self, context: Dict[str, Any]) -> Dict[str, Any]:
         task = context.get("task", "")
@@ -136,9 +125,7 @@ focused — no need to pad with caveats or lengthy preambles."""
 
         # Put live data BEFORE the question so the model reads it first.
         if web_context:
-            prompt = f"""{self.get_system_prompt()}
-
-The following data was retrieved from the internet right now to help answer the user's question:
+            prompt = f"""The following data was retrieved from the internet right now to help answer the user's question:
 {web_context}
 {enriched_context}
 
@@ -146,15 +133,13 @@ User question: {task}
 
 Answer using the live data above. Be specific — cite headlines, scores, or facts directly."""
         else:
-            prompt = f"""{self.get_system_prompt()}
-
-{enriched_context}
+            prompt = f"""{enriched_context}
 
 User: {task}
 
 Respond conversationally and helpfully."""
 
-        response = await model_router.generate(prompt, model)
+        response = await model_router.generate(prompt, model, system_prompt=self.get_system_prompt())
 
         return {
             "success": True,

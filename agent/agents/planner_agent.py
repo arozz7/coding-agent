@@ -50,8 +50,8 @@ class PlannerAgent:
             return self._fallback_plan(objective, task_type)
 
         strategy_hint = self._strategy_hint(task_type)
-        prompt = (
-            "You are a task planning assistant for an autonomous coding agent.\n\n"
+        system_prompt = (
+            "You are an expert task planning assistant for an autonomous coding agent.\n\n"
             "Break the following objective into 3–7 concrete, ordered tasks.\n"
             "Each task must be small enough that a single agent call can complete it.\n"
             "Assign the correct agent_type to each task.\n\n"
@@ -61,7 +61,10 @@ class PlannerAgent:
             "- test:      write or run tests\n"
             "- review:    code review or security audit\n"
             "- architect: system design or ADR\n"
-            "- chat:      explain or answer questions\n\n"
+            "- chat:      explain or answer questions"
+        )
+
+        prompt = (
             f"{strategy_hint}\n"
             f"Objective: {objective}\n\n"
             f"{f'Context: {context}' if context else ''}\n\n"
@@ -75,7 +78,7 @@ class PlannerAgent:
         )
 
         try:
-            raw = await self.model_router.generate(prompt, model)
+            raw = await self.model_router.generate(prompt, model, system_prompt=system_prompt)
             tasks = self._parse_task_list(raw)
             if tasks:
                 self.logger.info(
