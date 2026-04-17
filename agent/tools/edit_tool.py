@@ -201,7 +201,13 @@ class EditTool:
 
     def __init__(self, allowed_base_path: str):
         # allowed_base_path comes from config / env, not user input.
-        self.allowed_base = Path(allowed_base_path).resolve()  # lgtm[py/path-injection]
+        try:
+            resolved_base = Path(allowed_base_path).resolve(strict=True)  # lgtm[py/path-injection]
+        except Exception as e:
+            raise EditError(f"Invalid workspace base path: {allowed_base_path}") from e
+        if not resolved_base.is_dir():
+            raise EditError(f"Workspace base path is not a directory: {allowed_base_path}")
+        self.allowed_base = resolved_base
         self.logger = logger.bind(component="edit_tool")
 
     def _validate_path(self, path: str) -> Path:
@@ -213,7 +219,9 @@ class EditTool:
             if parts and parts[0] == self.allowed_base.name and len(parts) > 1:
                 path = str(Path(*parts[1:]))
             resolved = (self.allowed_base / path).resolve()
-        if not str(resolved).startswith(str(self.allowed_base)):
+        try:
+            resolved.relative_to(self.allowed_base)
+        except ValueError:
             raise EditError(f"Path '{path}' is outside the workspace.")
         return resolved
 

@@ -54,7 +54,10 @@ class SearchTool:
 
     def __init__(self, allowed_base_path: str):
         # allowed_base_path comes from WORKSPACE_PATH env var / server config.
-        self.allowed_base = Path(allowed_base_path).resolve()  # lgtm[py/path-injection]
+        base = Path(allowed_base_path).resolve()  # lgtm[py/path-injection]
+        if not base.exists() or not base.is_dir():
+            raise ValueError(f"Invalid workspace base path: {allowed_base_path!r}")
+        self.allowed_base = base
         self.logger = logger.bind(component="search_tool")
 
     # ------------------------------------------------------------------
@@ -70,7 +73,9 @@ class SearchTool:
             resolved = raw.resolve()
         else:
             resolved = (self.allowed_base / path).resolve()
-        if not str(resolved).startswith(str(self.allowed_base)):
+        try:
+            resolved.relative_to(self.allowed_base)
+        except ValueError:
             raise ValueError(f"Path '{path}' is outside the workspace.")
         return resolved
 
