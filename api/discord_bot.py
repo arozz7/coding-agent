@@ -347,24 +347,28 @@ bot = DiscordAgentBot()
 # ---------------------------------------------------------------------------
 
 _PHASE_LABELS: dict[str, str] = {
-    "queued":        "Queued",
-    "pending":       "Queued",
-    "planning":      "Building plan",
-    "developing":    "Writing code",
-    "reviewing":     "Reviewing",
-    "testing":       "Running tests",
-    "designing":     "Designing architecture",
-    "researching":   "Researching codebase",
-    "thinking":      "Thinking",
-    "working":       "Working",
-    "complete":      "Finishing up",
+    "queued":          "Queued",
+    "pending":         "Queued",
+    "planning":        "Building plan",
+    "planning:review": "Reviewing plan…",
+    "developing":      "Writing code",
+    "reviewing":       "Reviewing",
+    "testing":         "Running tests",
+    "designing":       "Designing architecture",
+    "researching":     "Researching codebase",
+    "mapping":         "Mapping project structure",
+    "securing":        "Security audit",
+    "documenting":     "Writing docs",
+    "thinking":        "Thinking",
+    "working":         "Working",
+    "complete":        "Finishing up",
     # SDLC pipeline phases
-    "sdlc:planning":  "SDLC — Planning",
-    "sdlc:building":  "SDLC — Building",
-    "sdlc:testing":   "SDLC — Running tests",
-    "sdlc:debugging": "SDLC — Debugging",
-    "sdlc:running":   "SDLC — Starting app",
-    "sdlc:verifying": "SDLC — Verifying (screenshot)",
+    "sdlc:planning":   "SDLC — Planning",
+    "sdlc:building":   "SDLC — Building",
+    "sdlc:testing":    "SDLC — Running tests",
+    "sdlc:debugging":  "SDLC — Debugging",
+    "sdlc:running":    "SDLC — Starting app",
+    "sdlc:verifying":  "SDLC — Verifying (screenshot)",
 }
 
 
@@ -499,12 +503,37 @@ async def _poll_job(ctx: commands.Context, status_msg: discord.Message, job_id: 
         job_status = job.get("status", "unknown")
         phase = job.get("phase", "")
 
-        # Task-loop phases: "task:N/M:description" or "planning:tasks"
-        if phase.startswith("task:"):
-            parts = phase.split(":", 2)
+        # Chain phases: "chain:<name>:step:N/M:agent" or "chain:<name>:complete"
+        if phase.startswith("chain:"):
+            parts = phase.split(":", 4)
+            chain_name = parts[1] if len(parts) > 1 else "?"
+            rest = parts[2] if len(parts) > 2 else ""
+            if rest == "complete":
+                label = f"Chain `{chain_name}` — complete"
+            elif rest == "starting":
+                label = f"Chain `{chain_name}` — starting"
+            elif rest == "step" and len(parts) >= 5:
+                step_progress = parts[3]
+                agent = parts[4]
+                label = f"Chain `{chain_name}` step {step_progress} [{agent}]"
+            else:
+                label = f"Chain `{chain_name}` — {rest}"
+
+        # Task-loop phases: "task:N/M:agent_type:description" (or legacy "task:N/M:description")
+        elif phase.startswith("task:"):
+            parts = phase.split(":", 3)
             progress = parts[1] if len(parts) > 1 else "?"
-            desc = parts[2][:40] if len(parts) > 2 else ""
-            label = f"Task {progress} — {desc}" if desc else f"Task {progress}"
+            if len(parts) >= 4:
+                # New format: task:N/M:agent_type:label
+                agent = parts[2]
+                desc = parts[3][:40]
+                label = f"Task {progress} [{agent}] — {desc}" if desc else f"Task {progress} [{agent}]"
+            elif len(parts) == 3:
+                # Legacy format: task:N/M:description
+                desc = parts[2][:40]
+                label = f"Task {progress} — {desc}" if desc else f"Task {progress}"
+            else:
+                label = f"Task {progress}"
         elif phase == "planning:tasks":
             label = "Planning tasks…"
         elif phase.startswith("sdlc:debugging:"):
@@ -674,6 +703,32 @@ async def research(ctx: commands.Context, *, task: str):
     The full report is available via `!result`.
     """
     await _submit_task(ctx, task, force_task_type="research")
+
+
+@bot.command(name="chains")
+async def list_chains(ctx: commands.Context):
+    """List all available agent chains defined in agent-chain.yaml."""
+    try:
+        resp = await bot.client._get("/chains")
+        chains = resp.get("chains", [])
+        if not chains:
+            await ctx.send("No chains available.")
+            return
+        lines = ["**Available chains** (`!chain <name> <task>`):"]
+        for c in chains:
+            lines.append(f"  `{c['name']}` — {c.get('description', '')}")
+        await ctx.send("\n".join(lines))
+    except Exception as exc:
+        await ctx.send(f"Could not fetch chains: {exc}")
+
+
+@bot.command(name="chain")
+async def run_chain(ctx: commands.Context, chain_name: str, *, task: str):
+    """Run a named agent chain.  Example: `!chain plan-build-review add auth to the API`
+
+    Use `!chains` to list available chains.
+    """
+    await _submit_task(ctx, f"__chain__:{chain_name}:{task}", force_task_type="chain")
 
 
 @bot.command(name="continue")

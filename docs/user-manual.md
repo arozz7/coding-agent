@@ -9,14 +9,15 @@ A comprehensive guide to using the Local Coding Agent.
 3. [Starting the Agent](#starting-the-agent)
 4. [Discord Commands Reference](#discord-commands-reference)
 5. [Task Types & Routing](#task-types--routing)
-6. [Workspace & Project Scoping](#workspace--project-scoping)
-7. [Model Management](#model-management)
-8. [Context Bridge](#context-bridge)
-9. [Agent Wiki Memory](#agent-wiki-memory)
-10. [Interactive Testing Tools](#interactive-testing-tools)
-11. [REST API Reference](#rest-api-reference)
-12. [Advanced File Operations](#advanced-file-operations)
-13. [Troubleshooting](#troubleshooting)
+6. [Agent Chains](#agent-chains)
+7. [Workspace & Project Scoping](#workspace--project-scoping)
+8. [Model Management](#model-management)
+9. [Context Bridge](#context-bridge)
+10. [Agent Wiki Memory](#agent-wiki-memory)
+11. [Interactive Testing Tools](#interactive-testing-tools)
+12. [REST API Reference](#rest-api-reference)
+13. [Advanced File Operations](#advanced-file-operations)
+14. [Troubleshooting](#troubleshooting)
 
 ---
 
@@ -69,6 +70,7 @@ python -m pip install -e .
 | `BOT_STATUS_CHANNEL_ID` | No | — | Discord channel ID for model-switch alerts (e.g. when the agent falls back from local to remote). Leave unset to disable |
 | `STALE_JOB_THRESHOLD_SECS` | No | `2700` | Seconds before the watchdog kills a stuck job (45 min default). The timer automatically resets on task progress updates. |
 | `MAX_FIND_RESULTS` | No | `200` | Maximum results returned by `find_files` or `grep_code`. |
+| `SKIP_PATH_PREFIXES` | No | `dist/,build/,node_modules/,.cache/` | Comma-separated path prefixes excluded from fix-loop file context reads. Add project-specific compiled output dirs here. |
 
 ### Model Configuration (`config/models.yaml`)
 
@@ -193,6 +195,33 @@ Resume the current active debugging session. Optionally attach a note to guide t
 ```
 !continue
 !continue the build is still failing on the test step
+```
+
+#### `!chains`
+List all available agent chains (built-in + any defined in `agent-chain.yaml`).
+
+```
+!chains
+```
+
+Output example:
+```
+Available chains (!chain <name> <task>):
+  plan-build-review — Plan, implement, and review — the standard development cycle
+  full-review       — End-to-end pipeline — scout, plan, build, review
+  scout-flow        — Triple-scout deep recon — explore, validate, verify
+  plan-review-plan  — Iterative planning — plan, critique, then refine
+  secure-build      — Plan, build, then run a security audit
+  plan-build        — Plan then build — fast two-step without review
+```
+
+#### `!chain <name> <task>`
+Run a named agent chain — sequences multiple agents, passing each step's output to the next.
+
+```
+!chain plan-build-review add OAuth2 login to the API
+!chain full-review audit the entire Shadows-of-Eldoria codebase
+!chain secure-build implement the user registration endpoint
 ```
 
 ---
@@ -332,16 +361,66 @@ The agent auto-classifies every `!ask` task into one of these types:
 
 | Type | When it fires | What happens |
 |------|--------------|--------------|
-| `develop` | Write, fix, run, build, debug, compile, npm, execute | `DeveloperAgent` — writes files, runs shell, fix loop up to 10 iterations |
-| `research` | Investigate, find, explain, search for, how does | `ResearchAgent` — iterative: decomposes → parallel web search → gap analysis → synthesis. Fast-path for local file tasks. Full report via `!result` |
+| `develop` | Write, fix, run, build, debug, compile, npm, execute | `DeveloperAgent` — writes files, runs shell, anchor-and-patch fix loop |
+| `research` | Investigate, find, explain, search for, how does | `ResearchAgent` — iterative: decomposes → parallel web search → gap analysis → synthesis |
+| `mapper` | Map the project, generate architecture docs | `MapperAgent` — produces `ARCHITECTURE.md` + `STACK.md`; auto-runs as first step in develop/sdlc tasks |
 | `plan` | Plan first, show me a plan, roadmap | `PlanAgent` — creates implementation plan without writing code |
-| `sdlc` | Build me a complete app, end-to-end | Full SDLC pipeline: plan → build → test → debug → run → verify |
+| `sdlc` | Build me a complete app, end-to-end | Full SDLC pipeline: map → plan → build → test → debug → run → verify |
 | `test` | Write tests, pytest, unit tests | `TesterAgent` — writes and runs test suites |
-| `review` | Code review, security audit | `ReviewerAgent` — audits for bugs, style, security |
+| `review` | Code review, quality check | `ReviewerAgent` — audits for bugs, style, correctness |
+| `security` | Security audit, red-team, find vulnerabilities | `RedTeamAgent` — OWASP checklist, secrets scan, injection/auth review; severity-rated report |
+| `documenter` | Write README, docs, changelog | `DocumenterAgent` — writes and updates project documentation |
 | `architect` | System design, write an ADR | `ArchitectAgent` — high-level design decisions |
 | `chat` | Everything else | `ChatAgent` — conversational Q&A (no file tools) |
 
+**Plan-review-plan loop:** For `develop` and `sdlc` tasks with ≥ 3 steps, a `PlanReviewerAgent` automatically critiques the generated plan before execution — checking for wrong agent types, missing steps (e.g. no build step), and bad task ordering. The improved plan is used transparently.
+
 **Pre-LLM keyword fast-path:** Common develop patterns (fix, run, npm, build, compile, debug) are classified immediately without an LLM call. Use `!dev` to force the develop path, or `!research` to force the research path, if auto-classification is wrong.
+
+---
+
+## Agent Chains
+
+Agent chains sequence multiple agents into a named pipeline. Each step receives the previous step's output as `$INPUT` and the original user request as `$ORIGINAL`.
+
+### Built-in chains
+
+| Chain | Steps | Best for |
+|-------|-------|----------|
+| `plan-build-review` | planner → developer → reviewer | Standard feature implementation |
+| `plan-build` | planner → developer | Quick implementation without review |
+| `full-review` | scout → planner → developer → reviewer | First-time work on an unfamiliar codebase |
+| `scout-flow` | scout × 3 | Deep codebase investigation with cross-checking |
+| `plan-review-plan` | planner → plan-reviewer → planner | High-stakes planning — critique before building |
+| `secure-build` | planner → developer → security | Any feature that touches auth, SQL, or external input |
+
+### Running a chain
+
+```
+!chain plan-build-review add rate limiting to the API
+!chain secure-build implement user password reset
+!chain full-review why is the game crashing on startup
+```
+
+The Done message shows the output of the final step. `!result` returns the full multi-step trace.
+
+### Custom chains
+
+Add an `agent-chain.yaml` file to your workspace root:
+
+```yaml
+my-pipeline:
+  description: "My custom pipeline"
+  steps:
+    - agent: research
+      prompt: "Investigate the codebase for: $INPUT"
+    - agent: develop
+      prompt: "Based on this analysis, implement:\n\n$INPUT\n\nOriginal: $ORIGINAL"
+    - agent: security
+      prompt: "Security audit the implementation:\n\n$INPUT"
+```
+
+Then run it with `!chain my-pipeline <task>`. Use `!chains` to see all available chains including your custom ones.
 
 ---
 

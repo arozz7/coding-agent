@@ -34,8 +34,49 @@ _EDIT_BLOCK_RE = re.compile(
     re.DOTALL,
 )
 
+# REPLACE: block — line-number-based patch (no old-text matching required).
+#
+#   REPLACE: path/to/file.ext 45-47
+#   <<<
+#   replacement line 1
+#   replacement line 2
+#   >>>
+#
+# Line numbers are 1-indexed and inclusive.  The system reads the current
+# file, splices in the new lines, and writes the result back — eliminating
+# the "old text not found" failure mode of EDIT: blocks.
+_REPLACE_BLOCK_RE = re.compile(
+    r'REPLACE:\s*(?P<path>\S+)\s+(?P<start>\d+)-(?P<end>\d+)\n'
+    r'<<<\n(?P<new_text>.*?)\n>>>',
+    re.DOTALL,
+)
+
 MAX_FIX_ITERATIONS = int(os.getenv("MAX_FIX_ITERATIONS", "50"))
 
+
+def _format_file_with_lines(content: str, path: str, max_chars: int = 3000) -> str:
+    """Return a numbered-line view of *content* suitable for anchor-and-patch prompts."""
+    lines = content.splitlines()
+    numbered = "\n".join(f"{i + 1:4}: {line}" for i, line in enumerate(lines))
+    header = f"=== {path} ({len(lines)} lines) ==="
+    full = header + "\n" + numbered
+    if len(full) > max_chars:
+        truncated = full[:max_chars]
+        cut = truncated.rfind("\n")
+        shown = truncated[:cut].count("\n") + 1
+        full = full[:cut] + f"\n   … ({len(lines) - shown} more lines omitted)"
+    return full
+
+
+def _is_readonly_probe(entry: str) -> bool:
+    """True when a shell entry is a file-read probe (type/cat/dir/ls) — not a real build failure."""
+    first = entry.splitlines()[0] if entry else ""
+    return bool(re.match(r'^\$\s+(type|cat|dir|ls|head|tail)\b', first, re.IGNORECASE))
+
+
+_MISSING_TOOL_NAMES = (
+    "jest", "webpack", "ts-node", "tsc", "mocha", "vitest", "eslint", "prettier",
+)
 
 def _looks_like_npm_missing(error_text: str) -> bool:
     """Return True if error output suggests missing npm dependencies / node_modules."""
@@ -47,6 +88,9 @@ def _looks_like_npm_missing(error_text: str) -> bool:
         or ("webpack" in lower and "command not found" in lower)
         or "sh: webpack" in lower
         or ("error: cannot find" in lower and "module" in lower)
+        or any(f"{t}: command not found" in lower for t in _MISSING_TOOL_NAMES)
+        or any(f"'{t}' is not recognized" in lower for t in _MISSING_TOOL_NAMES)
+        or any(f'"{t}" is not recognized' in lower for t in _MISSING_TOOL_NAMES)
     )
 
 
@@ -59,6 +103,22 @@ def _npm_install_cmd(verify_cmd: str) -> str:
 # TypeScript / webpack errors repeat the same stack endlessly — cap them
 # so we don't blow up the context window on iteration 3+.
 _MAX_ERROR_CHARS = 4000
+
+# Regex to extract source file paths from compiler / runtime error messages.
+# Matches patterns like:  src/foo/bar.ts:10:5  or  ./src/foo/bar.tsx
+_ERROR_FILE_RE = re.compile(
+    r'(?:^|[\s(\'"])(?:\.[\\/])?(?P<path>(?:src|lib|app|dist)[/\\][\w./\\-]+\.(?:ts|tsx|js|jsx|py|java|go|rs))',
+    re.MULTILINE | re.IGNORECASE,
+)
+# Compiled/generated output directories — never try to read or patch these.
+# Override via SKIP_PATH_PREFIXES env var as a comma-separated list.
+_SKIP_PATH_PREFIXES: tuple[str, ...] = tuple(
+    p.strip() for p in os.getenv(
+        "SKIP_PATH_PREFIXES", "dist/,build/,node_modules/,.cache/"
+    ).split(",") if p.strip()
+)
+_MAX_FIX_FILE_CONTEXT = 8000   # total chars of source included in fix prompts
+_MAX_FIX_FILE_PER_FILE = 3000  # chars per individual file
 
 # Maximum number of fix-attempt prose blocks accumulated into the response
 # string.  Older blocks are replaced with a placeholder to keep the string
@@ -73,7 +133,8 @@ _SCREENSHOT_RE = re.compile(
 
 # Detect "run/debug/fix/launch" intent in the task description.
 _RUN_DEBUG_INTENT_RE = re.compile(
-    r'\b(run|debug|launch|start|fix\s+the\s+error|fix\s+errors?|there\s+are\s+(?:still\s+)?errors?)\b',
+    r'\b(run|debug|launch|fix\s+the\s+error|fix\s+errors?|there\s+are\s+(?:still\s+)?errors?'
+    r'|start\s+(?!script\b|command\b|the\s+script\b))\b',
     re.IGNORECASE,
 )
 
@@ -119,7 +180,17 @@ FILE: path/to/file.ext
 entire file content here
 ```
 
-Format for surgical edits (preferred for fixes — changes only targeted regions):
+Format for line-number replacements (most reliable when file is shown with line numbers):
+REPLACE: path/to/file.ext 45-47
+<<<
+  replacement line 1
+  replacement line 2
+>>>
+
+Where 45-47 are the 1-indexed line numbers from the numbered file view in your context.
+Use REPLACE: whenever line numbers are available — it never fails on old-text mismatch.
+
+Format for surgical edits (fallback when no line numbers are available):
 EDIT: path/to/file.ext
 <<<OLD
 exact text to replace (must match the file exactly, be as minimal as possible)
@@ -127,12 +198,11 @@ exact text to replace (must match the file exactly, be as minimal as possible)
 new replacement text
 >>>
 
-You may have multiple EDIT: blocks for the same or different files.
-Each EDIT: block is matched against the original file, not after earlier edits,
-so do NOT make overlapping edits — merge nearby changes into one block.
+You may have multiple REPLACE: or EDIT: blocks for the same or different files.
 
 Guidelines:
-- Prefer EDIT: over FILE: for bug fixes — it is faster and produces a cleaner diff.
+- Prefer REPLACE: over EDIT: in fix loops — use the line numbers shown in the file context.
+- Prefer EDIT: over FILE: for bug fixes when line numbers are unavailable.
 - Use FILE: only for new files or when rewriting more than 60% of a file.
 - Use find_files and grep_code instead of shell find/grep — they work cross-platform.
 - Be concise in your responses."""
@@ -195,11 +265,7 @@ Guidelines:
         return [(path.strip(), content.strip()) for path, content in matches]
 
     def _extract_file_edits(self, response: str) -> List[tuple]:
-        """Extract EDIT: blocks from the response.
-
-        Returns a list of (path, old_text, new_text) tuples.
-        Multiple hunks for the same path are grouped by the caller.
-        """
+        """Extract EDIT: blocks → [(path, old_text, new_text), ...]."""
         results = []
         for m in _EDIT_BLOCK_RE.finditer(response):
             path = m.group("path").strip()
@@ -207,6 +273,43 @@ Guidelines:
             new_text = m.group("new_text")
             results.append((path, old_text, new_text))
         return results
+
+    def _extract_line_replacements(self, response: str) -> List[tuple]:
+        """Extract REPLACE: blocks → [(path, start, end, new_text), ...]."""
+        results = []
+        for m in _REPLACE_BLOCK_RE.finditer(response):
+            path = m.group("path").strip()
+            start = int(m.group("start"))
+            end = int(m.group("end"))
+            new_text = m.group("new_text")
+            results.append((path, start, end, new_text))
+        return results
+
+    async def _apply_line_replacement(
+        self, tool_executor, path: str, start: int, end: int, new_text: str
+    ) -> bool:
+        """Splice new_text into *path* at 1-indexed lines start–end (inclusive).
+
+        Reads the current file, replaces the line range, writes back.
+        Returns True on success, False if read or write fails.
+        """
+        content = await tool_executor.execute("file_read", {"path": path})
+        if content.startswith("Error"):
+            self.logger.warning("replace_read_failed", path=path)
+            return False
+        lines = content.splitlines(keepends=True)
+        for i, line in enumerate(lines):
+            if not line.endswith("\n"):
+                lines[i] = line + "\n"
+        s = max(0, start - 1)
+        e = min(len(lines), end)
+        replacement = new_text.splitlines(keepends=True)
+        for i, line in enumerate(replacement):
+            if not line.endswith("\n"):
+                replacement[i] = line + "\n"
+        updated = "".join(lines[:s] + replacement + lines[e:])
+        result = await tool_executor.execute("file_write", {"path": path, "content": updated})
+        return not (isinstance(result, str) and result.startswith("Error"))
 
     async def execute(self, context: Dict[str, Any]) -> Dict[str, Any]:
         task = context.get("task", "")
@@ -266,12 +369,72 @@ Summary: <one sentence>
         if tool_executor:
             shell_outputs, failed_outputs = await self._run_shell_blocks(response, tool_executor)
 
+        # Write phase: the LLM read files but emitted no code changes and no real failures.
+        # Feed the shell output back as context and ask for EDIT:/FILE: blocks.
+        # Only fire when shell_outputs actually contain file reads (type/cat) — not just
+        # build failures — so we don't pass empty context to the write-phase model call.
+        _write_phase_real_failures = [e for e in failed_outputs if not _is_readonly_probe(e)]
+        _has_file_reads = any(
+            re.match(r'^\$\s+(type|cat)\s+\S', e.splitlines()[0] if e else "", re.IGNORECASE)
+            for e in shell_outputs
+        )
+        if (
+            tool_executor
+            and not files_created
+            and not _write_phase_real_failures
+            and shell_outputs
+            and _has_file_reads
+            and not self._extract_file_edits(response)
+            and not self._extract_file_writes(response)
+        ):
+            read_context = "\n\n".join(shell_outputs[:5])
+            write_prompt = (
+                f"Task: {task}\n\n"
+                f"You have read these files:\n\n{read_context[:8000]}\n\n"
+                f"Now write the actual code changes using EDIT: blocks (preferred) or FILE: blocks.\n"
+                f"Do NOT run any commands — only output code fixes."
+            )
+            write_response = await model_router.generate(
+                write_prompt, model, system_prompt=self.get_system_prompt()
+            )
+            response += "\n\n**Write phase:**\n" + write_response
+
+            # Apply FILE: full writes from write phase.
+            for file_path, content in self._extract_file_writes(write_response):
+                try:
+                    await tool_executor.execute("file_write", {"path": file_path, "content": content})
+                    verify = await tool_executor.execute("file_read", {"path": file_path})
+                    if not verify.startswith("Error") and file_path not in files_created:
+                        files_created.append(file_path)
+                except Exception as e:
+                    self.logger.error("write_phase_file_write_failed", path=file_path, error=str(e))
+
+            # Apply EDIT: hunks from write phase.
+            wp_edits_by_path: dict[str, list[dict]] = {}
+            for file_path, old_text, new_text in self._extract_file_edits(write_response):
+                wp_edits_by_path.setdefault(file_path, []).append(
+                    {"old_text": old_text, "new_text": new_text}
+                )
+            for file_path, hunks in wp_edits_by_path.items():
+                try:
+                    edit_result = await tool_executor.execute(
+                        "file_edit", {"path": file_path, "edits": hunks}, on_phase=on_phase
+                    )
+                    if not edit_result.startswith("Edit failed") and not edit_result.startswith("Error"):
+                        if file_path not in files_created:
+                            files_created.append(file_path)
+                except Exception as e:
+                    self.logger.error("write_phase_edit_failed", path=file_path, error=str(e))
+
         # Forced-run step: if this is a run/debug task and the initial response
         # only explored the project (no actual app-run command was executed),
         # issue a second targeted call that explicitly runs the app.
+        # Read-only probe failures (type/cat/dir on wrong paths) don't count as
+        # real failures — they shouldn't block the force-run path.
+        real_failures = [e for e in failed_outputs if not _is_readonly_probe(e)]
         is_run_debug = bool(_RUN_DEBUG_INTENT_RE.search(task))
         ran_app = bool(_APP_RUN_CMD_RE.search("\n".join(shell_outputs)))
-        if is_run_debug and not ran_app and not failed_outputs and tool_executor:
+        if is_run_debug and not ran_app and not real_failures and tool_executor:
             prior_output = "\n\n".join(shell_outputs) if shell_outputs else "(no prior commands run)"
             force_run_prompt = (
                 f"Task: {task}\n\n"
@@ -310,10 +473,12 @@ Summary: <one sentence>
         # and re-run it explicitly after each fix, regardless of what shell blocks
         # the LLM includes in its fix response. This prevents the loop from
         # exiting early because the LLM forgot to re-emit the build command.
-        if failed_outputs and tool_executor:
-            # Extract the verify command from the first failed entry ("$ <cmd>\n...")
+        # Recompute real_failures after the force-run block may have updated failed_outputs.
+        real_failures = [e for e in failed_outputs if not _is_readonly_probe(e)]
+        if real_failures and tool_executor:
+            # Extract the verify command from the first real (non-probe) failure.
             verify_cmd: str | None = None
-            first_fail = failed_outputs[0]
+            first_fail = real_failures[0]
             first_line = first_fail.splitlines()[0] if first_fail else ""
             if first_line.startswith("$ "):
                 verify_cmd = first_line[2:].strip()
@@ -342,30 +507,99 @@ Summary: <one sentence>
                     if files_fixed_history
                     else ""
                 )
+
+                # Read the source files referenced in the error output so the
+                # LLM has exact content to write EDIT: old_text against.
+                file_context = ""
+                if tool_executor:
+                    seen_paths: list[str] = []
+                    for m in _ERROR_FILE_RE.finditer(raw_errors):
+                        fp = m.group("path").replace("\\", "/")
+                        if not any(fp.startswith(p) for p in _SKIP_PATH_PREFIXES) and fp not in seen_paths:
+                            seen_paths.append(fp)
+                    # Fallback: extract paths from prior "type"/"cat" shell commands
+                    # when the error output itself contains no source file references.
+                    if not seen_paths:
+                        for entry in shell_outputs:
+                            first = entry.splitlines()[0] if entry else ""
+                            m2 = re.match(r'^\$\s+(?:type|cat)\s+(.+)', first, re.IGNORECASE)
+                            if m2:
+                                fp = m2.group(1).strip().replace("\\", "/")
+                                if not any(fp.startswith(p) for p in _SKIP_PATH_PREFIXES) and fp not in seen_paths:
+                                    seen_paths.append(fp)
+                    # Fallback: read known entry-point files when paths still empty.
+                    if not seen_paths:
+                        for entry_file in ("package.json", "src/main.ts", "src/index.ts", "src/main.py", "src/app.py"):
+                            seen_paths.append(entry_file)
+                    # Also include any files already touched in prior iterations.
+                    for fp in files_fixed_history:
+                        if fp not in seen_paths:
+                            seen_paths.append(fp)
+                    parts: list[str] = []
+                    total_chars = 0
+                    for fp in seen_paths[:8]:  # cap at 8 files
+                        if total_chars >= _MAX_FIX_FILE_CONTEXT:
+                            break
+                        content = await tool_executor.execute("file_read", {"path": fp})
+                        if content.startswith("Error"):
+                            continue
+                        # Use numbered-line format so the model can reference exact
+                        # line numbers in REPLACE: blocks — no old-text matching needed.
+                        snippet = _format_file_with_lines(content, fp, _MAX_FIX_FILE_PER_FILE)
+                        parts.append(snippet)
+                        total_chars += len(snippet)
+                    if parts:
+                        file_context = "Current source files (with line numbers):\n\n" + "\n\n".join(parts) + "\n\n"
+
+                # If we have no file context AND haven't touched any files yet, the model
+                # has no basis for generating EDIT: blocks — abort early rather than wasting
+                # a model call that will produce empty output.
+                if not file_context and not files_fixed_history:
+                    response += (
+                        "\n\n*(Fix loop aborted: could not locate source files to provide as "
+                        "context. Check that the workspace path is correct and that error "
+                        "messages reference valid source file paths.)*"
+                    )
+                    self.logger.info("fix_loop_no_file_context", attempt=_attempt + 1)
+                    break
+
                 fix_prompt = (
                     f"Original task: {task}\n\n"
+                    f"{file_context}"
                     f"The following commands are still failing (attempt {_attempt + 1}/{MAX_FIX_ITERATIONS}).\n"
                     f"{history_note}"
-                    f"Fix the source files:\n\n"
+                    f"Errors:\n\n"
                     f"```\n{raw_errors}\n```\n\n"
-                    f"Use EDIT: blocks for surgical fixes (preferred):\n"
-                    f"EDIT: path/to/file.ext\n"
-                    f"<<<OLD\n"
-                    f"exact text to replace\n"
-                    f"===\n"
-                    f"replacement text\n"
+                    f"Fix the source files. Use REPLACE: blocks — reference the exact line numbers "
+                    f"shown in the file listing above:\n\n"
+                    f"REPLACE: path/to/file.ext 45-47\n"
+                    f"<<<\n"
+                    f"  replacement lines here\n"
                     f">>>\n\n"
-                    f"Or use FILE: blocks for full file rewrites.\n"
+                    f"For new files or large rewrites use FILE: blocks. "
                     f"Do NOT include shell blocks — the system re-runs the build automatically.\n"
                     f"Fix ALL errors shown above, not just the first one."
                 )
                 model = model_router.get_model("coding")
                 fix_response = await model_router.generate(fix_prompt, model, system_prompt=self.get_system_prompt())
 
-                # Apply EDIT: hunks first (surgical patches), then fall back to FILE: full writes.
                 iteration_files: list[str] = []
 
-                # Group EDIT: hunks by file path.
+                # 1. Apply REPLACE: blocks first — line-number based, never fails on old-text mismatch.
+                for file_path, start, end, new_text in self._extract_line_replacements(fix_response):
+                    try:
+                        ok = await self._apply_line_replacement(tool_executor, file_path, start, end, new_text)
+                        if ok:
+                            if file_path not in files_created:
+                                files_created.append(file_path)
+                            iteration_files.append(file_path)
+                            self.logger.info("replace_applied", path=file_path, lines=f"{start}-{end}")
+                        else:
+                            self.logger.warning("replace_failed", path=file_path, lines=f"{start}-{end}")
+                    except Exception as e:
+                        self.logger.error("replace_error", path=file_path, error=str(e))
+
+                # 2. Apply EDIT: hunks (surgical old-text patches) for any files not yet touched.
                 edits_by_path: dict[str, list[dict]] = {}
                 for file_path, old_text, new_text in self._extract_file_edits(fix_response):
                     edits_by_path.setdefault(file_path, []).append(
@@ -407,6 +641,17 @@ Summary: <one sentence>
 
                 files_fixed_history.extend(f for f in iteration_files if f not in files_fixed_history)
                 made_progress = len(iteration_files) > 0
+
+                # If package.json was just edited, run npm install before verifying
+                # so newly added devDependencies are actually available.
+                if made_progress and any(
+                    f.lower().endswith("package.json") for f in iteration_files
+                ) and tool_executor:
+                    install_cmd = _npm_install_cmd(verify_cmd or "npm test")
+                    install_out = await tool_executor.execute("shell", {"command": install_cmd})
+                    shell_outputs.append(f"$ {install_cmd}\n{install_out}")
+                    self.logger.info("npm_install_after_package_json_edit", attempt=_attempt + 1)
+                    _ran_npm_install = True
 
                 # Cap accumulated fix-attempt prose to avoid unbounded growth.
                 # Once we hit the limit, replace the oldest block with a summary.

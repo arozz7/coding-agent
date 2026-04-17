@@ -429,6 +429,13 @@ async def start_task_background(request: TaskRequest):
     return {"job_id": job_id, "session_id": session_id, "task_type": task_type}
 
 
+@app.get("/chains")
+async def list_chains():
+    """List all available agent chains from agent-chain.yaml."""
+    chains = _orchestrator.chain_runner.list_chains(_orchestrator.workspace_path)
+    return {"chains": chains}
+
+
 @app.get("/jobs")
 async def list_jobs(limit: int = 50, offset: int = 0):
     """List all jobs ordered by creation time descending (no full_response)."""

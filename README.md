@@ -9,7 +9,10 @@ An autonomous coding agent with LLM integration, multi-agent orchestration, SDLC
 - **Agentic Task Manager** — Objectives decomposed into ordered task lists; agents execute sequentially, can add tasks dynamically, wiki knowledge persists between subtasks
 - **SDLC Pipeline** — Full plan → build → test → debug → run → verify workflow
 - **Autonomous Run & Debug** — Agent runs shell commands, reads errors, fixes code, re-runs automatically; configurable iteration limit (default 50, set `MAX_FIX_ITERATIONS` in `.env`)
-- **Multi-Agent Routing** — Tasks routed to the right agent automatically: developer, researcher, planner, tester, reviewer, architect, chat
+- **Multi-Agent Routing** — Tasks routed to the right agent automatically: developer, researcher, mapper, planner, tester, reviewer, security, documenter, architect, chat
+- **Plan-Review-Plan Loop** — After the planner decomposes an objective, a dedicated `PlanReviewerAgent` critiques the task list (wrong agent types, missing steps, bad ordering) and returns an improved plan before any code runs
+- **Anchor-and-Patch Edits** — Fix loop shows files with line numbers and requests `REPLACE: file.ts 45-47` blocks; the system splices by line index — no old-text matching, no "text not found" failures
+- **Agent Chains** — Declarative `agent-chain.yaml` pipelines sequence multiple agents with `$INPUT`/`$ORIGINAL` passing; 6 built-in chains (`plan-build-review`, `full-review`, `scout-flow`, `plan-review-plan`, `secure-build`, `plan-build`); `!chain <name> <task>` in Discord
 - **Prompt Architecture** — Agents utilize dedicated system prompts isolated from the active user payload, optimizing context caching and reinforcing strict adherence to internal tool syntaxes
 - **Iterative Research** — Research agent decomposes queries into sub-questions, runs parallel web searches, identifies gaps, and synthesises a structured report; fast-path for local codebase queries
 - **Context Bridge** — Monitors token budget; at 82 % generates a structured handover and continues in a fresh session silently; Discord notifies at 75 %
@@ -19,7 +22,7 @@ An autonomous coding agent with LLM integration, multi-agent orchestration, SDLC
 - **Model Switch Notifications** — Discord bot alerts when the router falls back from a local to a remote model mid-task (inline during task loops; background poll for out-of-job switches via `BOT_STATUS_CHANNEL_ID`)
 - **Interactive CLI Testing** — `interactive_shell` tool spawns any process and drives it via `expect`/`send`/`wait` scripts (REPLs, text adventures, wizard prompts); cross-platform asyncio subprocess
 - **Browser Interaction** — `browser_interact` tool drives Playwright (Chromium) to `navigate`, `click`, `fill`, `press`, `screenshot`, and read `text` on any web app; cross-platform (Windows/macOS/Linux)
-- **Surgical Multi-Hunk Edits** — `EDIT:` block syntax for precise, multi-region file updates; matches against original file content, rejects overlapping edits, and generates unified diffs for transparent debugging
+- **Surgical Multi-Hunk Edits** — `EDIT:` block syntax for precise, multi-region file updates; matches against original file content, rejects overlapping edits; `REPLACE: file.ts 10-14` line-number blocks used in fix loops for zero-mismatch patching
 - **Native Search Tools** — Python-native `find_files` (glob) and `grep_code` (regex) tools; cross-platform, sandboxed to workspace, and automatically skip noisy dirs like `node_modules` and `.git`
 - **Windows Process-Tree Recovery** — Supervisor and shell tools use `taskkill /F /T` on Windows to ensure timed-out child process trees (daemons, build servers) are fully purged
 - **CRLF & BOM Preservation** — Detects and preserves original line endings and Byte Order Marks during file writes, preventing silent file corruption in Windows or legacy environments
