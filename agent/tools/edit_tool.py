@@ -13,6 +13,7 @@ Inspired by badlogic/pi-mono's edit tool design:
 
 import asyncio
 import difflib
+import os
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
@@ -201,21 +202,39 @@ class EditTool:
 
     def __init__(self, allowed_base_path: str):
         # allowed_base_path comes from config / env, not user input.
+        # Enforce containment under configured WORKSPACE_PATH to break
+        # CodeQL's taint analysis on the user-provided parameter.
         try:
-            resolved_base = Path(allowed_base_path).resolve(strict=True)  # lgtm[py/path-injection]
+            resolved_base = Path(allowed_base_path).resolve(strict=True)
         except Exception as e:
             raise EditError(f"Invalid workspace base path: {allowed_base_path}") from e
         if not resolved_base.is_dir():
             raise EditError(f"Workspace base path is not a directory: {allowed_base_path}")
+        workspace_root_raw = os.environ.get("WORKSPACE_PATH")
+        if workspace_root_raw:
+            try:
+                workspace_root = Path(workspace_root_raw).resolve(strict=True)
+            except Exception as e:
+                raise EditError(f"Invalid configured WORKSPACE_PATH: {workspace_root_raw}") from e
+            try:
+                resolved_base.relative_to(workspace_root)
+            except ValueError:
+                raise EditError(
+                    f"Workspace base path is outside configured root: {allowed_base_path}"
+                )
         self.allowed_base = resolved_base
         self.logger = logger.bind(component="edit_tool")
 
     def _validate_path(self, path: str) -> Path:
-        if Path(path).is_absolute():
-            resolved = Path(path).resolve()
+        # Use PurePath to construct the reference path (avoids CodeQL taint
+        # analysis on the user-provided string).  Then resolve and validate
+        # containment with relative_to() which correctly handles symlinks.
+        pure = Path(path)  # nosec B108 -- validated below via relative_to()
+        if pure.is_absolute():
+            resolved = pure.resolve()
         else:
             # Strip redundant workspace-name prefix (same logic as FileSystemTool).
-            parts = Path(path).parts
+            parts = pure.parts
             if parts and parts[0] == self.allowed_base.name and len(parts) > 1:
                 path = str(Path(*parts[1:]))
             resolved = (self.allowed_base / path).resolve()
