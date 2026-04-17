@@ -237,6 +237,10 @@ class AgentClient:
     async def restart(self) -> dict:
         return await self._post("/restart", {}, timeout=10.0)
 
+    async def get_recent_jobs(self, limit: int = 10) -> dict:
+        """Return the most recent jobs ordered newest-first."""
+        return await self._get("/jobs", limit=limit)
+
     async def wait_until_reachable(self) -> None:
         """Poll /health until the API responds. Never gives up.
 
@@ -365,6 +369,56 @@ _PHASE_LABELS: dict[str, str] = {
 
 
 _HEARTBEAT_INTERVAL = 60     # seconds between "still working…" edits when server is silent
+
+
+async def _resolve_last_job_id(
+    ctx: commands.Context,
+    explicit_job_id: Optional[str],
+    *,
+    require_done: bool = False,
+) -> Optional[str]:
+    """Return the best job_id to use for !files / !result / !status.
+
+    Priority:
+      1. Explicit ``job_id`` argument passed by the user.
+      2. In-memory ``bot.user_jobs[user_id]`` set when this bot session submitted
+         the job (lost on bot restart).
+      3. Fallback: query GET /jobs and return the most recently DONE job.
+         This recovers state transparently after a bot restart.
+
+    Returns ``None`` if no job can be resolved, and posts an error message
+    to Discord on behalf of the caller.
+    """
+    user_id = str(ctx.author.id)
+
+    # 1 & 2: explicit or in-memory
+    job_id = explicit_job_id or bot.user_jobs.get(user_id)
+    if job_id:
+        return job_id
+
+    # 3: API fallback — find the most recently completed job
+    try:
+        data = await bot.client.get_recent_jobs(limit=5)
+        jobs = data.get("jobs", [])
+        target_statuses = ("done",) if require_done else ("done", "failed", "running")
+        for job in jobs:  # already ordered newest-first
+            if job.get("status") in target_statuses:
+                recovered_id = job["job_id"]
+                # Re-hydrate the in-memory map so subsequent commands are fast.
+                bot.user_jobs[user_id] = recovered_id
+                await ctx.send(
+                    f"ℹ️ Bot was restarted — auto-recovered last job `{recovered_id}`. "
+                    f"Use `!jobs` to see all recent jobs."
+                )
+                return recovered_id
+    except Exception:
+        pass  # fall through to the not-found message
+
+    await ctx.send(
+        "No recent job found. Use `!ask <task>` to start one, "
+        "or pass an explicit job ID: `!files <job_id>`."
+    )
+    return None
 
 
 async def _safe_edit(msg: discord.Message, content: str) -> None:
@@ -708,11 +762,9 @@ async def cancel(ctx: commands.Context, job_id: Optional[str] = None):
 @bot.command(name="result")
 async def result(ctx: commands.Context, job_id: Optional[str] = None):
     """Show the agent's prose response from the last job (code blocks stripped). Specify a job_id if the bot restarted."""
-    user_id = str(ctx.author.id)
-    job_id = job_id or bot.user_jobs.get(user_id)
+    job_id = await _resolve_last_job_id(ctx, job_id, require_done=True)
     if not job_id:
-        await ctx.send("No recent job. Use `!ask <task>` first, or pass an explicit job ID.")
-        return
+        return  # error already posted
     try:
         data = await bot.client.get_job_result(job_id)
     except Exception as exc:
@@ -741,11 +793,9 @@ async def result(ctx: commands.Context, job_id: Optional[str] = None):
 @bot.command(name="files")
 async def files(ctx: commands.Context, job_id: Optional[str] = None):
     """List files created or modified by the last task. Specify a job_id if the bot restarted."""
-    user_id = str(ctx.author.id)
-    job_id = job_id or bot.user_jobs.get(user_id)
+    job_id = await _resolve_last_job_id(ctx, job_id, require_done=False)
     if not job_id:
-        await ctx.send("No recent job. Use `!ask <task>` first, or pass an explicit job ID.")
-        return
+        return  # error already posted by _resolve_last_job_id
     try:
         job = await bot.client.get_job(job_id)
     except Exception as exc:
@@ -754,10 +804,15 @@ async def files(ctx: commands.Context, job_id: Optional[str] = None):
 
     created = job.get("files_created", [])
     if not created:
-        await ctx.send("No files were created or modified in the last task.")
+        await ctx.send(
+            f"No files were recorded for job `{job_id}` "
+            f"(status: {job.get('status', '?')}).\n"
+            "If files were created via the agent's response text (not FILE: blocks), "
+            "use `!result` to read the full output."
+        )
         return
 
-    lines = ["**Files from last task:**"] + [f"  `{f}`" for f in created]
+    lines = [f"**Files from job `{job_id}`:**"] + [f"  `{f}`" for f in created]
     lines.append("\nUse `!show <path>` to view any of these.")
     await ctx.send("\n".join(lines))
 
