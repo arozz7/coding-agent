@@ -18,6 +18,22 @@ _INLINE_CMD_RE = re.compile(
     re.MULTILINE | re.IGNORECASE,
 )
 
+# EDIT: block — surgical multi-hunk patch format
+#
+#   EDIT: path/to/file.ext
+#   <<<OLD
+#   exact text to replace
+#   ===
+#   new replacement text
+#   >>>
+#
+# The regex captures path, old_text, new_text for each hunk.
+_EDIT_BLOCK_RE = re.compile(
+    r'EDIT:\s*(?P<path>[^\n]+)\n'
+    r'<<<OLD\n(?P<old_text>.*?)\n===\n(?P<new_text>.*?)\n>>>',
+    re.DOTALL,
+)
+
 MAX_FIX_ITERATIONS = int(os.getenv("MAX_FIX_ITERATIONS", "50"))
 
 
@@ -86,18 +102,40 @@ editing code, and writing new files.
 
 Available tools:
 - bash: Execute bash commands
-- edit: Make surgical edits to files
-- write: Create or overwrite files
+- write: Create or overwrite an entire file (use FILE: format)
+- edit: Make surgical edits to specific regions of a file (use EDIT: format)
+- find_files: Find files by glob pattern (preferred over shell find)
+- grep_code: Search file contents by regex (preferred over shell grep)
+
+Format for running commands (use ```shell blocks):
+```shell
+npm install
+npm run build
+```
+
+Format for creating or completely rewriting a file:
+FILE: path/to/file.ext
+```language
+entire file content here
+```
+
+Format for surgical edits (preferred for fixes — changes only targeted regions):
+EDIT: path/to/file.ext
+<<<OLD
+exact text to replace (must match the file exactly, be as minimal as possible)
+===
+new replacement text
+>>>
+
+You may have multiple EDIT: blocks for the same or different files.
+Each EDIT: block is matched against the original file, not after earlier edits,
+so do NOT make overlapping edits — merge nearby changes into one block.
 
 Guidelines:
-- Use bash blocks to run commands, examine files, or search the codebase (must use ```shell)
-- Use the exact FILE: formatting block to write or overwrite files:
-  FILE: path/to/file.ext
-  ```language
-  content
-  ```
-- Use write only for new files or complete rewrites
-- Be concise in your responses"""
+- Prefer EDIT: over FILE: for bug fixes — it is faster and produces a cleaner diff.
+- Use FILE: only for new files or when rewriting more than 60% of a file.
+- Use find_files and grep_code instead of shell find/grep — they work cross-platform.
+- Be concise in your responses."""
 
     async def _run_shell_blocks(
         self, response: str, tool_executor
@@ -155,6 +193,20 @@ Guidelines:
         pattern = r'FILE:\s*(.+?)\n```\w*\n(.*?)```'
         matches = re.findall(pattern, response, re.DOTALL)
         return [(path.strip(), content.strip()) for path, content in matches]
+
+    def _extract_file_edits(self, response: str) -> List[tuple]:
+        """Extract EDIT: blocks from the response.
+
+        Returns a list of (path, old_text, new_text) tuples.
+        Multiple hunks for the same path are grouped by the caller.
+        """
+        results = []
+        for m in _EDIT_BLOCK_RE.finditer(response):
+            path = m.group("path").strip()
+            old_text = m.group("old_text")
+            new_text = m.group("new_text")
+            results.append((path, old_text, new_text))
+        return results
 
     async def execute(self, context: Dict[str, Any]) -> Dict[str, Any]:
         task = context.get("task", "")
@@ -296,16 +348,51 @@ Summary: <one sentence>
                     f"{history_note}"
                     f"Fix the source files:\n\n"
                     f"```\n{raw_errors}\n```\n\n"
-                    f"Write ONLY FILE: blocks to fix the errors. "
-                    f"Do NOT include shell blocks — the system will re-run the build automatically after your fixes.\n"
+                    f"Use EDIT: blocks for surgical fixes (preferred):\n"
+                    f"EDIT: path/to/file.ext\n"
+                    f"<<<OLD\n"
+                    f"exact text to replace\n"
+                    f"===\n"
+                    f"replacement text\n"
+                    f">>>\n\n"
+                    f"Or use FILE: blocks for full file rewrites.\n"
+                    f"Do NOT include shell blocks — the system re-runs the build automatically.\n"
                     f"Fix ALL errors shown above, not just the first one."
                 )
                 model = model_router.get_model("coding")
                 fix_response = await model_router.generate(fix_prompt, model, system_prompt=self.get_system_prompt())
 
-                # Write any fixed files
+                # Apply EDIT: hunks first (surgical patches), then fall back to FILE: full writes.
                 iteration_files: list[str] = []
+
+                # Group EDIT: hunks by file path.
+                edits_by_path: dict[str, list[dict]] = {}
+                for file_path, old_text, new_text in self._extract_file_edits(fix_response):
+                    edits_by_path.setdefault(file_path, []).append(
+                        {"old_text": old_text, "new_text": new_text}
+                    )
+
+                for file_path, hunks in edits_by_path.items():
+                    try:
+                        edit_result = await tool_executor.execute(
+                            "file_edit",
+                            {"path": file_path, "edits": hunks},
+                            on_phase=on_phase,
+                        )
+                        if not edit_result.startswith("Edit failed") and not edit_result.startswith("Error"):
+                            if file_path not in files_created:
+                                files_created.append(file_path)
+                            iteration_files.append(file_path)
+                            self.logger.info("edit_applied", path=file_path, hunks=len(hunks))
+                        else:
+                            self.logger.warning("edit_rejected", path=file_path, detail=edit_result[:120])
+                    except Exception as e:
+                        self.logger.error("edit_failed", path=file_path, error=str(e))
+
+                # Fallback: FILE: blocks for files not already patched via EDIT:.
                 for file_path, content in self._extract_file_writes(fix_response):
+                    if file_path in edits_by_path:
+                        continue  # already handled by EDIT: path above
                     try:
                         await tool_executor.execute("file_write", {"path": file_path, "content": content})
                         verify = await tool_executor.execute("file_read", {"path": file_path})

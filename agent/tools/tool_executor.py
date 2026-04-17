@@ -81,6 +81,8 @@ class ToolExecutor:
         """Register built-in tools."""
         from agent.tools.shell_tool import ShellTool
         from agent.tools.file_system_tool import FileSystemTool
+        from agent.tools.edit_tool import EditTool
+        from agent.tools.search_tool import SearchTool
         from agent.tools.browser_tool import BrowserTool
         from agent.tools.web_tool import WebTool
         from agent.tools.document_tool import DocumentTool
@@ -88,6 +90,8 @@ class ToolExecutor:
 
         self.shell_tool = ShellTool(self.workspace_path)
         self.fs_tool = FileSystemTool(self.workspace_path)
+        self.edit_tool = EditTool(self.workspace_path)
+        self.search_tool = SearchTool(self.workspace_path)
         self.browser_tool = BrowserTool(self.workspace_path)
         self.web_tool = WebTool()
         self.document_tool = DocumentTool()
@@ -99,8 +103,11 @@ class ToolExecutor:
         self.tools["shell"] = self._run_shell
         self.tools["file_read"] = self._read_file
         self.tools["file_write"] = self._write_file
+        self.tools["file_edit"] = self._apply_file_edit     # multi-hunk surgical edit
         self.tools["file_list"] = self._list_files
-        self.tools["search"] = self._search_files
+        self.tools["search"] = self._search_files           # legacy glob search
+        self.tools["find_files"] = self._find_files         # native rglob find
+        self.tools["grep_code"] = self._grep_code           # native regex grep
 
         # Screenshots (dev-server) — kept for backward compat
         self.tools["screenshot"] = self._take_screenshot
@@ -122,13 +129,32 @@ class ToolExecutor:
         if pytest_tool is not None:
             self.tools["test"] = self._run_tests
     
-    def _run_shell(self, input: Dict[str, Any]) -> str:
-        """Execute a shell command and return stdout + stderr with exit code on failure."""
+    async def _run_shell(self, input: Dict[str, Any]) -> str:
+        """Execute a shell command and return stdout + stderr with exit code on failure.
+
+        When ``_on_phase`` is injected (by :meth:`execute`) the command is run
+        via :meth:`~agent.tools.shell_tool.ShellTool.run_streaming` so that
+        each output chunk fires an ``on_phase("shell:running")`` heartbeat,
+        keeping the supervisor watchdog timer alive during long commands.
+        """
         command = input.get("command", "")
+        on_phase: Optional[Callable] = input.get("_on_phase")
         # Strip "cd <project> &&" when workspace is already scoped to that project.
         workspace_name = Path(self.workspace_path).name
         command = _strip_redundant_cd(command, workspace_name)
-        result = self.shell_tool.run(command)
+
+        if on_phase:
+            # Streaming path: emit heartbeats while the command runs.
+            def _heartbeat(_chunk: str) -> None:
+                try:
+                    on_phase("shell:running")
+                except Exception:
+                    pass
+
+            result = await self.shell_tool.run_streaming(command, on_data=_heartbeat)
+        else:
+            result = await asyncio.to_thread(self.shell_tool.run, command)
+
         stdout = (result.get("stdout") or "").strip()
         stderr = (result.get("stderr") or "").strip()
         rc = result.get("returncode")
@@ -189,11 +215,10 @@ class ToolExecutor:
             return f"Error taking screenshot: {str(e)}"
     
     def _search_files(self, input: Dict[str, Any]) -> str:
-        """Search files in workspace."""
+        """Legacy glob search (kept for backward compat). Prefer find_files."""
         pattern = input.get("pattern", "")
         path = input.get("path", "")
         try:
-            from pathlib import Path
             search_path = Path(self.workspace_path) / path if path else Path(self.workspace_path)
             results = []
             for p in search_path.rglob(pattern):
@@ -201,6 +226,64 @@ class ToolExecutor:
             return "\n".join(results) if results else "No matches found"
         except Exception as e:
             return f"Error searching: {str(e)}"
+
+    async def _apply_file_edit(self, input: Dict[str, Any]) -> str:
+        """Apply multi-hunk surgical edits to a file and return a unified diff.
+
+        Input keys
+        ----------
+        ``path``  (str)  — file path (relative or absolute within workspace)
+        ``edits`` (list) — list of dicts with ``old_text`` and ``new_text`` keys
+        """
+        from agent.tools.edit_tool import EditHunk
+        path = input.get("path", "")
+        raw_edits = input.get("edits", [])
+        if not path:
+            return "Error: 'path' is required"
+        if not isinstance(raw_edits, list) or not raw_edits:
+            return "Error: 'edits' must be a non-empty list of {old_text, new_text} objects"
+
+        hunks = []
+        for i, e in enumerate(raw_edits):
+            if not isinstance(e, dict) or "old_text" not in e or "new_text" not in e:
+                return f"Error: edits[{i}] must have 'old_text' and 'new_text' keys"
+            hunks.append(EditHunk(old_text=e["old_text"], new_text=e["new_text"]))
+
+        result = await self.edit_tool.apply_edits(path, hunks)
+        if result.success:
+            diff_section = f"\n\nDiff:\n```diff\n{result.diff}\n```" if result.diff else ""
+            return f"Successfully applied {len(hunks)} edit(s) to {path}.{diff_section}"
+        return f"Edit failed: {result.error}"
+
+    def _find_files(self, input: Dict[str, Any]) -> str:
+        """Find files matching a glob pattern inside the workspace.
+
+        Input keys
+        ----------
+        ``pattern`` (str) — glob pattern, e.g. ``*.py``, ``**/*.ts``
+        ``path``    (str) — sub-directory to search in (default: workspace root)
+        """
+        pattern = input.get("pattern", "")
+        path = input.get("path", ".")
+        if not pattern:
+            return "Error: 'pattern' is required"
+        return self.search_tool.find_files(pattern, path)
+
+    def _grep_code(self, input: Dict[str, Any]) -> str:
+        """Search file contents for a regex pattern inside the workspace.
+
+        Input keys
+        ----------
+        ``pattern``        (str)  — Python regex pattern
+        ``path``           (str)  — sub-directory to search in (default: workspace root)
+        ``case_sensitive`` (bool) — default True
+        """
+        pattern = input.get("pattern", "")
+        path = input.get("path", ".")
+        case_sensitive = bool(input.get("case_sensitive", True))
+        if not pattern:
+            return "Error: 'pattern' is required"
+        return self.search_tool.grep_code(pattern, path, case_sensitive=case_sensitive)
 
     async def _web_fetch(self, input: Dict[str, Any]) -> str:
         """Fetch a URL and return its rendered text content."""
@@ -364,7 +447,13 @@ class ToolExecutor:
         except Exception as e:
             return f"Error running tests: {str(e)}"
 
-    async def execute(self, tool_name: str, input: Dict[str, Any]) -> str:
+    async def execute(
+        self,
+        tool_name: str,
+        input: Dict[str, Any],
+        *,
+        on_phase: Optional[Callable] = None,
+    ) -> str:
         """Execute a tool by name with input dict.
 
         This is a coroutine — call it with ``await executor.execute(name, input)``.
@@ -372,11 +461,13 @@ class ToolExecutor:
         awaited, regular functions are called directly.
 
         Args:
-            tool_name: Name of the tool to execute
-            input: Dict of arguments for the tool
+            tool_name:  Name of the tool to execute.
+            input:      Dict of arguments for the tool.
+            on_phase:   Optional callback forwarded to the ``shell`` tool so it
+                        can emit watchdog heartbeats during long-running commands.
 
         Returns:
-            String result from the tool
+            String result from the tool.
         """
         if tool_name not in self.tools:
             return f"Error: Unknown tool '{tool_name}'. Available: {list(self.tools.keys())}"
@@ -385,11 +476,17 @@ class ToolExecutor:
 
         tool_func = self.tools[tool_name]
 
+        # Inject on_phase into shell input so the streaming runner can emit
+        # heartbeats without changing the tool's public interface.
+        effective_input = input
+        if tool_name == "shell" and on_phase is not None:
+            effective_input = {**input, "_on_phase": on_phase}
+
         try:
             if inspect.iscoroutinefunction(tool_func):
-                result = await tool_func(input)
+                result = await tool_func(effective_input)
             else:
-                result = await asyncio.to_thread(tool_func, input)
+                result = await asyncio.to_thread(tool_func, effective_input)
             return result
         except Exception as e:
             self.logger.error("tool_execution_failed", tool=tool_name, error=str(e))

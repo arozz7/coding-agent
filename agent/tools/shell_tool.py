@@ -1,10 +1,14 @@
+import asyncio
 import os
-import subprocess
 import platform
 import re
 import shlex
 import shutil
+import signal
+import subprocess
 from pathlib import Path
+from typing import Callable, Optional
+
 import structlog
 
 logger = structlog.get_logger()
@@ -141,6 +145,30 @@ def _is_windows_builtin(cmd: str) -> bool:
     return first_token in _WINDOWS_BUILTINS
 
 
+def _kill_process_tree(pid: int) -> None:
+    """Kill a process and all its children.
+
+    On Windows uses ``taskkill /F /T /PID`` to terminate the entire job tree.
+    On Unix sends SIGKILL to the process group so daemonised children die too.
+    """
+    try:
+        if IS_WINDOWS:
+            subprocess.run(
+                ["taskkill", "/F", "/T", "/PID", str(pid)],
+                capture_output=True,
+                timeout=10,
+            )
+        else:
+            try:
+                pgid = os.getpgid(pid)
+                os.killpg(pgid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass  # process already gone
+    except Exception:
+        # Best-effort; don't propagate kill errors.
+        pass
+
+
 class ShellTool:
     def __init__(self, workspace_path: str):
         # workspace_path comes from WORKSPACE_PATH env var / server config, not user HTTP input.
@@ -160,12 +188,10 @@ class ShellTool:
         verb = parts[0].lower() if parts else ""
 
         if verb == "ls":
-            # Collect non-flag arguments (directory targets)
             targets = [p for p in parts[1:] if not p.startswith("-")]
             return "dir " + " ".join(targets) if targets else "dir"
 
         if verb == "cat":
-            # `cat file` → `type file`; `cat file1 file2` → `type file1 file2`
             targets = [p for p in parts[1:] if not p.startswith("-")]
             return "type " + " ".join(targets) if targets else "type"
 
@@ -193,7 +219,6 @@ class ShellTool:
             return f"where {targets}" if targets else "where"
 
         if verb == "grep":
-            # Best-effort: `grep pattern file` → `findstr pattern file`
             targets = " ".join(parts[1:])
             return f"findstr {targets}"
 
@@ -213,16 +238,34 @@ class ShellTool:
 
         return cmd
 
+    def _resolve_args(self, cmd: str) -> tuple:
+        """Resolve (args, use_shell) for subprocess from the translated command string."""
+        if IS_WINDOWS:
+            if _is_windows_builtin(cmd):
+                return cmd, True
+            try:
+                parsed = shlex.split(cmd, posix=False)
+            except ValueError:
+                return None, None  # caller handles parse failure
+
+            first_tok = parsed[0] if parsed else ""
+            resolved = shutil.which(first_tok, path=_TOOL_ENV["PATH"])
+            if resolved and resolved.lower().endswith((".cmd", ".bat")):
+                return cmd, True
+            return parsed, False
+        else:
+            try:
+                return shlex.split(cmd), False
+            except ValueError:
+                return None, None
+
     def run(self, command: str, timeout: int = 60) -> dict:
         """Run a shell command in the workspace directory.
 
-        On Unix the command is tokenised with shlex and run with shell=False,
-        which prevents shell-metacharacter injection.  On Windows, built-in
-        commands (dir, type, del …) still require shell=True; external
-        commands (npm, python, git …) are run with shell=False.
-
-        All commands are checked against a blocklist of dangerous patterns
-        before execution regardless of platform.
+        Uses ``subprocess.Popen`` so the process PID is available for
+        process-tree termination on timeout.  On Windows, ``taskkill /F /T``
+        kills the entire child tree; on Unix the process group is killed via
+        SIGKILL so daemonised grandchildren don't survive.
         """
         cmd = command.strip()
 
@@ -237,73 +280,135 @@ class ShellTool:
 
         self.logger.info("shell_run", original=command, translated=cmd, cwd=str(self.workspace))
 
+        args, use_shell = self._resolve_args(cmd)
+        if args is None:
+            self.logger.warning("shlex_parse_failed", cmd=cmd)
+            return {"success": False, "error": f"Could not parse command: {cmd!r}"}
+
+        # On Unix, start process in a new session/group so killpg covers children.
+        popen_kwargs: dict = dict(
+            cwd=str(self.workspace),
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            env=_TOOL_ENV,
+        )
+        if not IS_WINDOWS:
+            popen_kwargs["start_new_session"] = True
+
         try:
-            if IS_WINDOWS:
-                if _is_windows_builtin(cmd):
-                    # Built-ins must use shell=True; already validated above.
-                    args: str | list = cmd
-                    use_shell = True
-                else:
-                    # External executables: tokenise first, then check if the
-                    # resolved binary is a .cmd/.bat script.  Windows CreateProcess
-                    # does NOT search PATHEXT when shell=False, so .cmd files
-                    # (e.g. npm.CMD, npx.CMD) silently fail with WinError 2.
-                    # Detect this case and fall back to shell=True (cmd /c).
-                    try:
-                        parsed = shlex.split(cmd, posix=False)
-                    except ValueError:
-                        self.logger.warning("shlex_parse_failed", cmd=cmd)
-                        return {"success": False, "error": f"Could not parse command: {cmd!r}"}
+            proc = subprocess.Popen(args, shell=use_shell, **popen_kwargs)
+        except Exception as e:
+            self.logger.error("shell_spawn_failed", command=command, error=str(e))
+            return {"success": False, "error": str(e)}
 
-                    first_tok = parsed[0] if parsed else ""
-                    resolved = shutil.which(first_tok, path=_TOOL_ENV["PATH"])
-                    if resolved and resolved.lower().endswith((".cmd", ".bat")):
-                        # Pass full command string to cmd.exe so it handles
-                        # argument quoting; shell=True is safe here because the
-                        # command has already passed _validate_command().
-                        args = cmd
-                        use_shell = True
-                    else:
-                        args = parsed
-                        use_shell = False
-            else:
-                # Unix: always tokenise; never need shell=True.
-                try:
-                    args = shlex.split(cmd)
-                except ValueError:
-                    self.logger.warning("shlex_parse_failed", cmd=cmd)
-                    return {"success": False, "error": f"Could not parse command: {cmd!r}"}
-                use_shell = False
-
-            result = subprocess.run(
-                args,
-                shell=use_shell,
-                cwd=str(self.workspace),
-                stdin=subprocess.DEVNULL,   # prevent interactive apps from blocking
-                capture_output=True,
-                text=True,
-                encoding='utf-8',
-                errors='replace',
-                timeout=timeout,
-                env=_TOOL_ENV,
-            )
-            return {
-                "success": result.returncode == 0,
-                "returncode": result.returncode,
-                "stdout": result.stdout,
-                "stderr": result.stderr,
-            }
+        try:
+            stdout, stderr = proc.communicate(timeout=timeout)
         except subprocess.TimeoutExpired:
-            self.logger.error("shell_timeout", command=command, timeout=timeout)
+            self.logger.error("shell_timeout", command=command, timeout=timeout, pid=proc.pid)
+            _kill_process_tree(proc.pid)
+            try:
+                stdout, stderr = proc.communicate(timeout=5)
+            except Exception:
+                stdout, stderr = "", ""
             return {"success": False, "error": f"Command timed out after {timeout}s"}
         except Exception as e:
+            _kill_process_tree(proc.pid)
             self.logger.error("shell_error", command=command, error=str(e))
             return {"success": False, "error": str(e)}
-    
+
+        return {
+            "success": proc.returncode == 0,
+            "returncode": proc.returncode,
+            "stdout": stdout,
+            "stderr": stderr,
+        }
+
+    async def run_streaming(
+        self,
+        command: str,
+        timeout: int = 60,
+        on_data: Optional[Callable[[str], None]] = None,
+    ) -> dict:
+        """Run a shell command, calling ``on_data(chunk)`` as output arrives.
+
+        Used by the tool executor to emit watchdog heartbeats during long-
+        running commands (npm start, pytest, etc.) without blocking the
+        supervisor's stale-job timer.
+
+        Returns the same dict shape as :meth:`run`.
+        """
+        cmd = command.strip()
+        if IS_WINDOWS:
+            cmd = self._translate_unix_to_windows(cmd)
+
+        try:
+            _validate_command(cmd)
+        except ValueError as e:
+            return {"success": False, "error": str(e)}
+
+        args, use_shell = self._resolve_args(cmd)
+        if args is None:
+            return {"success": False, "error": f"Could not parse command: {cmd!r}"}
+
+        create_flags = 0
+        if IS_WINDOWS:
+            CREATE_NEW_PROCESS_GROUP = 0x00000200
+            create_flags = CREATE_NEW_PROCESS_GROUP
+
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                *(args if isinstance(args, list) else [args]),
+                stdin=asyncio.subprocess.DEVNULL,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.STDOUT,
+                cwd=str(self.workspace),
+                env=_TOOL_ENV,
+            )
+        except Exception as e:
+            return {"success": False, "error": str(e)}
+
+        stdout_chunks: list[str] = []
+
+        async def _read_output() -> None:
+            assert proc.stdout is not None
+            async for raw_line in proc.stdout:
+                chunk = raw_line.decode("utf-8", errors="replace")
+                stdout_chunks.append(chunk)
+                if on_data:
+                    try:
+                        on_data(chunk)
+                    except Exception:
+                        pass
+
+        try:
+            await asyncio.wait_for(_read_output(), timeout=timeout)
+            await proc.wait()
+        except asyncio.TimeoutError:
+            self.logger.error("shell_streaming_timeout", command=command, timeout=timeout)
+            if proc.pid:
+                _kill_process_tree(proc.pid)
+            try:
+                await asyncio.wait_for(proc.wait(), timeout=5)
+            except asyncio.TimeoutError:
+                pass
+            return {"success": False, "error": f"Command timed out after {timeout}s"}
+
+        stdout = "".join(stdout_chunks)
+        return {
+            "success": proc.returncode == 0,
+            "returncode": proc.returncode,
+            "stdout": stdout,
+            "stderr": "",
+        }
+
     def run_npm(self, args: str, timeout: int = 120) -> dict:
-        """Run an npm command"""
+        """Run an npm command."""
         return self.run(f"npm {args}", timeout=timeout)
-    
+
     def run_python(self, args: str, timeout: int = 60) -> dict:
-        """Run a python command"""
+        """Run a python command."""
         return self.run(f"python {args}", timeout=timeout)

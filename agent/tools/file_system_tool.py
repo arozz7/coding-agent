@@ -102,10 +102,30 @@ class FileSystemTool:
 
         try:
             validated.parent.mkdir(parents=True, exist_ok=True)
-            with open(validated, "w", encoding="utf-8") as f:
-                f.write(content)
+
+            # Preserve the original file's line endings if it already exists.
+            # This prevents silently converting CRLF → LF on Windows workspaces.
+            original_ending = "\n"
+            if validated.exists():
+                try:
+                    sample = validated.read_bytes()[:4096].decode("utf-8", errors="replace")
+                    if "\r\n" in sample:
+                        original_ending = "\r\n"
+                except Exception:
+                    pass  # fall back to LF on any read error
+
+            # Normalise incoming content to LF then restore target endings.
+            normalised = content.replace("\r\n", "\n").replace("\r", "\n")
+            if original_ending == "\r\n":
+                normalised = normalised.replace("\n", "\r\n")
+
+            with open(validated, "w", encoding="utf-8", newline="") as f:
+                f.write(normalised)
             self.logger.info(
-                "file_written", path=str(validated), size=len(content)
+                "file_written",
+                path=str(validated),
+                size=len(normalised),
+                line_ending="CRLF" if original_ending == "\r\n" else "LF",
             )
         except PermissionError as e:
             raise PermissionDeniedError(
