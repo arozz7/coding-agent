@@ -162,6 +162,7 @@ Guidelines:
         files_created = []
         model_router = context.get("model_router")
         tool_executor = context.get("tool_executor")
+        on_phase = context.get("on_phase")
 
         if not model_router:
             return {"success": False, "error": "model_router not available"}
@@ -272,6 +273,12 @@ Summary: <one sentence>
             _ran_npm_install: bool = False
 
             for _attempt in range(MAX_FIX_ITERATIONS):
+                if on_phase:
+                    try:
+                        on_phase(f"fixing:attempt:{_attempt + 1}")
+                    except Exception:
+                        pass
+                
                 # Trim error text: TypeScript / webpack errors can be thousands of
                 # repeated lines.  Keep the tail (most recent errors) not the head.
                 raw_errors = "\n\n".join(failed_outputs)
@@ -312,6 +319,7 @@ Summary: <one sentence>
                         self.logger.error("fix_file_write_failed", path=file_path, error=str(e))
 
                 files_fixed_history.extend(f for f in iteration_files if f not in files_fixed_history)
+                made_progress = len(iteration_files) > 0
 
                 # Cap accumulated fix-attempt prose to avoid unbounded growth.
                 # Once we hit the limit, replace the oldest block with a summary.
@@ -345,6 +353,12 @@ Summary: <one sentence>
                             shell_outputs.append(f"$ {install_cmd}\n{install_out}")
                             self.logger.info("npm_auto_install", cmd=install_cmd, attempt=_attempt + 1)
                             _ran_npm_install = True
+                            made_progress = True
+                            
+                        if not made_progress:
+                            response += f"\n\n*(Fix loop aborted: The model did not modify any files to address the failure)*"
+                            self.logger.info("fix_loop_aborted_no_progress", attempt=_attempt + 1)
+                            break
 
                         verify_out = await tool_executor.execute("shell", {"command": verify_cmd})
                         verify_entry = f"$ {verify_cmd}\n{verify_out}"

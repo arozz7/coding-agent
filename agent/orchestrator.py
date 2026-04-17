@@ -961,12 +961,15 @@ class AgentOrchestrator:
                 description=description[:60],
             )
 
+            def _wrapped_on_phase(inner_label: str) -> None:
+                _emit(f"task:{task_num}/{total}:{inner_label}")
+
             try:
                 result = await self._run_specialized_agent(
                     description,
                     agent_type,
                     session_id,
-                    on_phase=on_phase,
+                    on_phase=_wrapped_on_phase,
                     job_id=None,     # prevent re-entering the loop
                     _direct=True,    # go straight to agent
                 )
