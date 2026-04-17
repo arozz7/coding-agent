@@ -129,6 +129,22 @@ Practical examples for using the Local Coding Agent effectively.
 > Add error handling to main.py
 > Rename all instances of "user_id" to "userId" in this file
 > Add type hints to this function
+
+### Surgical Edits (Precise Patching)
+
+```
+> Fix the typo in src/auth.py by replacing 'authentcate' with 'authenticate'
+```
+
+The agent will use an `EDIT:` block to target only that line:
+```
+EDIT: src/auth.py
+<<<OLD
+def authentcate(user):
+===
+def authenticate(user):
+>>>
+```
 ```
 
 ---

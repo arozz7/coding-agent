@@ -19,6 +19,10 @@ An autonomous coding agent with LLM integration, multi-agent orchestration, SDLC
 - **Model Switch Notifications** — Discord bot alerts when the router falls back from a local to a remote model mid-task (inline during task loops; background poll for out-of-job switches via `BOT_STATUS_CHANNEL_ID`)
 - **Interactive CLI Testing** — `interactive_shell` tool spawns any process and drives it via `expect`/`send`/`wait` scripts (REPLs, text adventures, wizard prompts); cross-platform asyncio subprocess
 - **Browser Interaction** — `browser_interact` tool drives Playwright (Chromium) to `navigate`, `click`, `fill`, `press`, `screenshot`, and read `text` on any web app; cross-platform (Windows/macOS/Linux)
+- **Surgical Multi-Hunk Edits** — `EDIT:` block syntax for precise, multi-region file updates; matches against original file content, rejects overlapping edits, and generates unified diffs for transparent debugging
+- **Native Search Tools** — Python-native `find_files` (glob) and `grep_code` (regex) tools; cross-platform, sandboxed to workspace, and automatically skip noisy dirs like `node_modules` and `.git`
+- **Windows Process-Tree Recovery** — Supervisor and shell tools use `taskkill /F /T` on Windows to ensure timed-out child process trees (daemons, build servers) are fully purged
+- **CRLF & BOM Preservation** — Detects and preserves original line endings and Byte Order Marks during file writes, preventing silent file corruption in Windows or legacy environments
 - **Workspace Scoping** — `PROJECT_DIR` env var focuses all file operations on an active project subdirectory; no path double-nesting
 - **Agent Wiki Memory** — `.agent-wiki/` knowledge base compiled per task; later subtasks query earlier ones; index deduplication; `!skills` to inspect
 - **RAG Memory** — Codebase indexed in ChromaDB; retrieved context injected into every task
@@ -282,8 +286,10 @@ coding-agent/
 │   │   ├── skill_loader.py        # Lazy skill content loading
 │   │   └── wiki_manager.py        # .agent-wiki/ read/write, index upsert, lint
 │   └── tools/
-│       ├── shell_tool.py              # Shell execution, PATH auto-discovery, Windows .cmd fix
-│       ├── file_system_tool.py        # File CRUD
+│       ├── shell_tool.py              # Shell execution, PATH auto-discovery, Windows .cmd fix, process-tree kill
+│       ├── file_system_tool.py        # File CRUD, CRLF preservation
+│       ├── edit_tool.py               # Surgical multi-hunk patched edits
+│       ├── search_tool.py             # Native find_files and grep_code
 │       ├── git_tool.py                # Git operations
 │       ├── browser_tool.py            # Playwright screenshots, server polling, browser interact
 │       ├── interactive_shell_tool.py  # asyncio expect/send driver for CLI apps

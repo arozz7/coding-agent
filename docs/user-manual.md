@@ -15,7 +15,8 @@ A comprehensive guide to using the Local Coding Agent.
 9. [Agent Wiki Memory](#agent-wiki-memory)
 10. [Interactive Testing Tools](#interactive-testing-tools)
 11. [REST API Reference](#rest-api-reference)
-12. [Troubleshooting](#troubleshooting)
+12. [Advanced File Operations](#advanced-file-operations)
+13. [Troubleshooting](#troubleshooting)
 
 ---
 
@@ -67,6 +68,7 @@ python -m pip install -e .
 | `MAX_FIX_ITERATIONS` | No | `50` | Maximum fix-loop iterations the developer agent will attempt before giving up on a build error |
 | `BOT_STATUS_CHANNEL_ID` | No | — | Discord channel ID for model-switch alerts (e.g. when the agent falls back from local to remote). Leave unset to disable |
 | `STALE_JOB_THRESHOLD_SECS` | No | `2700` | Seconds before the watchdog kills a stuck job (45 min default). The timer automatically resets on task progress updates. |
+| `MAX_FIND_RESULTS` | No | `200` | Maximum results returned by `find_files` or `grep_code`. |
 
 ### Model Configuration (`config/models.yaml`)
 
@@ -698,7 +700,68 @@ POST /restart
 
 ---
 
+## Advanced File Operations
+
+### Surgical Edits (`EDIT:` format)
+
+Instead of rewriting an entire file, the agent can make specific, surgical edits using the `EDIT:` block. This is the preferred method for bug fixes and small refactors.
+
+**Format:**
+
+```
+EDIT: path/to/file.ext
+<<<OLD
+exact text to replace
+===
+new replacement text
+>>>
+```
+
+**Features:**
+- **Multi-hunk support**: Single response can contain multiple `EDIT:` blocks for different files or different parts of the same file.
+- **Overlap Protection**: All edits are matched against the original file content simultaneously. If two edits would overlap or conflict, the entire operation is rejected to prevent file corruption.
+- **Unified Diff**: The agent returns a standard unified diff of the changes, which is displayed in the job transcript for easy review.
+- **Atomic Writes**: Each file is locked during the edit to prevent concurrent write races.
+
+### Native Search Tools
+
+The agent includes Python-native replacements for `find` and `grep` that work consistently across Windows, macOS, and Linux without requiring external shell utilities.
+
+#### `find_files`
+
+Uses `pathlib` globs to find files. Automatically skips noisy directories like `node_modules`, `.git`, and `dist`.
+
+```json
+// Tool execution example
+{
+  "pattern": "**/*.py",
+  "path": "src"
+}
+```
+
+#### `grep_code`
+
+Performs a regex search across file contents. Skips binary files (images, PDFs, executables) and ignored directories.
+
+```json
+// Tool execution example
+{
+  "pattern": "def session_id",
+  "case_sensitive": false
+}
+```
+
+### Line Ending & BOM Preservation
+
+The agent automatically detects the line endings (`CRLF` on Windows, `LF` on Unix) and the presence of a Byte Order Mark (`BOM`) in existing files. When writing updates (via `FILE:` or `EDIT:`), it restores the original format, ensuring compatibility with your existing VCS and IDE settings.
+
+---
+
 ## Troubleshooting
+
+### Windows Process-Tree termination
+
+If a background process (like `npm start` or a local build server) times out, the shell tool and supervisor now use `taskkill /F /T` on Windows. This ensures that the entire child process tree is purged. If you find orphaned processes still running, check that `taskkill` is available in your system PATH.
 
 ### Bot says "supervisor.py is not running — restart not possible"
 

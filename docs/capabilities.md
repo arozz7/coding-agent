@@ -49,7 +49,9 @@
 ### File Operations
 
 - **Create, read, update, delete** files
-- **Search for files** by pattern
+- **Surgical edits** — Apply precise multi-hunk patches while preserving line endings and BOM
+- **Search for files** — Native cross-platform glob search (find_files)
+- **Grep code** — Native regex search across the codebase (grep_code)
 - **Explore directory structures**
 - **Batch operations** on multiple files
 - **Path traversal protection** (security)
@@ -101,7 +103,8 @@
 - **Cannot interact** with GUI applications
 - **Cannot send emails** or notifications
 - **Cannot directly modify** system files
-- **Cannot install software** (only write files)
+- **Cannot install software** (only write files and run tools found in PATH)
+- **Process management** — Supervisor and shell tools can terminate entire child trees on Windows to prevent daemon stalls
 
 ---
 
@@ -153,10 +156,10 @@
 
 | Capability | Supported | Notes |
 |-----------|-----------|-------|
-| Read files | ✅ | With encoding handling |
-| Write files | ✅ | Create/update |
+| Read files | ✅ | With encoding, line ending, and BOM handling |
+| Write files | ✅ | Create/update/surgical-patch |
 | Delete files | ✅ | With confirmation |
-| Glob/search | ✅ | Pattern matching |
+| Glob/search | ✅ | Native find_files / grep_code |
 | Directory listing | ✅ | Recursive option |
 | Symbolic links | ⚠️ | Restricted |
 | Permissions | ⚠️ | Read-only info |
