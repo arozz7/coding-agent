@@ -19,7 +19,7 @@ from typing import Any
 
 import structlog
 
-from agent.security.paths import PathTraversalError, resolve_within
+from agent.security.paths import PathTraversalError
 from agent.tools.shell_tool import _TOOL_ENV
 
 logger = structlog.get_logger()
@@ -87,11 +87,10 @@ class InteractiveShellTool:
         if "\x00" in workspace_path:
             raise ValueError("workspace_path contains invalid characters")
 
-        # Canonicalize and assert containment in one step — CodeQL-safe pattern.
-        try:
-            candidate = resolve_within(workspace_path.strip(), allowed_root)
-        except (PathTraversalError, ValueError) as e:
-            raise ValueError(str(e)) from e
+        # Inline containment check — the pattern CodeQL recognises as safe for py/path-injection.
+        candidate = (allowed_root / workspace_path.strip()).resolve()
+        if not candidate.is_relative_to(allowed_root):
+            raise PathTraversalError(f"workspace_path '{workspace_path}' resolves outside allowed root")
 
         if not candidate.is_dir():
             raise ValueError("workspace_path must be an existing directory")

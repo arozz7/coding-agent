@@ -206,11 +206,11 @@ class EditTool:
         # os.path.realpath() resolves symlinks. The startswith() check then
         # validates the result is within the expected root — this is the
         # exact pattern recommended by CodeQL for py/path-injection.
-        canonical = os.path.realpath(os.path.normpath(allowed_base_path))  # lgtm[py/path-injection] — allowed_base_path comes from WORKSPACE_PATH env/config, not direct HTTP input
+        canonical = os.path.realpath(os.path.normpath(allowed_base_path))
         if not os.path.isdir(canonical):
             raise EditError(f"Workspace base path is not a directory: {allowed_base_path}")
         resolved_base = Path(canonical)
-        self.allowed_base = resolved_base  # lgtm[py/path-injection] — canonical path resolved via realpath on line above
+        self.allowed_base = resolved_base
         self.logger = logger.bind(component="edit_tool")
 
     def _validate_path(self, path: str) -> Path:

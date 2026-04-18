@@ -28,7 +28,7 @@ def resolve_within(path: str | Path, allowed_base: str | Path) -> Path:
     p = Path(path)
     # Relative paths are joined with the base before resolving so they don't
     # accidentally resolve against the process working directory.
-    resolved = (base / p).resolve() if not p.is_absolute() else p.resolve()  # lgtm[py/path-injection] — containment checked on the next line
+    resolved = (base / p).resolve() if not p.is_absolute() else p.resolve()
     if not resolved.is_relative_to(base):
         raise PathTraversalError(
             f"Path '{path}' resolves outside allowed directory '{base}'"

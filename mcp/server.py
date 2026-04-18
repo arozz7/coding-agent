@@ -51,7 +51,7 @@ def create_mcp_server(workspace_path: str, repo_path: Optional[str] = None) -> M
     if repo_path is None:
         from pathlib import Path as _Path
         # workspace_path comes from WORKSPACE_PATH env var / server config, not user HTTP input.
-        if (_Path(workspace_path) / ".git").exists():  # lgtm[py/path-injection] — workspace_path comes from WORKSPACE_PATH env/config, not raw HTTP input
+        if (_Path(workspace_path) / ".git").exists():
             repo_path = workspace_path
             logger.info("git_repo_detected", path=workspace_path)
 

@@ -1389,7 +1389,7 @@ class AgentOrchestrator:
 
         # Populate MemoryWiki from static analysis of Python files
         self.memory_wiki.clear()
-        py_files = list(Path(self.workspace_path).rglob("*.py"))  # lgtm[py/path-injection] — workspace_path is server config, validated at API layer before reaching here
+        py_files = list(Path(self.workspace_path).rglob("*.py"))
         wiki_errors = 0
         for py_file in py_files:
             rel_path = str(py_file.relative_to(self.workspace_path))
