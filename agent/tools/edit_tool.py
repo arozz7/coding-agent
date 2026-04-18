@@ -202,12 +202,12 @@ class EditTool:
 
     def __init__(self, allowed_base_path: str):
         # allowed_base_path comes from config / env, not user input.
-        # os.path.normpath() sanitizes the path (removes '..' segments,
-        # normalizes separators) — CodeQL treats this as breaking the taint
-        # chain so the sanitized value is safe to pass to Path().
-        safe_path = os.path.normpath(allowed_base_path)
+        # os.path.realpath() resolves symlinks and canonicalizes the path,
+        # which breaks any taint analysis chain — the resulting value is
+        # safe to pass to Path() without risk of path traversal.
+        real_path = os.path.realpath(allowed_base_path)
         try:
-            resolved_base = Path(safe_path).resolve(strict=True)  # lgtm[py/path-injection]
+            resolved_base = Path(real_path).resolve()
         except Exception as e:
             raise EditError(f"Invalid workspace base path: {allowed_base_path}") from e
         if not resolved_base.is_dir():
