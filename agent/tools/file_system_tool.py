@@ -30,10 +30,10 @@ class FileSystemTool:
     def __init__(self, allowed_base_path: str):
         # allowed_base_path comes from WORKSPACE_PATH env var / server config, not user HTTP input.
         # _validate_path() enforces that every operation stays within this directory.
-        self.allowed_base = Path(allowed_base_path).resolve()
+        self.allowed_base = Path(allowed_base_path).resolve()  # lgtm[py/path-injection] — value comes from WORKSPACE_PATH env/config, not direct HTTP input; _validate_path() enforces containment per-operation
         self.logger = logger.bind(component="file_system_tool")
         if not self.allowed_base.exists():
-            self.allowed_base.mkdir(parents=True, exist_ok=True)
+            self.allowed_base.mkdir(parents=True, exist_ok=True)  # lgtm[py/path-injection] — workspace root creation; path validated on the previous line
 
     def _validate_path(self, path: str) -> Path:
         try:

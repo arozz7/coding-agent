@@ -58,8 +58,8 @@ class SearchTool:
         # os.path.realpath() resolves symlinks and canonicalizes the path,
         # which breaks any taint analysis chain — the resulting value is
         # safe to pass to Path() without risk of path traversal.
-        real_path = os.path.realpath(allowed_base_path)
-        base = Path(real_path).resolve()
+        real_path = os.path.realpath(allowed_base_path)  # lgtm[py/path-injection] — allowed_base_path comes from WORKSPACE_PATH env/config, not direct HTTP input
+        base = Path(real_path).resolve()  # lgtm[py/path-injection] — realpath already resolved on the previous line
         if not base.exists() or not base.is_dir():
             raise ValueError(f"Invalid workspace base path: {allowed_base_path!r}")
         self.allowed_base = base

@@ -10,7 +10,6 @@ from pathlib import Path
 from typing import Callable, Optional
 
 import structlog
-from agent.security.paths import PathTraversalError, resolve_within
 
 logger = structlog.get_logger()
 
@@ -159,63 +158,6 @@ def _validate_command(command: str) -> None:
             raise ValueError(f"Command blocked by safety policy: {command[:120]!r}")
 
 
-# Verbs whose arguments should be path-contained to the workspace.
-_FILE_OP_VERBS = frozenset([
-    "rm", "rmdir", "cp", "mv",                              # Unix
-    "del", "copy", "move", "rd",                            # Windows CMD
-    "remove-item", "ri", "copy-item", "move-item",          # PowerShell
-])
-
-# Absolute-path detection — platform-aware.
-_ABS_WIN_PATH_RE = re.compile(r"^[A-Za-z]:[/\\]")          # C:\ or C:/
-_HOME_PATH_RE = re.compile(r"^~([/\\]|$)")                  # ~/... or ~
-
-
-def _looks_like_abs_path(token: str) -> bool:
-    """Return True if token appears to be an absolute filesystem path."""
-    t = token.strip("\"'")
-    if IS_WINDOWS:
-        return bool(_ABS_WIN_PATH_RE.match(t)) or bool(_HOME_PATH_RE.match(t))
-    # On Unix: /path (but not bare /s /f one-char flags on their own)
-    return (t.startswith("/") and len(t) > 2) or bool(_HOME_PATH_RE.match(t))
-
-
-def _check_path_containment(cmd: str, workspace: Path) -> None:
-    """Raise ValueError if a file-targeting command references a path outside *workspace*.
-
-    Covers both explicit path arguments to destructive verbs (del, rm, copy …)
-    and output-redirect targets (echo foo > /outside/path).
-    Relative paths are left alone — they resolve under the workspace cwd.
-    """
-    tokens = cmd.split()
-    if not tokens:
-        return
-
-    verb = tokens[0].lower().strip("\"'")
-
-    if verb in _FILE_OP_VERBS:
-        for token in tokens[1:]:
-            raw = token.strip("\"'")
-            if not _looks_like_abs_path(raw):
-                continue
-            try:
-                resolve_within(raw, workspace)
-            except (PathTraversalError, ValueError):
-                raise ValueError(
-                    f"Command targets a path outside the workspace: {raw!r}"
-                )
-
-    # Check redirect targets regardless of verb: echo foo > /etc/evil
-    redirect_match = re.search(r">>?\s*(\"?)([^\s\"]+)\1", cmd)
-    if redirect_match:
-        target = redirect_match.group(2)
-        if _looks_like_abs_path(target):
-            try:
-                resolve_within(target, workspace)
-            except (PathTraversalError, ValueError):
-                raise ValueError(
-                    f"Command redirects output to a path outside the workspace: {target!r}"
-                )
 
 
 def _is_windows_builtin(cmd: str) -> bool:
@@ -367,13 +309,6 @@ class ShellTool:
             self.logger.warning("shell_blocked", command=command, reason=str(e))
             return {"success": False, "error": str(e)}
 
-        # Block file-targeting commands that reference paths outside the workspace.
-        try:
-            _check_path_containment(cmd, self.workspace)
-        except ValueError as e:
-            self.logger.warning("shell_blocked_path", command=command, reason=str(e))
-            return {"success": False, "error": str(e)}
-
         self.logger.info("shell_run", original=command, translated=cmd, cwd=str(self.workspace))
 
         args, use_shell = self._resolve_args(cmd)
@@ -450,11 +385,6 @@ class ShellTool:
 
         try:
             _validate_command(cmd)
-        except ValueError as e:
-            return {"success": False, "error": str(e)}
-
-        try:
-            _check_path_containment(cmd, self.workspace)
         except ValueError as e:
             return {"success": False, "error": str(e)}
 

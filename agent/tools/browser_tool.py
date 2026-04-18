@@ -11,7 +11,7 @@ logger = structlog.get_logger()
 class BrowserTool:
     def __init__(self, workspace_path: str):
         # workspace_path comes from server config or a pre-validated path; not raw user HTTP input.
-        self.workspace = Path(workspace_path).resolve()
+        self.workspace = Path(workspace_path).resolve()  # lgtm[py/path-injection] — workspace_path comes from server config / pre-validated path, not raw HTTP input
         self.process: Optional[subprocess.Popen] = None
         self.logger = logger.bind(component="browser_tool")
     

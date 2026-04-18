@@ -14,7 +14,6 @@ _SERVER_START_TIME = _time.time()
 
 from llm import ModelRouter
 from agent.orchestrator import AgentOrchestrator
-from agent.security.paths import PathTraversalError, resolve_within
 from api.job_store import JobStore
 from api.task_store import TaskStore
 
@@ -510,13 +509,11 @@ async def read_workspace_file(path: str):
     workspace = Path(_current_workspace).resolve()
     try:
         target = (workspace / path).resolve()
-        # Security: prevent path traversal — raises ValueError if target escapes workspace
-        target.relative_to(workspace)
-    except ValueError:
-        raise HTTPException(status_code=403, detail="Path is outside workspace")
     except Exception:
         logger.warning("workspace_file_path_error", path=path)
         raise HTTPException(status_code=400, detail="Invalid path")
+    if not target.is_relative_to(workspace):
+        raise HTTPException(status_code=403, detail="Path is outside workspace")
 
     if not target.exists():
         raise HTTPException(status_code=404, detail=f"File not found: {path}")
@@ -775,10 +772,9 @@ async def set_project(request: dict):
         parts = Path(raw_name).parts
         if any(part in ("", ".", "..") for part in parts):
             raise HTTPException(status_code=400, detail="Invalid project name")
-        # Canonicalize and assert containment — CodeQL-safe pattern.
-        try:
-            resolved_target = resolve_within(raw_name, workspace_root)
-        except (PathTraversalError, ValueError):
+        # Inline containment check — the pattern CodeQL recognises as safe for py/path-injection.
+        resolved_target = (workspace_root / raw_name).resolve()
+        if not resolved_target.is_relative_to(workspace_root):
             raise HTTPException(status_code=403, detail="Path not allowed")
     else:
         resolved_target = workspace_root
@@ -816,10 +812,9 @@ async def set_workspace(request: dict):
 
     workspace_root = Path(WORKSPACE_PATH).resolve()
 
-    # Canonicalize and assert containment in one step — CodeQL-safe pattern.
-    try:
-        path = resolve_within(new_path, workspace_root)
-    except (PathTraversalError, ValueError):
+    # Inline containment check — the pattern CodeQL recognises as safe for py/path-injection.
+    path = (workspace_root / new_path).resolve()
+    if not path.is_relative_to(workspace_root):
         raise HTTPException(status_code=403, detail="Cannot set workspace outside configured root")
 
     if not _is_path_allowed(str(path)):
