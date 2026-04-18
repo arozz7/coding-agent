@@ -162,12 +162,21 @@ class ToolExecutor:
         if result.get("success"):
             return _cap_shell_output(stdout or "(command completed, no output)")
 
+        error_msg = result.get("error", "unknown error")
         parts = []
         if stdout:
             parts.append(f"stdout:\n{stdout}")
         if stderr:
             parts.append(f"stderr:\n{stderr}")
-        body = "\n".join(parts) if parts else result.get("error", "unknown error")
+        body = "\n".join(parts) if parts else error_msg
+        if "timed out" in error_msg.lower():
+            body = (
+                f"{error_msg}"
+                + (f"\nProcess output before hang:\n{stdout}" if stdout else "")
+                + "\nLikely cause: the process blocked waiting for interactive stdin input "
+                "(e.g. readline-sync, input(), raw_input). "
+                "Fix: replace blocking stdin reads with async alternatives or mock stdin in tests."
+            )
         rc_str = f" (exit {rc})" if rc is not None else ""
         return _cap_shell_output(f"Command failed{rc_str}:\n{body}")
     
@@ -519,13 +528,19 @@ class EventEmittingExecutor:
         self.session_id = session_id
         self.logger = logger.bind(component="event_emitting_executor", session_id=session_id)
 
-    async def execute(self, tool_name: str, input: Dict[str, Any]) -> str:
+    async def execute(
+        self,
+        tool_name: str,
+        input: Dict[str, Any],
+        *,
+        on_phase: Optional[Callable] = None,
+    ) -> str:
         self.session_memory.emit_event(
             self.session_id,
             "tool_call",
             {"tool": tool_name, "input": input},
         )
-        result = await self.executor.execute(tool_name, input)
+        result = await self.executor.execute(tool_name, input, on_phase=on_phase)
         self.session_memory.emit_event(
             self.session_id,
             "tool_result",

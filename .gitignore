@@ -26,3 +26,7 @@ extensions/
 
 # Agent runtime workspace (generated code, not source)
 workspace/
+
+# Runtime logs and state (generated at runtime)
+logs/
+.state/

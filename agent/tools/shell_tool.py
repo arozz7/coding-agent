@@ -192,8 +192,16 @@ def _kill_process_tree(pid: int) -> None:
 
 class ShellTool:
     def __init__(self, workspace_path: str):
-        # workspace_path comes from WORKSPACE_PATH env var / server config, not user HTTP input.
-        self.workspace = Path(workspace_path).resolve()
+        # Validate workspace_path against the configured workspace root (trusted env var)
+        # using the inline containment pattern CodeQL recognises as safe for py/path-injection.
+        configured_root = os.getenv("WORKSPACE_PATH", "./workspace")
+        workspace_root = Path(configured_root).resolve()
+        candidate = (workspace_root / workspace_path).resolve()
+        if not candidate.is_relative_to(workspace_root):
+            raise ValueError(
+                f"workspace_path '{workspace_path}' resolves outside configured workspace root"
+            )
+        self.workspace = candidate
         self.logger = logger.bind(component="shell_tool")
         # Log which key tools are resolvable so PATH issues are visible at startup.
         _found = {t: shutil.which(t, path=_TOOL_ENV["PATH"]) for t in ("npm", "node", "python", "git", "cargo")}

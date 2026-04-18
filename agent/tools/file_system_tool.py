@@ -3,6 +3,8 @@ from typing import List, Optional
 import os
 import structlog
 
+from agent.security.paths import PathTraversalError  # noqa: F401 – re-exported
+
 logger = structlog.get_logger()
 
 
@@ -28,9 +30,24 @@ class InvalidPathError(FileOperationError):
 
 class FileSystemTool:
     def __init__(self, allowed_base_path: str):
-        # allowed_base_path comes from WORKSPACE_PATH env var / server config, not user HTTP input.
-        # _validate_path() enforces that every operation stays within this directory.
-        self.allowed_base = Path(allowed_base_path).resolve()
+        """Initialise the tool with a workspace root.
+
+        *allowed_base_path* is validated against the configured WORKSPACE_PATH
+        root using the inline containment check that CodeQL recognises as safe
+        for py/path-injection.
+        """
+        # Anchor validation to the configured workspace root (trusted env var),
+        # not the caller-supplied string.  This breaks the HTTP-taint chain.
+        configured_root = os.getenv("WORKSPACE_PATH", "./workspace")
+        workspace_root = Path(configured_root).resolve()
+
+        # Inline containment check — the pattern CodeQL recognises as safe.
+        candidate = (workspace_root / allowed_base_path).resolve()
+        if not candidate.is_relative_to(workspace_root):
+            raise PathTraversalError(
+                f"allowed_base_path '{allowed_base_path}' resolves outside workspace root"
+            )
+        self.allowed_base = candidate
         self.logger = logger.bind(component="file_system_tool")
         if not self.allowed_base.exists():
             self.allowed_base.mkdir(parents=True, exist_ok=True)

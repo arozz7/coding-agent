@@ -1,8 +1,11 @@
 import subprocess
 import json
+import os
 from pathlib import Path
 from typing import Optional, List, Dict
 import structlog
+
+from agent.security.paths import PathTraversalError
 
 logger = structlog.get_logger()
 
@@ -13,8 +16,16 @@ class TestRunnerError(Exception):
 
 class PytestTool:
     def __init__(self, project_root: str):
-        # project_root comes from WORKSPACE_PATH env var / server config, not user HTTP input.
-        self.project_root = Path(project_root).resolve()
+        # Validate project_root against the configured WORKSPACE_PATH root
+        # using the inline containment pattern CodeQL recognises as safe.
+        configured_root = os.getenv("WORKSPACE_PATH", "./workspace")
+        workspace_root = Path(configured_root).resolve()
+        candidate = (workspace_root / project_root).resolve()
+        if not candidate.is_relative_to(workspace_root):
+            raise PathTraversalError(
+                f"project_root '{project_root}' resolves outside configured workspace root"
+            )
+        self.project_root = candidate
         self.logger = logger.bind(component="pytest_tool")
 
     def _run_pytest(self, args: List[str], capture_output: bool = True) -> subprocess.CompletedProcess:

@@ -1,17 +1,28 @@
 import subprocess
 import asyncio
+import os
 import time
 from pathlib import Path
 from typing import Any, Optional
 import structlog
+
+from agent.security.paths import PathTraversalError
 
 logger = structlog.get_logger()
 
 
 class BrowserTool:
     def __init__(self, workspace_path: str):
-        # workspace_path comes from server config or a pre-validated path; not raw user HTTP input.
-        self.workspace = Path(workspace_path).resolve()
+        # Validate workspace_path against the configured WORKSPACE_PATH root
+        # using the inline containment pattern CodeQL recognises as safe.
+        configured_root = os.getenv("WORKSPACE_PATH", "./workspace")
+        workspace_root = Path(configured_root).resolve()
+        candidate = (workspace_root / workspace_path).resolve()
+        if not candidate.is_relative_to(workspace_root):
+            raise PathTraversalError(
+                f"workspace_path '{workspace_path}' resolves outside configured workspace root"
+            )
+        self.workspace = candidate
         self.process: Optional[subprocess.Popen] = None
         self.logger = logger.bind(component="browser_tool")
     

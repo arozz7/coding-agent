@@ -48,6 +48,19 @@ class AgentOrchestrator:
         session_db_path: str = "data/memory.db",
         chroma_path: str = "data/chroma_db",
     ):
+        # Validate workspace_path against the configured root using the inline
+        # containment check CodeQL recognises as safe for py/path-injection.
+        # This breaks the HTTP-taint chain before workspace_path is stored or
+        # passed to any tool constructor / filesystem operation.
+        from agent.security.paths import PathTraversalError as _PTE
+        _configured_root = os.getenv("WORKSPACE_PATH", "./workspace")
+        _workspace_root = Path(_configured_root).resolve()
+        _candidate = (_workspace_root / workspace_path).resolve()
+        if not _candidate.is_relative_to(_workspace_root):
+            raise _PTE(
+                f"workspace_path '{workspace_path}' resolves outside configured workspace root"
+            )
+        workspace_path = str(_candidate)  # rebind to resolved, validated path
         self.workspace_path = workspace_path
         self.model_router = model_router
         self.session_memory = SessionMemory(session_db_path)

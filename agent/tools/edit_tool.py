@@ -20,6 +20,8 @@ from typing import Dict, List, Optional, Tuple
 
 import structlog
 
+from agent.security.paths import PathTraversalError
+
 logger = structlog.get_logger()
 
 # ----------------------------------------------------------------------------
@@ -201,16 +203,23 @@ class EditTool:
     """
 
     def __init__(self, allowed_base_path: str):
-        # allowed_base_path comes from config / env, not user input.
-        # os.path.normpath() removes '..' segments and normalizes separators;
-        # os.path.realpath() resolves symlinks. The startswith() check then
-        # validates the result is within the expected root — this is the
-        # exact pattern recommended by CodeQL for py/path-injection.
-        canonical = os.path.realpath(os.path.normpath(allowed_base_path))
-        if not os.path.isdir(canonical):
+        """Initialise the editor anchored to *allowed_base_path*.
+
+        Validates the workspace root against the configured WORKSPACE_PATH
+        using the inline containment check CodeQL recognises as safe.
+        """
+        configured_root = os.getenv("WORKSPACE_PATH", "./workspace")
+        workspace_root = Path(configured_root).resolve()
+
+        # Inline containment check — the pattern CodeQL recognises as safe.
+        candidate = (workspace_root / allowed_base_path).resolve()
+        if not candidate.is_relative_to(workspace_root):
+            raise PathTraversalError(
+                f"allowed_base_path '{allowed_base_path}' resolves outside workspace root"
+            )
+        if not os.path.isdir(str(candidate)):
             raise EditError(f"Workspace base path is not a directory: {allowed_base_path}")
-        resolved_base = Path(canonical)
-        self.allowed_base = resolved_base
+        self.allowed_base = candidate
         self.logger = logger.bind(component="edit_tool")
 
     def _validate_path(self, path: str) -> Path:

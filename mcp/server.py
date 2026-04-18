@@ -1,8 +1,12 @@
 from typing import Optional, Callable, Any, List
+import os
+from pathlib import Path
 from .tools.filesystem_server import FileSystemMCPServer
 from .tools.git_server import GitMCPServer
 
 import structlog
+
+from agent.security.paths import PathTraversalError
 
 logger = structlog.get_logger()
 
@@ -44,14 +48,24 @@ class MCPServer:
 
 
 def create_mcp_server(workspace_path: str, repo_path: Optional[str] = None) -> MCPServer:
+    # Validate workspace_path against the configured root — inline containment check
+    # that CodeQL recognises as safe for py/path-injection before any tool constructor.
+    configured_root = os.getenv("WORKSPACE_PATH", "./workspace")
+    workspace_root = Path(configured_root).resolve()
+    validated_workspace = (workspace_root / workspace_path).resolve()
+    if not validated_workspace.is_relative_to(workspace_root):
+        raise PathTraversalError(
+            f"workspace_path '{workspace_path}' resolves outside configured workspace root"
+        )
+    workspace_path = str(validated_workspace)  # rebind to resolved, validated path
+
     server = MCPServer("local-coding-agent")
     fs_server = FileSystemMCPServer(workspace_path)
 
     # Auto-detect git repo when repo_path not explicitly provided
     if repo_path is None:
-        from pathlib import Path as _Path
-        # workspace_path comes from WORKSPACE_PATH env var / server config, not user HTTP input.
-        if (_Path(workspace_path) / ".git").exists():
+        # workspace_path is now the fully-resolved, validated path — not HTTP-tainted.
+        if (validated_workspace / ".git").exists():
             repo_path = workspace_path
             logger.info("git_repo_detected", path=workspace_path)
 

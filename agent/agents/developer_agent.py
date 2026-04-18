@@ -688,6 +688,18 @@ Summary: <one sentence>
                             made_progress = True
                             
                         if not made_progress:
+                            if _attempt == 0:
+                                # First pass produced analysis but no code changes.
+                                # Inject a direct instruction so the next attempt writes code.
+                                failed_outputs = [
+                                    raw_errors
+                                    + "\n\n[Fix loop note: you analyzed the issue but wrote no "
+                                    "code changes. The next response MUST contain REPLACE: or "
+                                    "EDIT: blocks with the actual fix. Do NOT describe — emit "
+                                    "the code directly.]"
+                                ]
+                                self.logger.info("fix_loop_no_progress_retry", attempt=1)
+                                continue
                             response += f"\n\n*(Fix loop aborted: The model did not modify any files to address the failure)*"
                             self.logger.info("fix_loop_aborted_no_progress", attempt=_attempt + 1)
                             break
@@ -701,6 +713,7 @@ Summary: <one sentence>
                             "returncode: 1" in verify_out
                             or "exit code: 1" in verify_out
                             or "Command failed" in verify_out
+                            or "timed out" in verify_out.lower()
                             or "FAILED" in verify_out
                             or (
                                 "error" in verify_out.lower()[:300]

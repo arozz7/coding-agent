@@ -19,6 +19,8 @@ from typing import List, Optional
 
 import structlog
 
+from agent.security.paths import PathTraversalError
+
 logger = structlog.get_logger()
 
 # Directories skipped by default for both find and grep operations.
@@ -54,15 +56,23 @@ class SearchTool:
     """Provides ``find_files`` and ``grep_code`` operations inside a workspace."""
 
     def __init__(self, allowed_base_path: str):
-        # allowed_base_path comes from WORKSPACE_PATH env var / server config.
-        # os.path.realpath() resolves symlinks and canonicalizes the path,
-        # which breaks any taint analysis chain — the resulting value is
-        # safe to pass to Path() without risk of path traversal.
-        real_path = os.path.realpath(allowed_base_path)
-        base = Path(real_path).resolve()
-        if not base.exists() or not base.is_dir():
+        """Initialise the search tool anchored to *allowed_base_path*.
+
+        Validates against the configured WORKSPACE_PATH root using the inline
+        containment check CodeQL recognises as safe for py/path-injection.
+        """
+        configured_root = os.getenv("WORKSPACE_PATH", "./workspace")
+        workspace_root = Path(configured_root).resolve()
+
+        # Inline containment check — the pattern CodeQL recognises as safe.
+        candidate = (workspace_root / allowed_base_path).resolve()
+        if not candidate.is_relative_to(workspace_root):
+            raise PathTraversalError(
+                f"allowed_base_path '{allowed_base_path}' resolves outside workspace root"
+            )
+        if not candidate.exists() or not candidate.is_dir():
             raise ValueError(f"Invalid workspace base path: {allowed_base_path!r}")
-        self.allowed_base = base
+        self.allowed_base = candidate
         self.logger = logger.bind(component="search_tool")
 
     # ------------------------------------------------------------------
