@@ -19,6 +19,7 @@ from typing import Any
 
 import structlog
 
+from agent.security.paths import PathTraversalError, resolve_within
 from agent.tools.shell_tool import _TOOL_ENV
 
 logger = structlog.get_logger()
@@ -86,20 +87,14 @@ class InteractiveShellTool:
         if "\x00" in workspace_path:
             raise ValueError("workspace_path contains invalid characters")
 
-        # Canonicalize and validate workspace_path at the sink (defense in depth).
-        # resolve(strict=True) normalizes traversal and resolves symlinks.
+        # Canonicalize and assert containment in one step — CodeQL-safe pattern.
         try:
-            candidate = Path(workspace_path.strip()).resolve(strict=True)
-        except FileNotFoundError as e:
-            raise ValueError("workspace_path must be an existing directory") from e
+            candidate = resolve_within(workspace_path.strip(), allowed_root)
+        except (PathTraversalError, ValueError) as e:
+            raise ValueError(str(e)) from e
 
         if not candidate.is_dir():
             raise ValueError("workspace_path must be an existing directory")
-
-        try:
-            candidate.relative_to(allowed_root)
-        except ValueError as e:
-            raise ValueError("workspace_path must be within the configured workspace root") from e
 
         self.workspace = candidate
         self.logger = logger.bind(component="interactive_shell_tool")

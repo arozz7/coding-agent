@@ -14,6 +14,7 @@ _SERVER_START_TIME = _time.time()
 
 from llm import ModelRouter
 from agent.orchestrator import AgentOrchestrator
+from agent.security.paths import PathTraversalError, resolve_within
 from api.job_store import JobStore
 from api.task_store import TaskStore
 
@@ -766,7 +767,6 @@ async def set_project(request: dict):
     raw_name = (request.get("name") or "").strip()
 
     workspace_root = Path(WORKSPACE_PATH).resolve()
-    target = (workspace_root / raw_name) if raw_name else workspace_root
 
     if raw_name:
         # Allow only safe project path characters and reject dangerous segments.
@@ -775,14 +775,13 @@ async def set_project(request: dict):
         parts = Path(raw_name).parts
         if any(part in ("", ".", "..") for part in parts):
             raise HTTPException(status_code=400, detail="Invalid project name")
-
-    resolved_target = target.resolve()
-
-    # Enforce containment within the configured workspace root.
-    try:
-        resolved_target.relative_to(workspace_root)
-    except ValueError:
-        raise HTTPException(status_code=403, detail="Path not allowed")
+        # Canonicalize and assert containment — CodeQL-safe pattern.
+        try:
+            resolved_target = resolve_within(raw_name, workspace_root)
+        except (PathTraversalError, ValueError):
+            raise HTTPException(status_code=403, detail="Path not allowed")
+    else:
+        resolved_target = workspace_root
 
     if not _is_path_allowed(str(resolved_target)):
         raise HTTPException(status_code=403, detail="Path not allowed")
@@ -817,11 +816,10 @@ async def set_workspace(request: dict):
 
     workspace_root = Path(WORKSPACE_PATH).resolve()
 
-    # Canonicalize first, then enforce allow-list boundary on the resolved path.
-    path = Path(new_path).resolve()
+    # Canonicalize and assert containment in one step — CodeQL-safe pattern.
     try:
-        path.relative_to(workspace_root)
-    except ValueError:
+        path = resolve_within(new_path, workspace_root)
+    except (PathTraversalError, ValueError):
         raise HTTPException(status_code=403, detail="Cannot set workspace outside configured root")
 
     if not _is_path_allowed(str(path)):
