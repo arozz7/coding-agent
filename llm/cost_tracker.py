@@ -1,5 +1,5 @@
 from dataclasses import dataclass, field
-from datetime import datetime, timedelta
+from datetime import datetime, timezone, timedelta
 from typing import Dict, List
 from collections import defaultdict
 import structlog
@@ -64,7 +64,7 @@ class CostTracker:
             prompt_tokens=prompt_tokens,
             completion_tokens=completion_tokens,
             cost=cost,
-            timestamp=datetime.utcnow(),
+            timestamp=datetime.now(timezone.utc),
         )
         self.records.append(record)
 
@@ -100,7 +100,7 @@ class CostTracker:
     def get_daily_costs(self, days: int = 30) -> List[dict]:
         daily = defaultdict(lambda: {"cost": 0.0, "tokens": 0})
 
-        cutoff = datetime.utcnow() - timedelta(days=days)
+        cutoff = datetime.now(timezone.utc) - timedelta(days=days)
         for record in self.records:
             if record.timestamp >= cutoff:
                 date = record.timestamp.date().isoformat()

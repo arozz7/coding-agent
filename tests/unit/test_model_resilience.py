@@ -1,7 +1,7 @@
 """Unit tests for model resilience."""
 import pytest
 from unittest.mock import AsyncMock, Mock, patch
-from datetime import datetime, timedelta
+from datetime import datetime, timezone, timedelta
 
 from llm.model_resilience import (
     ModelStatus,
@@ -39,7 +39,7 @@ class TestModelHealthStatus:
             model_name="test-model",
             status=ModelStatus.AVAILABLE,
             is_available=True,
-            last_checked=datetime.utcnow(),
+            last_checked=datetime.now(timezone.utc),
         )
         
         assert status.model_name == "test-model"
@@ -222,7 +222,7 @@ class TestModelResilienceManager:
             model_name="test",
             status=ModelStatus.AVAILABLE,
             is_available=True,
-            last_checked=datetime.utcnow(),
+            last_checked=datetime.now(timezone.utc),
         )
 
         manager = ModelResilienceManager()
@@ -240,13 +240,13 @@ class TestModelResilienceManager:
                 model_name="unavailable",
                 status=ModelStatus.OFFLOADED,
                 is_available=False,
-                last_checked=datetime.utcnow(),
+                last_checked=datetime.now(timezone.utc),
             ),
             "available-model": ModelHealthStatus(
                 model_name="available-model",
                 status=ModelStatus.AVAILABLE,
                 is_available=True,
-                last_checked=datetime.utcnow(),
+                last_checked=datetime.now(timezone.utc),
             ),
         }
 
@@ -266,13 +266,13 @@ class TestModelResilienceManager:
                     model_name=name,
                     status=ModelStatus.OFFLOADED,
                     is_available=False,
-                    last_checked=datetime.utcnow(),
+                    last_checked=datetime.now(timezone.utc),
                 )
             return ModelHealthStatus(
                 model_name=name,
                 status=ModelStatus.AVAILABLE,
                 is_available=True,
-                last_checked=datetime.utcnow(),
+                last_checked=datetime.now(timezone.utc),
             )
 
         mock_instance.get_model_status.side_effect = mock_status
@@ -333,7 +333,7 @@ class TestModelResilienceManager:
             model_name="test",
             status=ModelStatus.AVAILABLE,
             is_available=True,
-            last_checked=datetime.utcnow(),
+            last_checked=datetime.now(timezone.utc),
         )
         
         manager.clear_cache()

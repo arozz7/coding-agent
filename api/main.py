@@ -1,4 +1,4 @@
-from fastapi import FastAPI, HTTPException, BackgroundTasks, Response, Request
+from fastapi import FastAPI, HTTPException, BackgroundTasks, Response, Request, Depends, Header
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from typing import Optional, List, Dict
@@ -6,7 +6,7 @@ from prometheus_client import generate_latest, CONTENT_TYPE_LATEST
 import uuid
 import re
 import time as _time
-from datetime import datetime
+from datetime import datetime, timezone
 import asyncio
 import structlog
 
@@ -59,7 +59,7 @@ DISALLOWED_PATHS = [
 
 def _is_path_allowed(path: str) -> bool:
     """Check if path is not a critical system folder"""
-    abs_path = str(Path(path).resolve())  # lgtm[py/path-injection]
+    abs_path = str(Path(path).resolve())
     
     for disallowed in DISALLOWED_PATHS:
         if abs_path.lower().startswith(disallowed.lower()):
@@ -112,8 +112,19 @@ app.add_middleware(
     allow_origins=CORS_ORIGINS,
     allow_credentials=False,
     allow_methods=["GET", "POST", "DELETE", "OPTIONS"],
-    allow_headers=["Content-Type", "Authorization"],
+    allow_headers=["Content-Type", "Authorization", "X-API-Key"],
 )
+
+# Optional API key guard for mutating endpoints.
+# Set AGENT_API_KEY in .env to enable.  When the env var is absent every
+# request is allowed (local-dev default).  When set, callers must supply the
+# key in the X-API-Key header.
+_AGENT_API_KEY: str = os.getenv("AGENT_API_KEY", "")
+
+
+async def _require_api_key(x_api_key: str = Header(default="")) -> None:
+    if _AGENT_API_KEY and x_api_key != _AGENT_API_KEY:
+        raise HTTPException(status_code=401, detail="Invalid or missing API key")
 
 
 class TaskRequest(BaseModel):
@@ -318,7 +329,7 @@ async def health_check():
     }
 
 
-@app.post("/task", response_model=TaskResponse)
+@app.post("/task", response_model=TaskResponse, dependencies=[Depends(_require_api_key)])
 async def run_task(request: TaskRequest):
     if not _orchestrator:
         raise HTTPException(status_code=503, detail="Agent not initialized")
@@ -343,14 +354,14 @@ async def run_task(request: TaskRequest):
         raise HTTPException(status_code=500, detail="Internal server error")
 
 
-@app.post("/task/start")
+@app.post("/task/start", dependencies=[Depends(_require_api_key)])
 async def start_task_background(request: TaskRequest):
     """Submit a task and return a job_id immediately. Poll GET /task/{job_id} for status."""
     if not _orchestrator:
         raise HTTPException(status_code=503, detail="Agent not initialized")
 
     job_id = f"job_{uuid.uuid4().hex[:12]}"
-    session_id = request.session_id or f"session_{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}"
+    session_id = request.session_id or f"session_{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S')}"
 
     # Use force_task_type when provided; otherwise keyword-classify for instant
     # response (0 ms) — the LLM classifier runs later inside run_task() in
@@ -495,9 +506,9 @@ async def cancel_job(job_id: str):
 @app.get("/workspace/file")
 async def read_workspace_file(path: str):
     """Read a file from the workspace by relative path."""
-    workspace = Path(_current_workspace).resolve()  # lgtm[py/path-injection]
+    workspace = Path(_current_workspace).resolve()
     try:
-        target = (workspace / path).resolve()  # lgtm[py/path-injection]
+        target = (workspace / path).resolve()
         # Security: prevent path traversal — raises ValueError if target escapes workspace
         target.relative_to(workspace)
     except ValueError:
@@ -524,7 +535,7 @@ async def read_workspace_file(path: str):
         raise HTTPException(status_code=500, detail="Could not read file")
 
 
-@app.post("/task/stream")
+@app.post("/task/stream", dependencies=[Depends(_require_api_key)])
 async def run_task_stream(request: TaskRequest):
     if not _orchestrator:
         raise HTTPException(status_code=503, detail="Agent not initialized")
@@ -699,7 +710,7 @@ async def get_workspace():
     """Get current workspace path"""
     return {
         "workspace": _current_workspace,
-        "exists": Path(_current_workspace).exists()  # lgtm[py/path-injection]
+        "exists": Path(_current_workspace).exists()
     }
 
 
@@ -707,7 +718,7 @@ async def get_workspace():
 async def get_project():
     """Return the active project name and workspace root."""
     base = Path(WORKSPACE_PATH).resolve()
-    current = Path(_current_workspace).resolve()  # lgtm[py/path-injection]
+    current = Path(_current_workspace).resolve()
     try:
         # project name is the relative part, if any
         project = str(current.relative_to(base)) if current != base else None
@@ -724,13 +735,13 @@ async def get_project():
 async def list_workspace_directories():
     """List available directories in workspace"""
     # _current_workspace is validated via _is_path_allowed() before it is set.
-    workspace = Path(_current_workspace).resolve()  # lgtm[py/path-injection]
+    workspace = Path(_current_workspace).resolve()
     if not workspace.exists():
         return {"error": "Workspace does not exist"}
 
     try:
         items = []
-        for item in workspace.iterdir():  # lgtm[py/path-injection]
+        for item in workspace.iterdir():
             items.append({
                 "name": item.name,
                 "type": "directory" if item.is_dir() else "file",
@@ -742,7 +753,7 @@ async def list_workspace_directories():
         raise HTTPException(status_code=500, detail="Could not list workspace")
 
 
-@app.post("/workspace/project")
+@app.post("/workspace/project", dependencies=[Depends(_require_api_key)])
 async def set_project(request: dict):
     """Switch the active project subdirectory within the workspace root.
 
@@ -776,8 +787,8 @@ async def set_project(request: dict):
     if not _is_path_allowed(str(resolved_target)):
         raise HTTPException(status_code=403, detail="Path not allowed")
 
-    resolved_target.mkdir(parents=True, exist_ok=True)  # lgtm[py/path-injection]
-    _current_workspace = str(resolved_target)  # lgtm[py/path-injection]
+    resolved_target.mkdir(parents=True, exist_ok=True)
+    _current_workspace = str(resolved_target)
     os.environ["AGENT_EFFECTIVE_WORKSPACE"] = _current_workspace
 
     from local_coding_agent import create_agent
@@ -807,7 +818,7 @@ async def set_workspace(request: dict):
     workspace_root = Path(WORKSPACE_PATH).resolve()
 
     # Canonicalize first, then enforce allow-list boundary on the resolved path.
-    path = Path(new_path).resolve()  # lgtm[py/path-injection]
+    path = Path(new_path).resolve()
     try:
         path.relative_to(workspace_root)
     except ValueError:
@@ -865,7 +876,7 @@ async def take_screenshot(request: dict):
             workspace = str(game_path)
 
     from agent.tools.browser_tool import BrowserTool
-    browser = BrowserTool(workspace)  # lgtm[py/path-injection]
+    browser = BrowserTool(workspace)
 
     try:
         import asyncio

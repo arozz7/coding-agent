@@ -14,7 +14,7 @@ class TestRunnerError(Exception):
 class PytestTool:
     def __init__(self, project_root: str):
         # project_root comes from WORKSPACE_PATH env var / server config, not user HTTP input.
-        self.project_root = Path(project_root).resolve()  # lgtm[py/path-injection]
+        self.project_root = Path(project_root).resolve()
         self.logger = logger.bind(component="pytest_tool")
 
     def _run_pytest(self, args: List[str], capture_output: bool = True) -> subprocess.CompletedProcess:

@@ -30,10 +30,10 @@ class FileSystemTool:
     def __init__(self, allowed_base_path: str):
         # allowed_base_path comes from WORKSPACE_PATH env var / server config, not user HTTP input.
         # _validate_path() enforces that every operation stays within this directory.
-        self.allowed_base = Path(allowed_base_path).resolve()  # lgtm[py/path-injection]
+        self.allowed_base = Path(allowed_base_path).resolve()
         self.logger = logger.bind(component="file_system_tool")
         if not self.allowed_base.exists():
-            self.allowed_base.mkdir(parents=True, exist_ok=True)  # lgtm[py/path-injection]
+            self.allowed_base.mkdir(parents=True, exist_ok=True)
 
     def _validate_path(self, path: str) -> Path:
         try:
@@ -60,7 +60,7 @@ class FileSystemTool:
             else:
                 resolved = Path(path).resolve()
 
-            if not str(resolved).startswith(str(self.allowed_base)):
+            if not resolved.is_relative_to(self.allowed_base):
                 self.logger.warning(
                     "path_traversal_attempt",
                     path=path,

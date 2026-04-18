@@ -1,7 +1,7 @@
 from typing import Dict, Any, Optional, List, Callable
 from dataclasses import dataclass, field
 from enum import Enum
-from datetime import datetime
+from datetime import datetime, timezone
 import structlog
 
 logger = structlog.get_logger()
@@ -147,7 +147,7 @@ class HumanInTheLoop:
             checkpoint_name=checkpoint.name,
             description=checkpoint.description,
             context=context,
-            requested_at=datetime.utcnow(),
+            requested_at=datetime.now(timezone.utc),
         )
         
         self._pending_approvals[approval_request.checkpoint_id] = approval_request
@@ -189,7 +189,7 @@ class HumanInTheLoop:
         approval = self._pending_approvals[checkpoint_id]
         approval.status = "approved"
         approval.response = response
-        approval.responded_at = datetime.utcnow()
+        approval.responded_at = datetime.now(timezone.utc)
         
         self.logger.info("approval_granted", checkpoint_id=checkpoint_id)
         return True
@@ -201,7 +201,7 @@ class HumanInTheLoop:
         approval = self._pending_approvals[approval_id]
         approval.status = "rejected"
         approval.response = reason
-        approval.responded_at = datetime.utcnow()
+        approval.responded_at = datetime.now(timezone.utc)
         
         self.logger.warning("approval_rejected", checkpoint_id=approval_id, reason=reason)
         return True

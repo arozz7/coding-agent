@@ -27,6 +27,7 @@ An autonomous coding agent with LLM integration, multi-agent orchestration, SDLC
 - **Windows Process-Tree Recovery** — Supervisor and shell tools use `taskkill /F /T` on Windows to ensure timed-out child process trees (daemons, build servers) are fully purged
 - **CRLF & BOM Preservation** — Detects and preserves original line endings and Byte Order Marks during file writes, preventing silent file corruption in Windows or legacy environments
 - **Workspace Scoping** — `PROJECT_DIR` env var focuses all file operations on an active project subdirectory; no path double-nesting
+- **Security Layer** — Prompt injection detection blocks known jailbreak patterns before input reaches any LLM prompt; shell commands that reference absolute paths outside the workspace are rejected; optional `AGENT_API_KEY` header auth on all mutating API endpoints; SQLite session store uses WAL mode + `threading.RLock` for concurrent-access safety
 - **Agent Wiki Memory** — `.agent-wiki/` knowledge base compiled per task; later subtasks query earlier ones; index deduplication; `!skills` to inspect
 - **RAG Memory** — Codebase indexed in ChromaDB; retrieved context injected into every task
 - **Shell PATH Auto-Discovery** — Scans 15+ common install dirs (nvm, volta, Homebrew, Cargo…) so npm/node/git are found even when the API starts with a minimal PATH
@@ -66,6 +67,7 @@ WORKSPACE_PATH=J:\Projects\agent-workspace
 PROJECT_DIR=my-project                   # optional — scope agent to a subdirectory
 OPENROUTER_API_KEY=sk-or-...             # optional — enables cloud model fallback
 BOT_STATUS_CHANNEL_ID=123456789          # optional — channel for model-switch alerts
+AGENT_API_KEY=your-secret-key           # optional — enables X-API-Key auth on mutating endpoints
 ```
 
 **2. Edit `config/models.yaml`** to list your available models:
@@ -238,10 +240,12 @@ Environment variables:
 
 ## REST API
 
+Mutating endpoints (`POST /task`, `POST /task/start`, `POST /task/stream`, `POST /workspace/project`) require an `X-API-Key` header when `AGENT_API_KEY` is set in `.env`. Read-only endpoints are always unauthenticated.
+
 | Method | Path | Description |
 |--------|------|-------------|
-| `POST` | `/task` | Submit a task synchronously |
-| `POST` | `/task/start` | Submit a background task → returns `job_id` |
+| `POST` | `/task` | Submit a task synchronously *(auth required if AGENT_API_KEY set)* |
+| `POST` | `/task/start` | Submit a background task → returns `job_id` *(auth required if AGENT_API_KEY set)* |
 | `GET` | `/task/{job_id}` | Poll job status + summary |
 | `GET` | `/task/{job_id}/result` | Full agent response |
 | `GET` | `/task/{job_id}/tasks` | Task plan with per-task status |
@@ -288,8 +292,11 @@ coding-agent/
 │   │   ├── skill_executor.py      # Pre/post skill execution (wiki-query, wiki-compile)
 │   │   ├── skill_loader.py        # Lazy skill content loading
 │   │   └── wiki_manager.py        # .agent-wiki/ read/write, index upsert, lint
+│   ├── security/
+│   │   ├── paths.py                   # resolve_within() — canonical path-containment validator (CodeQL-safe)
+│   │   └── prompt_guard.py            # guard_task() — strips control chars, detects 12 injection patterns
 │   └── tools/
-│       ├── shell_tool.py              # Shell execution, PATH auto-discovery, Windows .cmd fix, process-tree kill
+│       ├── shell_tool.py              # Shell execution, PATH auto-discovery, workspace path containment, process-tree kill
 │       ├── file_system_tool.py        # File CRUD, CRLF preservation
 │       ├── edit_tool.py               # Surgical multi-hunk patched edits
 │       ├── search_tool.py             # Native find_files and grep_code

@@ -15,6 +15,7 @@ build/
 .mypy_cache/
 .ruff_cache/
 .DS_Store
+extensions/
 
 # Claude skills cache
 .claude/skills/*/scripts/__pycache__/

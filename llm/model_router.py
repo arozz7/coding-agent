@@ -1,7 +1,7 @@
 import os
 import re
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Optional, List, AsyncIterator, Callable
 from pathlib import Path
 import yaml
@@ -25,7 +25,7 @@ class ModelSwitchEvent:
     to_model: str
     reason: str          # "load_timeout" | "load_failed" | "circuit_open" | "reload_exhausted"
     task_id: Optional[str] = None
-    timestamp: datetime = field(default_factory=datetime.utcnow)
+    timestamp: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
 
 
 class ModelRouter:

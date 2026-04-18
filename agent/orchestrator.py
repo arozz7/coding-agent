@@ -1,11 +1,13 @@
 from typing import TypedDict, Annotated, List, Optional, Callable
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 import os
 import re
 import subprocess
 import structlog
+
+from agent.security.prompt_guard import guard_task
 
 from llm import ModelRouter
 from agent.memory import SessionMemory, CodebaseMemory
@@ -207,7 +209,7 @@ class AgentOrchestrator:
             if files_created and result.get("success"):
                 project_id = Path(self.workspace_path).name
                 for rel_path in files_created:
-                    abs_path = Path(self.workspace_path) / rel_path  # lgtm[py/path-injection]
+                    abs_path = Path(self.workspace_path) / rel_path
                     if abs_path.exists() and abs_path.is_file():
                         try:
                             self.codebase_memory.index_files(
@@ -689,7 +691,7 @@ class AgentOrchestrator:
         bridge_text = await self.model_router.generate(prompt, config)
 
         # Create the new session and pre-seed it with the bridge document.
-        new_session_id = f"session_{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}_bridge"
+        new_session_id = f"session_{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S')}_bridge"
         self.session_memory.get_or_create_session(new_session_id, self.workspace_path)
         self.session_memory.save_message(
             new_session_id,
@@ -1199,7 +1201,14 @@ class AgentOrchestrator:
                     pass
 
         if not session_id:
-            session_id = f"session_{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}"
+            session_id = f"session_{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S')}"
+
+        # Sanitize input and reject known prompt-injection patterns before
+        # the task string enters any LLM prompt.
+        try:
+            task = guard_task(task)
+        except ValueError as e:
+            return {"success": False, "session_id": session_id, "error": str(e)}
 
         self.session_memory.get_or_create_session(session_id, self.workspace_path)
         self.session_memory.save_message(session_id, "user", task)
@@ -1380,7 +1389,7 @@ class AgentOrchestrator:
 
         # Populate MemoryWiki from static analysis of Python files
         self.memory_wiki.clear()
-        py_files = list(Path(self.workspace_path).rglob("*.py"))  # lgtm[py/path-injection]
+        py_files = list(Path(self.workspace_path).rglob("*.py"))
         wiki_errors = 0
         for py_file in py_files:
             rel_path = str(py_file.relative_to(self.workspace_path))
@@ -1433,8 +1442,14 @@ class AgentOrchestrator:
     async def run_stream(
         self, task: str, session_id: Optional[str] = None, include_history: bool = True
     ):
+        try:
+            task = guard_task(task)
+        except ValueError as e:
+            yield {"error": str(e), "chunk": "", "full_response": ""}
+            return
+
         if not session_id:
-            session_id = f"session_{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}"
+            session_id = f"session_{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S')}"
 
         self.session_memory.get_or_create_session(session_id, self.workspace_path)
         self.session_memory.save_message(session_id, "user", task)

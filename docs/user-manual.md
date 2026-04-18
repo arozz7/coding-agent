@@ -17,7 +17,8 @@ A comprehensive guide to using the Local Coding Agent.
 11. [Interactive Testing Tools](#interactive-testing-tools)
 12. [REST API Reference](#rest-api-reference)
 13. [Advanced File Operations](#advanced-file-operations)
-14. [Troubleshooting](#troubleshooting)
+14. [Security](#security)
+15. [Troubleshooting](#troubleshooting)
 
 ---
 
@@ -71,6 +72,7 @@ python -m pip install -e .
 | `STALE_JOB_THRESHOLD_SECS` | No | `2700` | Seconds before the watchdog kills a stuck job (45 min default). The timer automatically resets on task progress updates. |
 | `MAX_FIND_RESULTS` | No | `200` | Maximum results returned by `find_files` or `grep_code`. |
 | `SKIP_PATH_PREFIXES` | No | `dist/,build/,node_modules/,.cache/` | Comma-separated path prefixes excluded from fix-loop file context reads. Add project-specific compiled output dirs here. |
+| `AGENT_API_KEY` | No | _(none)_ | When set, callers must send `X-API-Key: <value>` on mutating endpoints (`POST /task`, `/task/start`, `/task/stream`, `/workspace/project`). Leave unset to disable auth (safe for local-only use). |
 
 ### Model Configuration (`config/models.yaml`)
 
@@ -836,6 +838,54 @@ The agent automatically detects the line endings (`CRLF` on Windows, `LF` on Uni
 
 ---
 
+## Security
+
+### API Authentication
+
+When `AGENT_API_KEY` is set in `.env`, the four mutating REST endpoints require the key in the `X-API-Key` header:
+
+```
+POST /task
+POST /task/start
+POST /task/stream
+POST /workspace/project
+```
+
+Example:
+```
+curl -X POST http://127.0.0.1:5005/task/start \
+  -H "X-API-Key: your-secret-key" \
+  -H "Content-Type: application/json" \
+  -d '{"task": "run the tests"}'
+```
+
+Read-only endpoints (`GET /health`, `/models`, `/task/{id}`, etc.) are always unauthenticated. Leave `AGENT_API_KEY` unset (or empty) for local-only development.
+
+### Prompt Injection Protection
+
+All task input (from the API, Discord, or any client) passes through a sanitizer before reaching any LLM prompt:
+
+1. **Control character stripping** — removes `\x00–\x1f` and Unicode private-use characters, caps input at 32 000 characters
+2. **Injection pattern detection** — 12 regex patterns detect known jailbreak phrases ("ignore previous instructions", "you are now a different AI", `<system>` tags, `[INST] ignore`, etc.)
+
+If a match is detected, the task is rejected immediately with an error message — no LLM call is made and no shell commands run.
+
+### Workspace Path Containment
+
+Shell commands run by the agent are checked against the workspace boundary. Any file-targeting command (`rm`, `del`, `copy`, `move`, `Remove-Item`, etc.) that references an **absolute path outside the workspace** is blocked:
+
+```
+# Blocked — targets a path outside the workspace
+del C:\Users\arozz\Documents\important.txt
+
+# Allowed — relative path, resolves inside workspace
+del src/old-file.js
+```
+
+Output redirections (`echo foo > /outside/path`) are checked the same way. Recursive destructive operations (`rm -rf /`, `rd /s`, `Remove-Item -Recurse`) are blocked unconditionally regardless of path.
+
+---
+
 ## Troubleshooting
 
 ### Windows Process-Tree termination
@@ -940,4 +990,4 @@ Get-Content logs\bot-20260415-120005.log -Wait   # tail the latest bot log
 
 ---
 
-*Last updated: 2026-04-16 — Phase 20 (bug fixes: path double-nesting, redundant cd, npm auto-install, research routing; interactive testing: `interactive_shell` + `browser_interact`)*
+*Last updated: 2026-04-18 — Phase 24 (security hardening: API key auth, prompt injection detection, workspace path containment, shell command blocking; SQLite WAL mode + thread-safe session store; datetime timezone fixes)*

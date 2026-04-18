@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Callable, Optional
 
 import structlog
+from agent.security.paths import PathTraversalError, resolve_within
 
 logger = structlog.get_logger()
 
@@ -107,22 +108,41 @@ _TOOL_ENV = _build_tool_env()
 
 # Patterns that are unconditionally blocked regardless of platform.
 # These guard against LLM-generated command injection and destructive operations.
+# IMPORTANT: _validate_command() is called on the ORIGINAL command (before any
+# Unix→Windows translation) AND on the translated form — so both rm and del are caught.
 _BLOCKED_PATTERNS = [
+    # Unix destructive
     re.compile(r"rm\s+-[rf]{1,2}\s+[/~*]", re.IGNORECASE),        # rm -rf / or ~
     re.compile(r"rm\s+-[rf]{1,2}\s+\.\.", re.IGNORECASE),          # rm -rf ..
+    re.compile(r"rm\s+--no-preserve-root", re.IGNORECASE),         # rm --no-preserve-root
+    # Windows CMD destructive
     re.compile(r"del\s+/[fqs].*\s+/[sq]", re.IGNORECASE),          # del /f /q (mass delete)
+    re.compile(r"del\s+/s\b", re.IGNORECASE),                      # del /s (recursive delete)
+    re.compile(r"\brd\s+/s\b", re.IGNORECASE),                     # rd /s (remove dir tree)
+    re.compile(r"\brmdir\s+/s\b", re.IGNORECASE),                  # rmdir /s (remove dir tree)
+    # PowerShell destructive
+    re.compile(r"Remove-Item\s+.*-Recurse", re.IGNORECASE),        # Remove-Item -Recurse
+    re.compile(r"\bri\b.*-r\b", re.IGNORECASE),                    # ri -r (alias)
+    re.compile(r"Remove-Item\s+[/\\~*]", re.IGNORECASE),           # Remove-Item /
+    # Disk / device operations
     re.compile(r"\bformat\s+[a-z]:", re.IGNORECASE),                # format C:
     re.compile(r"\bmkfs\b", re.IGNORECASE),                         # mkfs
-    re.compile(r":\(\)\s*\{.*\}", re.IGNORECASE),                   # fork bomb :(){:|}:&}
-    re.compile(r"\|\s*(ba|da|z|c)?sh\b", re.IGNORECASE),           # pipe to shell
     re.compile(r">\s*/dev/sd", re.IGNORECASE),                      # write to raw block device
     re.compile(r">\s*/proc/", re.IGNORECASE),                       # write to /proc
     re.compile(r">\s*C:\\Windows", re.IGNORECASE),                  # overwrite Windows system dir
-    re.compile(r"\bshutdown\b", re.IGNORECASE),                     # shutdown / reboot
-    re.compile(r"\breboot\b", re.IGNORECASE),
-    re.compile(r"(;|&&|\|\|)\s*rm\s", re.IGNORECASE),              # chained rm after another cmd
+    re.compile(r">\s*/etc/", re.IGNORECASE),                        # overwrite /etc files
+    # Shell injection / execution
+    re.compile(r":\(\)\s*\{.*\}", re.IGNORECASE),                   # fork bomb :(){:|}:&}
+    re.compile(r"\|\s*(ba|da|z|c)?sh\b", re.IGNORECASE),           # pipe to shell
+    re.compile(r"(;|&&|\|\|)\s*rm\s", re.IGNORECASE),              # chained rm
     re.compile(r"\$\(.*rm\s", re.IGNORECASE),                       # subshell rm
     re.compile(r"`.*rm\s.*`", re.IGNORECASE),                       # backtick rm
+    # System state
+    re.compile(r"\bshutdown\b", re.IGNORECASE),
+    re.compile(r"\breboot\b", re.IGNORECASE),
+    # Environment poisoning
+    re.compile(r"\bsetx\s+PATH\b", re.IGNORECASE),                 # Windows PATH overwrite
+    re.compile(r"export\s+PATH\s*=\s*/tmp", re.IGNORECASE),        # PATH hijack to /tmp
 ]
 
 # Windows shell built-ins that cannot run without shell=True.
@@ -137,6 +157,65 @@ def _validate_command(command: str) -> None:
     for pattern in _BLOCKED_PATTERNS:
         if pattern.search(command):
             raise ValueError(f"Command blocked by safety policy: {command[:120]!r}")
+
+
+# Verbs whose arguments should be path-contained to the workspace.
+_FILE_OP_VERBS = frozenset([
+    "rm", "rmdir", "cp", "mv",                              # Unix
+    "del", "copy", "move", "rd",                            # Windows CMD
+    "remove-item", "ri", "copy-item", "move-item",          # PowerShell
+])
+
+# Absolute-path detection — platform-aware.
+_ABS_WIN_PATH_RE = re.compile(r"^[A-Za-z]:[/\\]")          # C:\ or C:/
+_HOME_PATH_RE = re.compile(r"^~([/\\]|$)")                  # ~/... or ~
+
+
+def _looks_like_abs_path(token: str) -> bool:
+    """Return True if token appears to be an absolute filesystem path."""
+    t = token.strip("\"'")
+    if IS_WINDOWS:
+        return bool(_ABS_WIN_PATH_RE.match(t)) or bool(_HOME_PATH_RE.match(t))
+    # On Unix: /path (but not bare /s /f one-char flags on their own)
+    return (t.startswith("/") and len(t) > 2) or bool(_HOME_PATH_RE.match(t))
+
+
+def _check_path_containment(cmd: str, workspace: Path) -> None:
+    """Raise ValueError if a file-targeting command references a path outside *workspace*.
+
+    Covers both explicit path arguments to destructive verbs (del, rm, copy …)
+    and output-redirect targets (echo foo > /outside/path).
+    Relative paths are left alone — they resolve under the workspace cwd.
+    """
+    tokens = cmd.split()
+    if not tokens:
+        return
+
+    verb = tokens[0].lower().strip("\"'")
+
+    if verb in _FILE_OP_VERBS:
+        for token in tokens[1:]:
+            raw = token.strip("\"'")
+            if not _looks_like_abs_path(raw):
+                continue
+            try:
+                resolve_within(raw, workspace)
+            except (PathTraversalError, ValueError):
+                raise ValueError(
+                    f"Command targets a path outside the workspace: {raw!r}"
+                )
+
+    # Check redirect targets regardless of verb: echo foo > /etc/evil
+    redirect_match = re.search(r">>?\s*(\"?)([^\s\"]+)\1", cmd)
+    if redirect_match:
+        target = redirect_match.group(2)
+        if _looks_like_abs_path(target):
+            try:
+                resolve_within(target, workspace)
+            except (PathTraversalError, ValueError):
+                raise ValueError(
+                    f"Command redirects output to a path outside the workspace: {target!r}"
+                )
 
 
 def _is_windows_builtin(cmd: str) -> bool:
@@ -172,7 +251,7 @@ def _kill_process_tree(pid: int) -> None:
 class ShellTool:
     def __init__(self, workspace_path: str):
         # workspace_path comes from WORKSPACE_PATH env var / server config, not user HTTP input.
-        self.workspace = Path(workspace_path).resolve()  # lgtm[py/path-injection]
+        self.workspace = Path(workspace_path).resolve()
         self.logger = logger.bind(component="shell_tool")
         # Log which key tools are resolvable so PATH issues are visible at startup.
         _found = {t: shutil.which(t, path=_TOOL_ENV["PATH"]) for t in ("npm", "node", "python", "git", "cargo")}
@@ -269,13 +348,30 @@ class ShellTool:
         """
         cmd = command.strip()
 
-        if IS_WINDOWS:
-            cmd = self._translate_unix_to_windows(cmd)
-
+        # Validate the ORIGINAL command before translation so Unix-form patterns
+        # (e.g. `rm -rf /`) are caught even when running on Windows.
         try:
             _validate_command(cmd)
         except ValueError as e:
             self.logger.warning("shell_blocked", command=command, reason=str(e))
+            return {"success": False, "error": str(e)}
+
+        if IS_WINDOWS:
+            cmd = self._translate_unix_to_windows(cmd)
+
+        # Validate again after translation — catches Windows-form equivalents
+        # that the translation may have produced (e.g. `del /s`).
+        try:
+            _validate_command(cmd)
+        except ValueError as e:
+            self.logger.warning("shell_blocked", command=command, reason=str(e))
+            return {"success": False, "error": str(e)}
+
+        # Block file-targeting commands that reference paths outside the workspace.
+        try:
+            _check_path_containment(cmd, self.workspace)
+        except ValueError as e:
+            self.logger.warning("shell_blocked_path", command=command, reason=str(e))
             return {"success": False, "error": str(e)}
 
         self.logger.info("shell_run", original=command, translated=cmd, cwd=str(self.workspace))
@@ -314,7 +410,7 @@ class ShellTool:
                 stdout, stderr = proc.communicate(timeout=5)
             except Exception:
                 stdout, stderr = "", ""
-            return {"success": False, "error": f"Command timed out after {timeout}s"}
+            return {"success": False, "error": f"Command timed out after {timeout}s", "stdout": stdout, "stderr": stderr}
         except Exception as e:
             _kill_process_tree(proc.pid)
             self.logger.error("shell_error", command=command, error=str(e))
@@ -342,11 +438,23 @@ class ShellTool:
         Returns the same dict shape as :meth:`run`.
         """
         cmd = command.strip()
+
+        # Validate original form first, then the translated form.
+        try:
+            _validate_command(cmd)
+        except ValueError as e:
+            return {"success": False, "error": str(e)}
+
         if IS_WINDOWS:
             cmd = self._translate_unix_to_windows(cmd)
 
         try:
             _validate_command(cmd)
+        except ValueError as e:
+            return {"success": False, "error": str(e)}
+
+        try:
+            _check_path_containment(cmd, self.workspace)
         except ValueError as e:
             return {"success": False, "error": str(e)}
 

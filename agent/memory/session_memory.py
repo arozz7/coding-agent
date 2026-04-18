@@ -1,6 +1,7 @@
 import sqlite3
 import json
-from datetime import datetime
+import threading
+from datetime import datetime, timezone
 from typing import List, Optional
 from pathlib import Path
 import structlog
@@ -13,6 +14,10 @@ class SessionMemory:
         self.db_path = Path(db_path)
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         self.conn = sqlite3.connect(str(self.db_path), check_same_thread=False)
+        # WAL mode allows concurrent readers alongside the single writer,
+        # preventing "database is locked" errors under concurrent API requests.
+        self.conn.execute("PRAGMA journal_mode=WAL")
+        self._lock = threading.RLock()
         self._initialize_schema()
         self.logger = logger.bind(component="session_memory")
 
@@ -80,15 +85,16 @@ class SessionMemory:
     def create_session(
         self, session_id: str, project_path: Optional[str] = None, metadata: Optional[dict] = None
     ) -> str:
-        cursor = self.conn.cursor()
-        cursor.execute(
-            """
-            INSERT OR REPLACE INTO sessions (id, project_path, status, metadata, updated_at)
-            VALUES (?, ?, 'active', ?, CURRENT_TIMESTAMP)
-        """,
-            (session_id, project_path, json.dumps(metadata) if metadata else None),
-        )
-        self.conn.commit()
+        with self._lock:
+            cursor = self.conn.cursor()
+            cursor.execute(
+                """
+                INSERT OR REPLACE INTO sessions (id, project_path, status, metadata, updated_at)
+                VALUES (?, ?, 'active', ?, CURRENT_TIMESTAMP)
+            """,
+                (session_id, project_path, json.dumps(metadata) if metadata else None),
+            )
+            self.conn.commit()
         self.logger.info("session_created", session_id=session_id)
         return session_id
 
@@ -101,29 +107,30 @@ class SessionMemory:
         model_name: Optional[str] = None,
         tool_calls: Optional[List[dict]] = None,
     ) -> None:
-        cursor = self.conn.cursor()
-        cursor.execute(
-            """
-            INSERT INTO messages 
-            (session_id, role, content, tokens_used, model_name, tool_calls)
-            VALUES (?, ?, ?, ?, ?, ?)
-        """,
-            (
-                session_id,
-                role,
-                content,
-                tokens_used,
-                model_name,
-                json.dumps(tool_calls) if tool_calls else None,
-            ),
-        )
-        cursor.execute(
-            """
-            UPDATE sessions SET updated_at = CURRENT_TIMESTAMP WHERE id = ?
-        """,
-            (session_id,),
-        )
-        self.conn.commit()
+        with self._lock:
+            cursor = self.conn.cursor()
+            cursor.execute(
+                """
+                INSERT INTO messages
+                (session_id, role, content, tokens_used, model_name, tool_calls)
+                VALUES (?, ?, ?, ?, ?, ?)
+            """,
+                (
+                    session_id,
+                    role,
+                    content,
+                    tokens_used,
+                    model_name,
+                    json.dumps(tool_calls) if tool_calls else None,
+                ),
+            )
+            cursor.execute(
+                """
+                UPDATE sessions SET updated_at = CURRENT_TIMESTAMP WHERE id = ?
+            """,
+                (session_id,),
+            )
+            self.conn.commit()
 
     def get_conversation_history(
         self, session_id: str, max_messages: int = 50
@@ -229,37 +236,35 @@ class SessionMemory:
         status: str,
         result: Optional[dict] = None,
     ) -> int:
-        cursor = self.conn.cursor()
-
-        cursor.execute(
-            """
-            SELECT id FROM tasks WHERE session_id = ? AND description = ?
-        """,
-            (session_id, task_desc),
-        )
-        existing = cursor.fetchone()
-
-        if existing:
-            task_id = existing[0]
+        with self._lock:
+            cursor = self.conn.cursor()
             cursor.execute(
-                """
-                UPDATE tasks 
-                SET status = ?, completed_at = CURRENT_TIMESTAMP, result = ?
-                WHERE id = ?
-            """,
-                (status, json.dumps(result) if result else None, task_id),
+                "SELECT id FROM tasks WHERE session_id = ? AND description = ?",
+                (session_id, task_desc),
             )
-        else:
-            cursor.execute(
-                """
-                INSERT INTO tasks (session_id, description, status, result)
-                VALUES (?, ?, ?, ?)
-            """,
-                (session_id, task_desc, status, json.dumps(result) if result else None),
-            )
+            existing = cursor.fetchone()
 
-        self.conn.commit()
-        return cursor.rowcount
+            if existing:
+                task_id = existing[0]
+                cursor.execute(
+                    """
+                    UPDATE tasks
+                    SET status = ?, completed_at = CURRENT_TIMESTAMP, result = ?
+                    WHERE id = ?
+                """,
+                    (status, json.dumps(result) if result else None, task_id),
+                )
+            else:
+                cursor.execute(
+                    """
+                    INSERT INTO tasks (session_id, description, status, result)
+                    VALUES (?, ?, ?, ?)
+                """,
+                    (session_id, task_desc, status, json.dumps(result) if result else None),
+                )
+
+            self.conn.commit()
+            return cursor.rowcount
 
     def get_session_summary(self, session_id: str) -> dict:
         cursor = self.conn.cursor()
@@ -350,14 +355,13 @@ class SessionMemory:
         return self.get_session_summary(session_id)
 
     def update_session_status(self, session_id: str, status: str) -> None:
-        cursor = self.conn.cursor()
-        cursor.execute(
-            """
-            UPDATE sessions SET status = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?
-        """,
-            (status, session_id),
-        )
-        self.conn.commit()
+        with self._lock:
+            cursor = self.conn.cursor()
+            cursor.execute(
+                "UPDATE sessions SET status = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+                (status, session_id),
+            )
+            self.conn.commit()
 
     def emit_event(self, session_id: str, event_type: str, data: dict) -> None:
         """Persist a structured execution event for observability and crash recovery.
@@ -383,16 +387,17 @@ class SessionMemory:
 
         Returns True if the session existed and was removed, False otherwise.
         """
-        cursor = self.conn.cursor()
-        cursor.execute("SELECT id FROM sessions WHERE id = ?", (session_id,))
-        if not cursor.fetchone():
-            self.logger.warning("delete_session_not_found", session_id=session_id)
-            return False
+        with self._lock:
+            cursor = self.conn.cursor()
+            cursor.execute("SELECT id FROM sessions WHERE id = ?", (session_id,))
+            if not cursor.fetchone():
+                self.logger.warning("delete_session_not_found", session_id=session_id)
+                return False
 
-        cursor.execute("DELETE FROM messages WHERE session_id = ?", (session_id,))
-        cursor.execute("DELETE FROM tasks WHERE session_id = ?", (session_id,))
-        cursor.execute("DELETE FROM sessions WHERE id = ?", (session_id,))
-        self.conn.commit()
+            cursor.execute("DELETE FROM messages WHERE session_id = ?", (session_id,))
+            cursor.execute("DELETE FROM tasks WHERE session_id = ?", (session_id,))
+            cursor.execute("DELETE FROM sessions WHERE id = ?", (session_id,))
+            self.conn.commit()
         self.logger.info("session_deleted", session_id=session_id)
         return True
 
