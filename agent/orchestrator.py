@@ -67,7 +67,12 @@ class AgentOrchestrator:
         self.browser_tool = BrowserTool(workspace_path)
         self.tool_executor = ToolExecutor(workspace_path, self.code_analyzer, self.pytest_tool)
         self.skill_manager = SkillManager("skills")
-        self.wiki_manager = WikiManager(workspace_path)
+        # Derive project name: non-empty when workspace is a subdirectory of the root.
+        _ws_root = os.getenv("WORKSPACE_PATH", "./workspace")
+        _ws_root_resolved = str(Path(_ws_root).resolve())
+        _ws_resolved = str(Path(_ws).resolve())
+        _project_name = Path(_ws).name if _ws_resolved != _ws_root_resolved else ""
+        self.wiki_manager = WikiManager(workspace_path, project_name=_project_name)
         self.wiki_manager._ensure_dirs()   # create .agent-wiki/ structure on startup
         self.skill_executor = SkillExecutor(self.wiki_manager, self.skill_manager)
         self.memory_wiki = MemoryWiki(project_id=Path(workspace_path).name)

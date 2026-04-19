@@ -1334,6 +1334,98 @@ async def skills_cmd(ctx: commands.Context, action: str = "list"):
     await ctx.send("\n".join(lines))
 
 
+@bot.command(name="wiki")
+async def wiki_cmd(ctx: commands.Context, action: str = "status", *, args: str = ""):
+    """Interact with the agent wiki knowledge base.
+
+    !wiki                     — show wiki status (entry count, project breakdown)
+    !wiki status              — same as above
+    !wiki query <terms>       — search the wiki for matching entries
+    !wiki clean               — remove out-of-scope entries from the current wiki index
+    !wiki migrate <project>   — move <project>-tagged entries from root wiki to project wiki
+    """
+    action = action.lower().strip()
+
+    if action in ("status", ""):
+        try:
+            data = await bot.client._get("/wiki/status")
+        except Exception as exc:
+            await ctx.send(f"Error: {exc}")
+            return
+
+        total = data.get("total", 0)
+        current = data.get("current_project", "<root>")
+        by_cat = data.get("by_category", {})
+        by_proj = data.get("by_project", {})
+        last = data.get("last_entry", "—")
+        wiki_root = data.get("wiki_root", "")
+
+        cat_lines = "\n".join(f"  `{k}` — {v}" for k, v in sorted(by_cat.items())) or "  (empty)"
+        proj_lines = "\n".join(f"  `{k}` — {v} entries" for k, v in sorted(by_proj.items())) or "  (empty)"
+
+        await ctx.send(
+            f"**Wiki Status** — `{wiki_root}`\n"
+            f"Active project: **{current}**\n"
+            f"Total entries: **{total}**\n\n"
+            f"**By category:**\n{cat_lines}\n\n"
+            f"**By project:**\n{proj_lines}\n\n"
+            f"**Last compiled:** {last[:100]}"
+        )
+        return
+
+    if action == "query":
+        if not args:
+            await ctx.send("Usage: `!wiki query <term1> <term2> ...`")
+            return
+        terms = ",".join(args.split())
+        try:
+            data = await bot.client._get(f"/wiki/query?terms={terms}")
+        except Exception as exc:
+            await ctx.send(f"Error: {exc}")
+            return
+        result = data.get("result", "(no matches)")
+        # Truncate for Discord's 2000-char limit
+        if len(result) > 1800:
+            result = result[:1800] + "\n…(truncated)"
+        await ctx.send(f"**Wiki Query: `{args}`**\n\n{result}")
+        return
+
+    if action == "clean":
+        msg = await ctx.send("Cleaning out-of-scope entries from wiki index…")
+        try:
+            data = await bot.client._post("/wiki/clean", {})
+        except Exception as exc:
+            await msg.edit(content=f"Error: {exc}")
+            return
+        removed = data.get("removed", 0)
+        kept = data.get("kept", 0)
+        await msg.edit(
+            content=f"Wiki clean complete — removed **{removed}** out-of-scope entries, kept **{kept}**."
+        )
+        return
+
+    if action == "migrate":
+        project = args.strip()
+        if not project:
+            await ctx.send("Usage: `!wiki migrate <project-name>`")
+            return
+        msg = await ctx.send(f"Migrating entries tagged `{project}` to their project wiki…")
+        try:
+            data = await bot.client._post("/wiki/migrate", {"project": project})
+        except Exception as exc:
+            await msg.edit(content=f"Error: {exc}")
+            return
+        moved = data.get("moved", 0)
+        await msg.edit(
+            content=f"Migration complete — moved **{moved}** entries to `{project}/.agent-wiki`."
+        )
+        return
+
+    await ctx.send(
+        "Unknown wiki action. Available: `status`, `query <terms>`, `clean`, `migrate <project>`"
+    )
+
+
 @bot.command(name="restart", aliases=["reboot"])
 async def restart_services(ctx: commands.Context):
     """Restart both the API and bot via the supervisor (!reboot also works)."""

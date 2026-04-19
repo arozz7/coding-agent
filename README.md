@@ -28,7 +28,7 @@ An autonomous coding agent with LLM integration, multi-agent orchestration, SDLC
 - **CRLF & BOM Preservation** — Detects and preserves original line endings and Byte Order Marks during file writes, preventing silent file corruption in Windows or legacy environments
 - **Workspace Scoping** — `PROJECT_DIR` env var focuses all file operations on an active project subdirectory; no path double-nesting
 - **Security Layer** — Prompt injection detection blocks known jailbreak patterns before input reaches any LLM prompt; shell commands that reference absolute paths outside the workspace are rejected; optional `AGENT_API_KEY` header auth on all mutating API endpoints; SQLite session store uses WAL mode + `threading.RLock` for concurrent-access safety
-- **Agent Wiki Memory** — `.agent-wiki/` knowledge base compiled per task; later subtasks query earlier ones; index deduplication; `!skills` to inspect
+- **Agent Wiki Memory** — Per-project `.agent-wiki/` knowledge base: each project subdirectory owns its wiki; entries are tagged with the active project so queries never surface stale context from other projects; `!wiki status/query/clean/migrate` commands for full interactive control
 - **RAG Memory** — Codebase indexed in ChromaDB; retrieved context injected into every task
 - **Shell PATH Auto-Discovery** — Scans 15+ common install dirs (nvm, volta, Homebrew, Cargo…) so npm/node/git are found even when the API starts with a minimal PATH
 
@@ -140,6 +140,7 @@ python -m api.discord_bot
 | `!clear` | Clear session history |
 | `!workspace` | Show workspace path and active project |
 | `!project [name]` | Get or set the active project directory |
+| `!wiki [status\|query\|clean\|migrate]` | Inspect, search, clean, or migrate the active wiki knowledge base |
 
 ### Model Management
 
@@ -260,6 +261,10 @@ Mutating endpoints (`POST /task`, `POST /task/start`, `POST /task/stream`, `POST
 | `GET` | `/workspace` | Current workspace path and project |
 | `GET` | `/workspace/file?path=` | Read a workspace file |
 | `POST` | `/workspace/project` | Set active project `{"project": "name"}` |
+| `GET` | `/wiki/status` | Wiki summary: entry count, breakdown by category and project |
+| `GET` | `/wiki/query?terms=` | Search wiki (respects active project scope) |
+| `POST` | `/wiki/clean` | Remove out-of-scope index entries from the active wiki |
+| `POST` | `/wiki/migrate` | Move entries tagged for a project into that project's wiki `{"project": "name"}` |
 | `GET` | `/sessions` | List sessions |
 | `DELETE` | `/sessions/{id}` | Delete a session |
 | `POST` | `/restart` | Signal supervisor to restart both services |
@@ -321,10 +326,10 @@ coding-agent/
 ├── config/
 │   ├── models.yaml                # Model configuration (local + remote + defaults)
 │   └── task_classifier.yaml      # LLM classifier prompt for task type detection
-├── .agent-wiki/                   # Per-session knowledge base (auto-generated)
-│   ├── index.md                   # Entry catalog
-│   ├── log.md                     # Compilation log
-│   └── <category>/<slug>.md       # Individual knowledge entries
+├── workspace/
+│   ├── .agent-wiki/               # Workspace-level wiki (cross-project knowledge, no project tag)
+│   └── <project-name>/
+│       └── .agent-wiki/           # Per-project wiki (entries tagged project:<name>)
 ├── .state/                        # Runtime state (supervisor heartbeat, restart flag)
 ├── logs/                          # Timestamped child-process logs (auto-generated)
 ├── data/                          # SQLite databases (jobs, tasks, sessions)
