@@ -812,6 +812,63 @@ async def set_project(request: dict):
     }
 
 
+@app.get("/wiki/status")
+async def wiki_status():
+    """Return a summary of the active wiki: entry count, project breakdown, last entry."""
+    if not _orchestrator:
+        raise HTTPException(status_code=503, detail="Agent not initialized")
+    return _orchestrator.wiki_manager.status()
+
+
+@app.post("/wiki/clean", dependencies=[Depends(_require_api_key)])
+async def wiki_clean():
+    """Remove index entries that are out of scope for the current project.
+
+    At root: removes all project-tagged entries.
+    In a project: removes entries tagged for a different project.
+    Entry *files* are preserved — only the index row is stripped.
+    """
+    if not _orchestrator:
+        raise HTTPException(status_code=503, detail="Agent not initialized")
+    result = _orchestrator.wiki_manager.clean()
+    return {"success": True, **result}
+
+
+@app.post("/wiki/migrate", dependencies=[Depends(_require_api_key)])
+async def wiki_migrate(request: dict):
+    """Migrate entries tagged with a given project out of the current wiki.
+
+    Body: {"project": "<name>"}
+    Copies matching entries into the project's own .agent-wiki directory and
+    removes them from the source index.
+    """
+    if not _orchestrator:
+        raise HTTPException(status_code=503, detail="Agent not initialized")
+    project = (request.get("project") or "").strip()
+    if not project or not re.fullmatch(r"[A-Za-z0-9._\-]+", project):
+        raise HTTPException(status_code=400, detail="Invalid project name")
+    workspace_root = Path(WORKSPACE_PATH).resolve()
+    target_path = workspace_root / project
+    target_path.mkdir(parents=True, exist_ok=True)
+    result = _orchestrator.wiki_manager.migrate_to(project, str(target_path))
+    return {"success": True, "project": project, **result}
+
+
+@app.get("/wiki/query")
+async def wiki_query(terms: str = ""):
+    """Query the wiki for matching entries (respects project scope).
+
+    Query param: ?terms=word1,word2
+    """
+    if not _orchestrator:
+        raise HTTPException(status_code=503, detail="Agent not initialized")
+    term_list = [t.strip() for t in terms.split(",") if t.strip()]
+    if not term_list:
+        raise HTTPException(status_code=400, detail="Provide at least one search term")
+    result = _orchestrator.wiki_manager.query(term_list)
+    return {"result": result or "(no matches)"}
+
+
 @app.post("/workspace")
 async def set_workspace(request: dict):
     """Set new workspace path"""

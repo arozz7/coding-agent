@@ -28,6 +28,10 @@ VALID_AGENT_TYPES = frozenset({
     "documenter",  # documentation writer
 })
 
+# Agent types safe for research tasks. architect is excluded because it writes
+# ADR files to disk, which is wrong for a read-only research workflow.
+_RESEARCH_SAFE_TYPES = frozenset({"research", "documenter", "chat", "develop"})
+
 # Matches a JSON array in the LLM response even if wrapped in prose/markdown
 _JSON_ARRAY_RE = re.compile(r'\[[\s\S]*?\]', re.DOTALL)
 
@@ -90,6 +94,8 @@ class PlannerAgent:
         try:
             raw = await self.model_router.generate(prompt, model, system_prompt=system_prompt)
             tasks = self._parse_task_list(raw)
+            if task_type == "research":
+                tasks = self._enforce_research_types(tasks)
             if tasks:
                 self.logger.info(
                     "plan_created",
@@ -139,13 +145,25 @@ class PlannerAgent:
 
         return validated
 
+    def _enforce_research_types(self, tasks: List[Dict[str, str]]) -> List[Dict[str, str]]:
+        """Remap unsafe agent types for research workflows.
+
+        architect writes ADR files to disk — never appropriate for read-only research.
+        """
+        return [
+            {**t, "agent_type": "documenter" if t["agent_type"] not in _RESEARCH_SAFE_TYPES else t["agent_type"]}
+            for t in tasks
+        ]
+
     def _strategy_hint(self, task_type: str) -> str:
         if task_type == "research":
             return (
                 "Strategy for research objectives:\n"
                 "1. One or more 'research' tasks to search/gather information\n"
-                "2. A 'research' task to synthesize findings into a report\n"
+                "2. A 'documenter' task to synthesize findings into a structured report\n"
                 "3. Optionally a 'develop' task if code output is needed\n"
+                "IMPORTANT: NEVER use 'architect' agent_type for research tasks — "
+                "it writes ADR files to disk which is wrong for a research workflow.\n"
             )
         if task_type in ("sdlc", "develop"):
             return (

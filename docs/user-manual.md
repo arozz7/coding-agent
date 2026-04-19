@@ -11,6 +11,7 @@ A comprehensive guide to using the Local Coding Agent.
 5. [Task Types & Routing](#task-types--routing)
 6. [Agent Chains](#agent-chains)
 7. [Workspace & Project Scoping](#workspace--project-scoping)
+   - [!wiki commands](#wiki-commands)
 8. [Model Management](#model-management)
 9. [Context Bridge](#context-bridge)
 10. [Agent Wiki Memory](#agent-wiki-memory)
@@ -297,10 +298,12 @@ Get or set the active project:
 ```
 !project                         # show current project
 !project Shadows-of-Eldoria      # set active project
-!project none                    # clear active project (use workspace root)
+!project clear                   # clear active project (return to workspace root)
 ```
 
-Setting a project scopes all agent file operations to `WORKSPACE_PATH/<name>`. Agents see `Active project: <name>` in their context and write files there without creating nested subdirectories.
+Setting a project scopes all agent file operations to `WORKSPACE_PATH/<name>`. Agents see `Active project: <name>` in their context and write files there. The wiki is also scoped: all entries compiled during this project are tagged `project:<name>` and will not contaminate other projects' queries.
+
+> **Always set a project before starting work.** Running tasks from the workspace root writes to the root wiki, which is shared across all projects. Use `!project clear` only when you intend to work at the workspace level.
 
 ---
 
@@ -568,26 +571,110 @@ You can always resume the previous session with `!session` and `!sessions`.
 
 ## Agent Wiki Memory
 
-The agent maintains a per-workspace knowledge base in `.agent-wiki/`:
+The agent maintains a persistent knowledge base in `.agent-wiki/` that accumulates learnings across tasks and sessions. **Each project subdirectory owns its own wiki** — entries are tagged with the active project so queries never surface stale context from other projects.
+
+### Wiki layout
 
 ```
-.agent-wiki/
-├── index.md              # Catalog of all entries
-├── log.md                # Compilation history
-├── tech-patterns/        # Discovered code patterns
-├── bugs/                 # Bugs found and fixed
-├── decisions/            # Architecture decisions
-├── api-usage/            # API/SDK usage patterns
-└── synthesis/            # Cross-task synthesis
+workspace/
+├── .agent-wiki/               ← workspace-level wiki (cross-project knowledge)
+│   ├── index.md               ← entry catalog (one row per entry)
+│   ├── log.md                 ← compilation history
+│   ├── tech-patterns/
+│   ├── bugs/
+│   ├── decisions/
+│   ├── api-usage/
+│   └── synthesis/
+└── my-project/
+    └── .agent-wiki/           ← project-scoped wiki (tagged project:my-project)
+        └── ...
 ```
 
-**How it works:**
+### How it works
 
-1. **Pre-task (wiki-query):** Before each task, the agent searches the wiki for relevant entries and injects them as context.
-2. **Post-task (wiki-compile):** After each task succeeds, the LLM synthesises a structured wiki entry from the task + result. This happens for every subtask in a multi-task job, so Task 2 can see what Task 1 learned.
-3. **Deduplication:** The index is upserted — re-compiling the same entry updates the row rather than appending a duplicate.
+1. **Pre-task (wiki-query):** Before each task the agent searches the wiki for relevant entries and injects them as context. Only entries scoped to the active project (or untagged workspace-level entries) are returned — entries from other projects are filtered out automatically.
+2. **Post-task (wiki-compile):** After each subtask the LLM synthesises a concise wiki entry from the task + result. Task 2 in a multi-step job can see what Task 1 learned.
+3. **Project tagging:** Every compiled entry is tagged `project:<name>` when a project is active, or left untagged for workspace-level knowledge (e.g. `scope="workspace"`).
+4. **Deduplication:** The index is upserted — recompiling the same entry updates the existing row rather than appending a duplicate.
 
-Use `!skills` to see available wiki skills. The wiki accumulates over time and improves agent performance on repeat work in the same codebase.
+### Scope rules
+
+| Situation | What the query returns |
+|-----------|----------------------|
+| Active project `my-project` | Entries tagged `project:my-project` + untagged entries |
+| At workspace root (no project) | Untagged entries only |
+| Entry has `project:other` tag | Never returned to a different project |
+
+### `!wiki` commands
+
+#### `!wiki` / `!wiki status`
+Shows a summary of the active wiki: total entries, breakdown by category, breakdown by project, and the last compiled entry.
+
+```
+!wiki
+```
+
+Output example:
+```
+Wiki Status — workspace/my-project/.agent-wiki
+Active project: my-project
+Total entries: 14
+
+By category:
+  bugs         — 3
+  decisions    — 4
+  synthesis    — 7
+
+By project:
+  my-project   — 14 entries
+
+Last compiled: compiled: [JWT Auth Pattern](…) (tech-patterns) — 2026-04-19T18:00:00Z
+```
+
+#### `!wiki query <terms>`
+Searches the active wiki for entries matching any of the given terms. Respects the active project scope — results only include entries visible to the current project.
+
+```
+!wiki query auth jwt
+!wiki query database migration
+```
+
+#### `!wiki clean`
+Removes index rows that are out of scope for the current project. Entry *files* are preserved on disk — only the catalog row is stripped so nothing is permanently lost.
+
+- **At workspace root:** removes all entries with any `project:` tag
+- **In a project:** removes entries tagged for a different project
+
+```
+!wiki clean
+```
+
+Output:
+```
+Wiki clean complete — removed 7 out-of-scope entries, kept 3.
+```
+
+#### `!wiki migrate <project>`
+Moves all entries tagged `project:<name>` from the **current wiki** (typically the workspace root wiki) into the named project's own `.agent-wiki/`. Useful for cleaning up the root wiki after work was accidentally done without setting a project first.
+
+```
+!wiki migrate Shadows-of-Eldoria
+```
+
+Output:
+```
+Migration complete — moved 12 entries to Shadows-of-Eldoria/.agent-wiki.
+```
+
+### Recommended first-time cleanup
+
+If entries from an old project have accumulated in the workspace root wiki:
+
+```
+!wiki migrate <old-project-name>   ← move tagged entries to their project
+!wiki clean                        ← remove any remaining stale tagged rows
+!wiki status                       ← confirm the root wiki is clean
+```
 
 ---
 
@@ -762,6 +849,33 @@ GET /workspace/file?path=relative/path
 POST /workspace/project
   Body: {"project": "project-name"}
   Sets PROJECT_DIR for the running process.
+```
+
+### Wiki Endpoints
+
+```
+GET /wiki/status
+  Returns: {
+    "total": 14,
+    "by_category": {"synthesis": 7, "decisions": 4, "bugs": 3},
+    "by_project": {"my-project": 14},
+    "current_project": "my-project",
+    "wiki_root": "/path/to/workspace/my-project/.agent-wiki",
+    "last_entry": "compiled: [JWT Auth Pattern](…)"
+  }
+
+GET /wiki/query?terms=word1,word2
+  Returns relevant wiki entries matching any term (project-scoped).
+  {"result": "**From Agent Wiki:**\n\n### .agent-wiki/…"}
+
+POST /wiki/clean   (auth required if AGENT_API_KEY set)
+  Removes out-of-scope index rows from the active wiki.
+  Returns: {"success": true, "removed": 7, "kept": 3}
+
+POST /wiki/migrate   (auth required if AGENT_API_KEY set)
+  Body: {"project": "Shadows-of-Eldoria"}
+  Moves entries tagged for the named project to that project's own wiki.
+  Returns: {"success": true, "project": "Shadows-of-Eldoria", "moved": 12}
 ```
 
 ### Health & Operations
@@ -990,4 +1104,4 @@ Get-Content logs\bot-20260415-120005.log -Wait   # tail the latest bot log
 
 ---
 
-*Last updated: 2026-04-18 — Phase 24 (security hardening: API key auth, prompt injection detection, workspace path containment, shell command blocking; SQLite WAL mode + thread-safe session store; datetime timezone fixes)*
+*Last updated: 2026-04-19 — Phase 25 (per-project wiki isolation: project-scoped `.agent-wiki/`, entry tagging, query filtering, `!wiki status/query/clean/migrate` commands, wiki API endpoints; planner research-type enforcement; architect agent path sanitization)*
