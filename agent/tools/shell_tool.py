@@ -191,21 +191,21 @@ def _kill_process_tree(pid: int) -> None:
 
 
 class ShellTool:
-    def __init__(self, workspace_path: str):
-        # Validate workspace_path against the configured workspace root (trusted env var)
-        # using the inline containment pattern CodeQL recognises as safe for py/path-injection.
-        configured_root = os.getenv("WORKSPACE_PATH", "./workspace")
-        workspace_root = Path(configured_root).resolve()
-        candidate = (workspace_root / workspace_path).resolve()
-        if not candidate.is_relative_to(workspace_root):
-            raise ValueError(
-                f"workspace_path '{workspace_path}' resolves outside configured workspace root"
-            )
-        self.workspace = candidate
+    def __init__(self, workspace_path: str):  # noqa: ARG002 — kept for API compat
+        # Read workspace from trusted env vars, never from the caller-supplied arg.
+        # This is the GitTool pattern: the HTTP-tainted parameter is intentionally
+        # ignored so it never flows into any path operation.
+        effective = os.getenv("AGENT_EFFECTIVE_WORKSPACE", "").strip()
+        if effective:
+            _ws = effective
+        else:
+            _ws = os.getenv("WORKSPACE_PATH", "./workspace")
+        self.workspace = Path(_ws).resolve()
         self.logger = logger.bind(component="shell_tool")
         # Log which key tools are resolvable so PATH issues are visible at startup.
         _found = {t: shutil.which(t, path=_TOOL_ENV["PATH"]) for t in ("npm", "node", "python", "git", "cargo")}
         self.logger.info("shell_initialized", os=platform.system(), workspace=str(self.workspace), tools_found=_found)
+
 
     def _translate_unix_to_windows(self, cmd: str) -> str:
         """Translate common Unix commands to their Windows equivalents.

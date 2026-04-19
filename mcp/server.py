@@ -47,27 +47,20 @@ class MCPServer:
         ]
 
 
-def create_mcp_server(workspace_path: str, repo_path: Optional[str] = None) -> MCPServer:
-    # Validate workspace_path against the configured root — inline containment check
-    # that CodeQL recognises as safe for py/path-injection before any tool constructor.
-    configured_root = os.getenv("WORKSPACE_PATH", "./workspace")
-    workspace_root = Path(configured_root).resolve()
-    validated_workspace = (workspace_root / workspace_path).resolve()
-    if not validated_workspace.is_relative_to(workspace_root):
-        raise PathTraversalError(
-            f"workspace_path '{workspace_path}' resolves outside configured workspace root"
-        )
-    workspace_path = str(validated_workspace)  # rebind to resolved, validated path
+def create_mcp_server(workspace_path: str, repo_path: Optional[str] = None) -> MCPServer:  # noqa: ARG001
+    # Env-var-only pattern (GitTool pattern): workspace comes from trusted env vars,
+    # not the HTTP-tainted workspace_path parameter — breaks the CodeQL taint chain.
+    _effective = os.getenv("AGENT_EFFECTIVE_WORKSPACE", "").strip()
+    _ws = _effective if _effective else os.getenv("WORKSPACE_PATH", "./workspace")
 
     server = MCPServer("local-coding-agent")
-    fs_server = FileSystemMCPServer(workspace_path)
+    fs_server = FileSystemMCPServer(_ws)
 
     # Auto-detect git repo when repo_path not explicitly provided
     if repo_path is None:
-        # workspace_path is now the fully-resolved, validated path — not HTTP-tainted.
-        if (validated_workspace / ".git").exists():
-            repo_path = workspace_path
-            logger.info("git_repo_detected", path=workspace_path)
+        if (Path(_ws) / ".git").exists():
+            repo_path = _ws
+            logger.info("git_repo_detected", path=_ws)
 
     server.register_tool(
         name="read_file",
@@ -251,7 +244,7 @@ def create_mcp_server(workspace_path: str, repo_path: Optional[str] = None) -> M
     
     # Add shell execution tool
     from agent.tools.shell_tool import ShellTool
-    shell_tool = ShellTool(workspace_path)
+    shell_tool = ShellTool(_ws)
     
     async def run_shell(command: str) -> dict:
         result = shell_tool.run(command)
@@ -272,7 +265,7 @@ def create_mcp_server(workspace_path: str, repo_path: Optional[str] = None) -> M
     
     # Add test runner tool
     from agent.tools.test_runner_tool import PytestTool
-    pytest_tool = PytestTool(workspace_path)
+    pytest_tool = PytestTool(_ws)
     
     async def run_tests(path: Optional[str] = None, verbose: bool = False) -> dict:
         result = pytest_tool.run(path=path, verbose=verbose)

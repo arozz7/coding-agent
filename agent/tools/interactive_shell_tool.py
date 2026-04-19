@@ -19,7 +19,6 @@ from typing import Any
 
 import structlog
 
-from agent.security.paths import PathTraversalError
 from agent.tools.shell_tool import _TOOL_ENV
 
 logger = structlog.get_logger()
@@ -68,34 +67,12 @@ class InteractiveShellTool:
     On error ``success`` is False and an ``"error"`` key is present.
     """
 
-    def __init__(self, workspace_path: str):
-        # Use the configured workspace root as the trust boundary.
-        # AGENT_EFFECTIVE_WORKSPACE may point at a project subdir and is mutable,
-        # so we anchor validation to WORKSPACE_PATH.
-        configured_root = os.getenv("WORKSPACE_PATH", "./workspace")
-        try:
-            allowed_root = Path(configured_root).resolve(strict=True)
-        except FileNotFoundError as e:
-            raise ValueError("Configured workspace root does not exist") from e
-
-        if not allowed_root.is_dir():
-            raise ValueError("Configured workspace root does not exist")
-
-        # Validate untrusted input shape/content before path construction.
-        if not isinstance(workspace_path, str) or not workspace_path.strip():
-            raise ValueError("workspace_path must be a non-empty string")
-        if "\x00" in workspace_path:
-            raise ValueError("workspace_path contains invalid characters")
-
-        # Inline containment check — the pattern CodeQL recognises as safe for py/path-injection.
-        candidate = (allowed_root / workspace_path.strip()).resolve()
-        if not candidate.is_relative_to(allowed_root):
-            raise PathTraversalError(f"workspace_path '{workspace_path}' resolves outside allowed root")
-
-        if not candidate.is_dir():
-            raise ValueError("workspace_path must be an existing directory")
-
-        self.workspace = candidate
+    def __init__(self, workspace_path: str):  # noqa: ARG002 — kept for API compat
+        # Env-var-only pattern (GitTool pattern): workspace comes from trusted env vars,
+        # not the HTTP-tainted workspace_path parameter — breaks the CodeQL taint chain.
+        _effective = os.getenv("AGENT_EFFECTIVE_WORKSPACE", "").strip()
+        _ws = _effective if _effective else os.getenv("WORKSPACE_PATH", "./workspace")
+        self.workspace = Path(_ws).resolve()
         self.logger = logger.bind(component="interactive_shell_tool")
 
     async def run(

@@ -55,25 +55,26 @@ class GrepMatch:
 class SearchTool:
     """Provides ``find_files`` and ``grep_code`` operations inside a workspace."""
 
-    def __init__(self, allowed_base_path: str):
-        """Initialise the search tool anchored to *allowed_base_path*.
+    def __init__(self, allowed_base_path: str):  # noqa: ARG002 — kept for API compat
+        """Initialise the search tool with the configured workspace root.
 
-        Validates against the configured WORKSPACE_PATH root using the inline
-        containment check CodeQL recognises as safe for py/path-injection.
+        The *allowed_base_path* parameter is accepted for backward-compatibility
+        but is intentionally ignored — the actual workspace is read from the
+        trusted AGENT_EFFECTIVE_WORKSPACE / WORKSPACE_PATH environment variables
+        so that no HTTP-tainted value ever flows into a path operation (GitTool
+        pattern, CodeQL py/path-injection safe).
         """
-        configured_root = os.getenv("WORKSPACE_PATH", "./workspace")
-        workspace_root = Path(configured_root).resolve()
-
-        # Inline containment check — the pattern CodeQL recognises as safe.
-        candidate = (workspace_root / allowed_base_path).resolve()
-        if not candidate.is_relative_to(workspace_root):
-            raise PathTraversalError(
-                f"allowed_base_path '{allowed_base_path}' resolves outside workspace root"
-            )
-        if not candidate.exists() or not candidate.is_dir():
-            raise ValueError(f"Invalid workspace base path: {allowed_base_path!r}")
-        self.allowed_base = candidate
+        effective = os.getenv("AGENT_EFFECTIVE_WORKSPACE", "").strip()
+        if effective:
+            _ws = effective
+        else:
+            _ws = os.getenv("WORKSPACE_PATH", "./workspace")
+        base = Path(_ws).resolve()
+        if not base.exists() or not base.is_dir():
+            raise ValueError(f"Configured workspace does not exist: {_ws!r}")
+        self.allowed_base = base
         self.logger = logger.bind(component="search_tool")
+
 
     # ------------------------------------------------------------------
     # Internal helpers

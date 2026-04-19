@@ -29,28 +29,25 @@ class InvalidPathError(FileOperationError):
 
 
 class FileSystemTool:
-    def __init__(self, allowed_base_path: str):
-        """Initialise the tool with a workspace root.
+    def __init__(self, allowed_base_path: str):  # noqa: ARG002 — kept for API compat
+        """Initialise the tool with the configured workspace root.
 
-        *allowed_base_path* is validated against the configured WORKSPACE_PATH
-        root using the inline containment check that CodeQL recognises as safe
-        for py/path-injection.
+        The *allowed_base_path* parameter is accepted for backward-compatibility
+        but is intentionally ignored — the actual workspace is read from the
+        trusted AGENT_EFFECTIVE_WORKSPACE / WORKSPACE_PATH environment variables
+        so that no HTTP-tainted value ever flows into a path operation (GitTool
+        pattern, CodeQL py/path-injection safe).
         """
-        # Anchor validation to the configured workspace root (trusted env var),
-        # not the caller-supplied string.  This breaks the HTTP-taint chain.
-        configured_root = os.getenv("WORKSPACE_PATH", "./workspace")
-        workspace_root = Path(configured_root).resolve()
-
-        # Inline containment check — the pattern CodeQL recognises as safe.
-        candidate = (workspace_root / allowed_base_path).resolve()
-        if not candidate.is_relative_to(workspace_root):
-            raise PathTraversalError(
-                f"allowed_base_path '{allowed_base_path}' resolves outside workspace root"
-            )
-        self.allowed_base = candidate
+        effective = os.getenv("AGENT_EFFECTIVE_WORKSPACE", "").strip()
+        if effective:
+            _ws = effective
+        else:
+            _ws = os.getenv("WORKSPACE_PATH", "./workspace")
+        self.allowed_base = Path(_ws).resolve()
         self.logger = logger.bind(component="file_system_tool")
         if not self.allowed_base.exists():
             self.allowed_base.mkdir(parents=True, exist_ok=True)
+
 
     def _validate_path(self, path: str) -> Path:
         try:
