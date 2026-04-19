@@ -1,7 +1,7 @@
 import os
 import re
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Optional, List, AsyncIterator, Callable
 from pathlib import Path
 import yaml
@@ -25,7 +25,7 @@ class ModelSwitchEvent:
     to_model: str
     reason: str          # "load_timeout" | "load_failed" | "circuit_open" | "reload_exhausted"
     task_id: Optional[str] = None
-    timestamp: datetime = field(default_factory=datetime.utcnow)
+    timestamp: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
 
 
 class ModelRouter:
@@ -290,6 +290,7 @@ class ModelRouter:
         _fallback_chain: Optional[list] = None,
         timeout: float = 600.0,
         enable_thinking: bool | None = None,
+        system_prompt: Optional[str] = None,
     ) -> str:
         """Generate a completion.
 
@@ -316,11 +317,12 @@ class ModelRouter:
                     result = await self.ollama.generate(
                         prompt,
                         config.name,
+                        system_prompt=system_prompt,
                         enable_thinking=effective_thinking,
                         timeout=timeout,
                     )
                 else:
-                    result = await self.cloud.generate(prompt, config)
+                    result = await self.cloud.generate(prompt, config, system_prompt=system_prompt)
 
                 self.cost_tracker.track_usage(config, prompt, result)
                 self.health_checker.record_success(config.name)
@@ -368,10 +370,10 @@ class ModelRouter:
                     exclude=config.name,
                     reason="load_timeout" if config.provider == "lmstudio" else "reload_exhausted",
                     chain=_fallback_chain,
-                    max_retries=max_retries,
                     timeout=timeout,
                     enable_thinking=enable_thinking,
                     original_error=e,
+                    system_prompt=system_prompt,
                 )
 
             except RateLimitExceeded as e:
@@ -392,10 +394,10 @@ class ModelRouter:
                         exclude=config.name,
                         reason="circuit_open",
                         chain=_fallback_chain,
-                        max_retries=max_retries,
                         timeout=timeout,
                         enable_thinking=enable_thinking,
                         original_error=None,
+                        system_prompt=system_prompt,
                     )
                 raise
 
@@ -416,6 +418,7 @@ class ModelRouter:
                         timeout=timeout,
                         enable_thinking=enable_thinking,
                         original_error=e,
+                        system_prompt=system_prompt,
                     )
                 raise LLMError(f"OpenRouter model {config.name!r} is rate-limited and no fallback available") from e
 
@@ -437,6 +440,7 @@ class ModelRouter:
                         timeout=timeout,
                         enable_thinking=enable_thinking,
                         original_error=e,
+                        system_prompt=system_prompt,
                     )
 
                 self.logger.error(
@@ -465,6 +469,7 @@ class ModelRouter:
         timeout: float,
         enable_thinking: Optional[bool],
         original_error: Optional[Exception],
+        system_prompt: Optional[str] = None,
     ) -> str:
         """Try each model in the fallback chain in order.
 
@@ -503,24 +508,25 @@ class ModelRouter:
             prompt,
             fallback,
             max_retries=max_retries,
-            _is_fallback=True,
             _fallback_chain=remaining_chain,
             timeout=timeout,
             enable_thinking=enable_thinking,
+            system_prompt=system_prompt,
         )
 
     async def generate_stream(
         self,
         prompt: str,
         config: ModelConfig,
+        system_prompt: Optional[str] = None,
     ) -> AsyncIterator[str]:
         await self.rate_limiter.acquire(config.name)
 
         if config.type == "local":
-            async for chunk in self.ollama.stream_generate(prompt, config.name):
+            async for chunk in self.ollama.stream_generate(prompt, config.name, system_prompt):
                 yield chunk
         else:
-            async for chunk in self.cloud.stream_generate(prompt, config):
+            async for chunk in self.cloud.stream_generate(prompt, config, system_prompt):
                 yield chunk
 
     async def health_check(self, config: ModelConfig) -> bool:

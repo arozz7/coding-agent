@@ -1,5 +1,5 @@
 import httpx
-from typing import AsyncIterator, TYPE_CHECKING
+from typing import AsyncIterator, TYPE_CHECKING, Optional
 import json
 import structlog
 
@@ -35,29 +35,29 @@ class CloudAPIClient:
             return "openai"
         return "openai"  # default to OpenAI-compatible for unknown endpoints
 
-    async def generate(self, prompt: str, config: "ModelConfig") -> str:
+    async def generate(self, prompt: str, config: "ModelConfig", system_prompt: Optional[str] = None) -> str:
         kind = self._endpoint_type(config)
         if kind == "anthropic":
-            return await self._anthropic_generate(prompt, config)
+            return await self._anthropic_generate(prompt, config, system_prompt)
         if kind == "openrouter":
-            return await self._openrouter_generate(prompt, config)
-        return await self._openai_generate(prompt, config)
+            return await self._openrouter_generate(prompt, config, system_prompt)
+        return await self._openai_generate(prompt, config, system_prompt)
 
     async def stream_generate(
-        self, prompt: str, config: "ModelConfig"
+        self, prompt: str, config: "ModelConfig", system_prompt: Optional[str] = None
     ) -> AsyncIterator[str]:
         kind = self._endpoint_type(config)
         if kind == "anthropic":
-            async for chunk in self._anthropic_stream(prompt, config):
+            async for chunk in self._anthropic_stream(prompt, config, system_prompt):
                 yield chunk
         elif kind == "openrouter":
-            async for chunk in self._openrouter_stream(prompt, config):
+            async for chunk in self._openrouter_stream(prompt, config, system_prompt):
                 yield chunk
         else:
-            async for chunk in self._openai_stream(prompt, config):
+            async for chunk in self._openai_stream(prompt, config, system_prompt):
                 yield chunk
 
-    async def _anthropic_generate(self, prompt: str, config: "ModelConfig") -> str:
+    async def _anthropic_generate(self, prompt: str, config: "ModelConfig", system_prompt: Optional[str]) -> str:
         headers = {
             "x-api-key": config.api_key or "",
             "anthropic-version": "2023-06-01",
@@ -68,6 +68,8 @@ class CloudAPIClient:
             "max_tokens": 4096,
             "messages": [{"role": "user", "content": prompt}],
         }
+        if system_prompt:
+            payload["system"] = system_prompt
 
         async with httpx.AsyncClient(timeout=120.0) as client:
             response = await client.post(
@@ -80,7 +82,7 @@ class CloudAPIClient:
             return data.get("content", [{}])[0].get("text", "")
 
     async def _anthropic_stream(
-        self, prompt: str, config: "ModelConfig"
+        self, prompt: str, config: "ModelConfig", system_prompt: Optional[str]
     ) -> AsyncIterator[str]:
         headers = {
             "x-api-key": config.api_key or "",
@@ -93,6 +95,8 @@ class CloudAPIClient:
             "messages": [{"role": "user", "content": prompt}],
             "stream": True,
         }
+        if system_prompt:
+            payload["system"] = system_prompt
 
         async with httpx.AsyncClient(timeout=120.0) as client:
             async with client.stream(
@@ -111,14 +115,19 @@ class CloudAPIClient:
                         elif data.get("type") == "message_stop":
                             break
 
-    async def _openai_generate(self, prompt: str, config: "ModelConfig") -> str:
+    async def _openai_generate(self, prompt: str, config: "ModelConfig", system_prompt: Optional[str]) -> str:
         headers = {
             "Authorization": f"Bearer {config.api_key or ''}",
             "content-type": "application/json",
         }
+        messages = []
+        if system_prompt:
+            messages.append({"role": "system", "content": system_prompt})
+        messages.append({"role": "user", "content": prompt})
+
         payload = {
             "model": config.name,
-            "messages": [{"role": "user", "content": prompt}],
+            "messages": messages,
         }
 
         async with httpx.AsyncClient(timeout=120.0) as client:
@@ -132,15 +141,20 @@ class CloudAPIClient:
             return data["choices"][0]["message"]["content"]
 
     async def _openai_stream(
-        self, prompt: str, config: "ModelConfig"
+        self, prompt: str, config: "ModelConfig", system_prompt: Optional[str]
     ) -> AsyncIterator[str]:
         headers = {
             "Authorization": f"Bearer {config.api_key or ''}",
             "content-type": "application/json",
         }
+        messages = []
+        if system_prompt:
+            messages.append({"role": "system", "content": system_prompt})
+        messages.append({"role": "user", "content": prompt})
+
         payload = {
             "model": config.name,
-            "messages": [{"role": "user", "content": prompt}],
+            "messages": messages,
             "stream": True,
         }
 
@@ -162,16 +176,21 @@ class CloudAPIClient:
                         ):
                             yield content
 
-    async def _openrouter_generate(self, prompt: str, config: "ModelConfig") -> str:
+    async def _openrouter_generate(self, prompt: str, config: "ModelConfig", system_prompt: Optional[str]) -> str:
         headers = {
             "Authorization": f"Bearer {config.api_key or ''}",
             "HTTP-Referer": _OPENROUTER_REFERER,
             "X-Title": _OPENROUTER_TITLE,
             "content-type": "application/json",
         }
+        messages = []
+        if system_prompt:
+            messages.append({"role": "system", "content": system_prompt})
+        messages.append({"role": "user", "content": prompt})
+
         payload = {
             "model": config.name,
-            "messages": [{"role": "user", "content": prompt}],
+            "messages": messages,
         }
 
         async with httpx.AsyncClient(timeout=120.0) as client:
@@ -188,7 +207,7 @@ class CloudAPIClient:
             return data["choices"][0]["message"]["content"]
 
     async def _openrouter_stream(
-        self, prompt: str, config: "ModelConfig"
+        self, prompt: str, config: "ModelConfig", system_prompt: Optional[str]
     ) -> AsyncIterator[str]:
         headers = {
             "Authorization": f"Bearer {config.api_key or ''}",
@@ -196,9 +215,14 @@ class CloudAPIClient:
             "X-Title": _OPENROUTER_TITLE,
             "content-type": "application/json",
         }
+        messages = []
+        if system_prompt:
+            messages.append({"role": "system", "content": system_prompt})
+        messages.append({"role": "user", "content": prompt})
+
         payload = {
             "model": config.name,
-            "messages": [{"role": "user", "content": prompt}],
+            "messages": messages,
             "stream": True,
         }
 

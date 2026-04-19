@@ -1,8 +1,11 @@
 import subprocess
 import json
+import os
 from pathlib import Path
 from typing import Optional, List, Dict
 import structlog
+
+from agent.security.paths import PathTraversalError
 
 logger = structlog.get_logger()
 
@@ -12,10 +15,18 @@ class TestRunnerError(Exception):
 
 
 class PytestTool:
-    def __init__(self, project_root: str):
-        # project_root comes from WORKSPACE_PATH env var / server config, not user HTTP input.
-        self.project_root = Path(project_root).resolve()  # lgtm[py/path-injection]
+    def __init__(self, project_root: str):  # noqa: ARG002 — kept for API compat
+        # Read workspace from trusted env vars, never from the caller-supplied arg.
+        # This is the GitTool pattern: the HTTP-tainted parameter is intentionally
+        # ignored so it never flows into any path operation.
+        effective = os.getenv("AGENT_EFFECTIVE_WORKSPACE", "").strip()
+        if effective:
+            _ws = effective
+        else:
+            _ws = os.getenv("WORKSPACE_PATH", "./workspace")
+        self.project_root = Path(_ws).resolve()
         self.logger = logger.bind(component="pytest_tool")
+
 
     def _run_pytest(self, args: List[str], capture_output: bool = True) -> subprocess.CompletedProcess:
         cmd = ["pytest"] + args

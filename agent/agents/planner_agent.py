@@ -21,7 +21,12 @@ import structlog
 logger = structlog.get_logger()
 
 # Agent types the orchestrator can route to
-VALID_AGENT_TYPES = frozenset({"develop", "research", "test", "review", "architect", "chat"})
+VALID_AGENT_TYPES = frozenset({
+    "develop", "research", "test", "review", "architect", "chat",
+    "mapper",      # codebase mapper — produces ARCHITECTURE.md / STACK.md
+    "security",    # red-team security audit
+    "documenter",  # documentation writer
+})
 
 # Matches a JSON array in the LLM response even if wrapped in prose/markdown
 _JSON_ARRAY_RE = re.compile(r'\[[\s\S]*?\]', re.DOTALL)
@@ -50,32 +55,40 @@ class PlannerAgent:
             return self._fallback_plan(objective, task_type)
 
         strategy_hint = self._strategy_hint(task_type)
-        prompt = (
-            "You are a task planning assistant for an autonomous coding agent.\n\n"
-            "Break the following objective into 3–7 concrete, ordered tasks.\n"
+        system_prompt = (
+            "You are an expert task planning assistant for an autonomous coding agent.\n\n"
+            "Break the following objective into 5–8 concrete, ordered tasks.\n"
             "Each task must be small enough that a single agent call can complete it.\n"
             "Assign the correct agent_type to each task.\n\n"
             "Valid agent_type values:\n"
-            "- develop:   write, run, fix, or debug code\n"
-            "- research:  search the web, read files, investigate codebase\n"
-            "- test:      write or run tests\n"
-            "- review:    code review or security audit\n"
-            "- architect: system design or ADR\n"
-            "- chat:      explain or answer questions\n\n"
+            "- mapper:     map project structure → ARCHITECTURE.md + STACK.md (use as first step for unfamiliar projects)\n"
+            "- research:   search the web, read files, investigate codebase (read-only)\n"
+            "- develop:    write, run, fix, or debug code\n"
+            "- test:       write or run tests\n"
+            "- review:     code review or quality check\n"
+            "- security:   adversarial security audit (OWASP, secrets, injection risks)\n"
+            "- documenter: write READMEs, changelogs, or inline documentation\n"
+            "- architect:  system design or ADR\n"
+            "- chat:       explain or answer questions"
+        )
+
+        prompt = (
             f"{strategy_hint}\n"
             f"Objective: {objective}\n\n"
             f"{f'Context: {context}' if context else ''}\n\n"
             "Return ONLY a JSON array — no prose, no markdown fences. Example:\n"
             '[\n'
-            '  {"description": "Read package.json and note the start script", "agent_type": "develop"},\n'
-            '  {"description": "Run npm start to capture the current error", "agent_type": "develop"},\n'
-            '  {"description": "Fix the identified error in src/index.js", "agent_type": "develop"},\n'
-            '  {"description": "Run npm start again to verify the fix", "agent_type": "develop"}\n'
+            '  {"description": "Read package.json, tsconfig.json, and src/ layout to understand the project. No code changes.", "agent_type": "research"},\n'
+            '  {"description": "Run `npm start` and capture the full error output. Do NOT fix anything — only run and report.", "agent_type": "develop"},\n'
+            '  {"description": "Read the source files referenced in the error output to understand what needs changing.", "agent_type": "develop"},\n'
+            '  {"description": "Apply all code fixes using EDIT: blocks to resolve the errors found in the previous task.", "agent_type": "develop"},\n'
+            '  {"description": "Run `npm run build` to compile and check for type errors. Fix any compile errors found.", "agent_type": "develop"},\n'
+            '  {"description": "Run `npm start` again to confirm the application launches cleanly without errors.", "agent_type": "develop"}\n'
             ']'
         )
 
         try:
-            raw = await self.model_router.generate(prompt, model)
+            raw = await self.model_router.generate(prompt, model, system_prompt=system_prompt)
             tasks = self._parse_task_list(raw)
             if tasks:
                 self.logger.info(
@@ -137,11 +150,12 @@ class PlannerAgent:
         if task_type in ("sdlc", "develop"):
             return (
                 "Strategy for development/debugging objectives:\n"
-                "1. A 'develop' task to understand the project (read files, check structure)\n"
-                "2. A 'develop' task to make the required code changes\n"
-                "3. A 'develop' task to run the project and capture output/errors\n"
-                "4. A 'develop' task to fix any errors found (omit if step 3 passes)\n"
-                "5. A 'develop' task to verify the final state\n"
+                "1. A 'mapper' task to map the project structure (produces ARCHITECTURE.md + STACK.md). Skip if ARCHITECTURE.md already exists.\n"
+                "2. A 'research' task to read key source files identified by the mapper. No code changes.\n"
+                "3. A 'develop' task to run the project entry command (npm start / python app.py / cargo run). Capture the full error output. Do NOT fix anything — only run and report.\n"
+                "4. A 'develop' task to apply all code fixes using REPLACE: blocks (preferred) or EDIT: blocks. Fix every error identified in step 3.\n"
+                "5. A 'develop' task to run the build command (npm run build / tsc / cargo build) to compile and verify there are no remaining type or compile errors. Fix any found.\n"
+                "6. A 'develop' task to run the project entry command again to confirm it starts cleanly. Report success or list any remaining errors.\n"
             )
         return ""
 

@@ -1,5 +1,5 @@
 from enum import Enum
-from datetime import datetime, timedelta
+from datetime import datetime, timezone, timedelta
 from typing import Optional
 import time
 import structlog
@@ -94,7 +94,7 @@ class CircuitBreaker:
     
     def _on_failure(self) -> None:
         self._failure_count += 1
-        self._last_failure_time = datetime.utcnow()
+        self._last_failure_time = datetime.now(timezone.utc)
         
         if self._state == CircuitState.HALF_OPEN:
             self._state = CircuitState.OPEN

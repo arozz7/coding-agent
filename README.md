@@ -9,7 +9,11 @@ An autonomous coding agent with LLM integration, multi-agent orchestration, SDLC
 - **Agentic Task Manager** — Objectives decomposed into ordered task lists; agents execute sequentially, can add tasks dynamically, wiki knowledge persists between subtasks
 - **SDLC Pipeline** — Full plan → build → test → debug → run → verify workflow
 - **Autonomous Run & Debug** — Agent runs shell commands, reads errors, fixes code, re-runs automatically; configurable iteration limit (default 50, set `MAX_FIX_ITERATIONS` in `.env`)
-- **Multi-Agent Routing** — Tasks routed to the right agent automatically: developer, researcher, planner, tester, reviewer, architect, chat
+- **Multi-Agent Routing** — Tasks routed to the right agent automatically: developer, researcher, mapper, planner, tester, reviewer, security, documenter, architect, chat
+- **Plan-Review-Plan Loop** — After the planner decomposes an objective, a dedicated `PlanReviewerAgent` critiques the task list (wrong agent types, missing steps, bad ordering) and returns an improved plan before any code runs
+- **Anchor-and-Patch Edits** — Fix loop shows files with line numbers and requests `REPLACE: file.ts 45-47` blocks; the system splices by line index — no old-text matching, no "text not found" failures
+- **Agent Chains** — Declarative `agent-chain.yaml` pipelines sequence multiple agents with `$INPUT`/`$ORIGINAL` passing; 6 built-in chains (`plan-build-review`, `full-review`, `scout-flow`, `plan-review-plan`, `secure-build`, `plan-build`); `!chain <name> <task>` in Discord
+- **Prompt Architecture** — Agents utilize dedicated system prompts isolated from the active user payload, optimizing context caching and reinforcing strict adherence to internal tool syntaxes
 - **Iterative Research** — Research agent decomposes queries into sub-questions, runs parallel web searches, identifies gaps, and synthesises a structured report; fast-path for local codebase queries
 - **Context Bridge** — Monitors token budget; at 82 % generates a structured handover and continues in a fresh session silently; Discord notifies at 75 %
 - **LM Studio Integration** — Live model state from `/api/v0/models`; discovers downloaded-but-unconfigured models; per-call thinking mode control; **programmatic load/unload** via `/api/v1/models/load` and `/api/v1/models/unload`
@@ -18,7 +22,12 @@ An autonomous coding agent with LLM integration, multi-agent orchestration, SDLC
 - **Model Switch Notifications** — Discord bot alerts when the router falls back from a local to a remote model mid-task (inline during task loops; background poll for out-of-job switches via `BOT_STATUS_CHANNEL_ID`)
 - **Interactive CLI Testing** — `interactive_shell` tool spawns any process and drives it via `expect`/`send`/`wait` scripts (REPLs, text adventures, wizard prompts); cross-platform asyncio subprocess
 - **Browser Interaction** — `browser_interact` tool drives Playwright (Chromium) to `navigate`, `click`, `fill`, `press`, `screenshot`, and read `text` on any web app; cross-platform (Windows/macOS/Linux)
+- **Surgical Multi-Hunk Edits** — `EDIT:` block syntax for precise, multi-region file updates; matches against original file content, rejects overlapping edits; `REPLACE: file.ts 10-14` line-number blocks used in fix loops for zero-mismatch patching
+- **Native Search Tools** — Python-native `find_files` (glob) and `grep_code` (regex) tools; cross-platform, sandboxed to workspace, and automatically skip noisy dirs like `node_modules` and `.git`
+- **Windows Process-Tree Recovery** — Supervisor and shell tools use `taskkill /F /T` on Windows to ensure timed-out child process trees (daemons, build servers) are fully purged
+- **CRLF & BOM Preservation** — Detects and preserves original line endings and Byte Order Marks during file writes, preventing silent file corruption in Windows or legacy environments
 - **Workspace Scoping** — `PROJECT_DIR` env var focuses all file operations on an active project subdirectory; no path double-nesting
+- **Security Layer** — Prompt injection detection blocks known jailbreak patterns before input reaches any LLM prompt; shell commands that reference absolute paths outside the workspace are rejected; optional `AGENT_API_KEY` header auth on all mutating API endpoints; SQLite session store uses WAL mode + `threading.RLock` for concurrent-access safety
 - **Agent Wiki Memory** — `.agent-wiki/` knowledge base compiled per task; later subtasks query earlier ones; index deduplication; `!skills` to inspect
 - **RAG Memory** — Codebase indexed in ChromaDB; retrieved context injected into every task
 - **Shell PATH Auto-Discovery** — Scans 15+ common install dirs (nvm, volta, Homebrew, Cargo…) so npm/node/git are found even when the API starts with a minimal PATH
@@ -58,6 +67,7 @@ WORKSPACE_PATH=J:\Projects\agent-workspace
 PROJECT_DIR=my-project                   # optional — scope agent to a subdirectory
 OPENROUTER_API_KEY=sk-or-...             # optional — enables cloud model fallback
 BOT_STATUS_CHANNEL_ID=123456789          # optional — channel for model-switch alerts
+AGENT_API_KEY=your-secret-key           # optional — enables X-API-Key auth on mutating endpoints
 ```
 
 **2. Edit `config/models.yaml`** to list your available models:
@@ -101,18 +111,18 @@ python -m api.discord_bot
 | `!ask <task>` | Submit a task — auto-classifies type, polls in background |
 | `!dev <task>` | Force develop path — bypasses classifier, guaranteed to run/fix/build |
 | `!research <task>` | Force research path — web search, codebase investigation, analysis; full report via `!result` |
-| `!continue [note]` | Resume the current debugging session with an optional note |
+| `!continue [job_id] [note]` | Resume the current debugging session. Passing `job_id` recovers state after a bot restart |
 
 ### Job Monitoring
 
 | Command | Description |
 |---------|-------------|
-| `!status` | Current job phase and elapsed time |
-| `!tasks` | Task plan with per-task status (✅ / 🔄 / ❌) |
-| `!result` | Full prose response from the last completed job |
-| `!files` | Files created or modified by the last task |
+| `!status [job_id]` | Current job phase and elapsed time. Pass `job_id` to recover state |
+| `!tasks [job_id]` | Task plan with per-task status (✅ / 🔄 / ❌) |
+| `!result [job_id]` | Full prose response from the last completed job |
+| `!files [job_id]` | Files created or modified by the last task |
 | `!jobs [n]` | List last N jobs (default 10) |
-| `!cancel` | Cancel the running job |
+| `!cancel [job_id]` | Cancel the running job |
 
 ### File Access
 
@@ -224,15 +234,18 @@ Environment variables:
 | `API_STARTUP_TIMEOUT` | `120` | Seconds to wait for `/health` on startup |
 | `RESTART_DELAY_SECS` | `3` | Seconds between stop and start during restart |
 | `BOT_PYTHON` | `sys.executable` | Python interpreter for the bot (set when bot uses a different venv) |
+| `STALE_JOB_THRESHOLD_SECS` | `2700` | Seconds before watchdog kills a stuck job (45 min deafult). Progress updates automatically reset the timer |
 
 ---
 
 ## REST API
 
+Mutating endpoints (`POST /task`, `POST /task/start`, `POST /task/stream`, `POST /workspace/project`) require an `X-API-Key` header when `AGENT_API_KEY` is set in `.env`. Read-only endpoints are always unauthenticated.
+
 | Method | Path | Description |
 |--------|------|-------------|
-| `POST` | `/task` | Submit a task synchronously |
-| `POST` | `/task/start` | Submit a background task → returns `job_id` |
+| `POST` | `/task` | Submit a task synchronously *(auth required if AGENT_API_KEY set)* |
+| `POST` | `/task/start` | Submit a background task → returns `job_id` *(auth required if AGENT_API_KEY set)* |
 | `GET` | `/task/{job_id}` | Poll job status + summary |
 | `GET` | `/task/{job_id}/result` | Full agent response |
 | `GET` | `/task/{job_id}/tasks` | Task plan with per-task status |
@@ -279,9 +292,14 @@ coding-agent/
 │   │   ├── skill_executor.py      # Pre/post skill execution (wiki-query, wiki-compile)
 │   │   ├── skill_loader.py        # Lazy skill content loading
 │   │   └── wiki_manager.py        # .agent-wiki/ read/write, index upsert, lint
+│   ├── security/
+│   │   ├── paths.py                   # resolve_within() — canonical path-containment validator (CodeQL-safe)
+│   │   └── prompt_guard.py            # guard_task() — strips control chars, detects 12 injection patterns
 │   └── tools/
-│       ├── shell_tool.py              # Shell execution, PATH auto-discovery, Windows .cmd fix
-│       ├── file_system_tool.py        # File CRUD
+│       ├── shell_tool.py              # Shell execution, PATH auto-discovery, workspace path containment, process-tree kill
+│       ├── file_system_tool.py        # File CRUD, CRLF preservation
+│       ├── edit_tool.py               # Surgical multi-hunk patched edits
+│       ├── search_tool.py             # Native find_files and grep_code
 │       ├── git_tool.py                # Git operations
 │       ├── browser_tool.py            # Playwright screenshots, server polling, browser interact
 │       ├── interactive_shell_tool.py  # asyncio expect/send driver for CLI apps

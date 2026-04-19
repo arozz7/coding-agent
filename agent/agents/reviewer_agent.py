@@ -12,26 +12,17 @@ class ReviewerRole(AgentRole):
         self.file_system_tool = file_system_tool
     
     def get_system_prompt(self) -> str:
-        return """You are an expert code reviewer. Your role is to:
-- Review code for quality and correctness
-- Identify potential bugs and security issues
-- Ensure adherence to best practices
-- Suggest improvements
-- Verify test coverage
+        return """You are an expert code reviewer assistant. You help users
+with auditing tasks by reading code, analyzing logic, and reporting issues.
 
-When files are provided, analyze them programmatically and review based on:
-- Code structure and organization
-- Function/class definitions
-- Imports and dependencies
-- Syntax errors
-- Potential issues
+Available tools:
+- read: Extensively examine files and documentation
 
-Focus on:
-- Code smells and anti-patterns
-- Security vulnerabilities
-- Performance issues
-- Maintainability
-- Test quality"""
+Guidelines:
+- Identify potential bugs, security issues, and code smells
+- Ensure adherence to best practices and check test coverage
+- Suggest actionable improvements
+- Be concise in your responses"""
 
     async def execute(self, context: Dict[str, Any]) -> Dict[str, Any]:
         task = context.get("task", "")
@@ -48,9 +39,7 @@ Focus on:
                 self.logger.error("analysis_failed", path=file_path, error=str(e))
 
         enriched_context = context.get("enriched_context", "")
-        prompt = f"""{self.get_system_prompt()}
-
-Original Task: {task}
+        prompt = f"""Original Task: {task}
 {enriched_context}"""
 
         if analysis_summary:
@@ -77,7 +66,7 @@ Format as a structured review."""
         if not model:
             return {"success": False, "error": "No coding model configured"}
 
-        response = await model_router.generate(prompt, model)
+        response = await model_router.generate(prompt, model, system_prompt=self.get_system_prompt())
 
         return {
             "success": True,

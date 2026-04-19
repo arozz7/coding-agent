@@ -1,7 +1,7 @@
 import asyncio
 from typing import Dict, Optional
 from dataclasses import dataclass
-from datetime import datetime, timedelta
+from datetime import datetime, timezone, timedelta
 from collections import defaultdict
 import structlog
 
@@ -22,7 +22,7 @@ class TokenBucket:
     capacity: float
 
     def _refill(self) -> None:
-        now = datetime.utcnow()
+        now = datetime.now(timezone.utc)
         elapsed = (now - self.last_refill).total_seconds()
         self.tokens = min(self.capacity, self.tokens + elapsed * self.refill_rate)
         self.last_refill = now
@@ -55,7 +55,7 @@ class RateLimiter:
         self.buckets[model] = TokenBucket(
             tokens=capacity,
             refill_rate=refill_rate,
-            last_refill=datetime.utcnow(),
+            last_refill=datetime.now(timezone.utc),
             capacity=capacity,
         )
         self.logger.info("rate_limit_configured", model=model, rpm=rpm)

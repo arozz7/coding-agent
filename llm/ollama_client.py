@@ -45,6 +45,7 @@ class OllamaClient:
         self,
         prompt: str,
         model: str,
+        system_prompt: Optional[str] = None,
         enable_thinking: Optional[bool] = None,
         timeout: float = 600.0,
     ) -> str:
@@ -80,7 +81,7 @@ class OllamaClient:
         # hangs.  asyncio.wait_for cancels the coroutine at the deadline regardless.
         try:
             return await asyncio.wait_for(
-                self._do_generate(url, model, prompt, enable_thinking, timeout),
+                self._do_generate(url, model, prompt, system_prompt, enable_thinking, timeout),
                 timeout=timeout,
             )
         except asyncio.TimeoutError:
@@ -92,6 +93,7 @@ class OllamaClient:
         url: str,
         model: str,
         prompt: str,
+        system_prompt: Optional[str],
         enable_thinking: Optional[bool],
         timeout: float,
     ) -> str:
@@ -109,9 +111,12 @@ class OllamaClient:
         """
         payload: dict[str, Any] = {
             "model": model,
-            "messages": [{"role": "user", "content": prompt}],
+            "messages": [],
             "max_tokens": 8192,
         }
+        if system_prompt:
+            payload["messages"].append({"role": "system", "content": system_prompt})
+        payload["messages"].append({"role": "user", "content": prompt})
         if enable_thinking is False:
             # LM Studio / vLLM Qwen3 extension — disables the <think> phase
             # so the model always returns a direct content response.
@@ -180,15 +185,20 @@ class OllamaClient:
         return content
 
     async def stream_generate(
-        self, prompt: str, model: str
+        self, prompt: str, model: str, system_prompt: Optional[str] = None
     ) -> AsyncIterator[str]:
+        messages = []
+        if system_prompt:
+            messages.append({"role": "system", "content": system_prompt})
+        messages.append({"role": "user", "content": prompt})
+
         async with httpx.AsyncClient(timeout=600.0) as client:
             async with client.stream(
                 "POST",
                 self._get_chat_endpoint(),
                 json={
                     "model": model,
-                    "messages": [{"role": "user", "content": prompt}],
+                    "messages": messages,
                     "max_tokens": 8192,
                     "stream": True,
                 },
@@ -303,10 +313,10 @@ class OllamaClient:
         error.  Swallows all exceptions so callers never crash.
         """
         try:
-            async with httpx.AsyncClient(timeout=10.0) as client:
+            async with httpx.AsyncClient(timeout=300.0) as client:
                 r = await client.post(
                     f"{self.base_url}/api/v1/models/load",
-                    json={"identifier": identifier},
+                    json={"model": identifier},
                 )
                 accepted = r.status_code in (200, 201)
                 if accepted:
@@ -330,9 +340,16 @@ class OllamaClient:
         """
         try:
             async with httpx.AsyncClient(timeout=10.0) as client:
+                instance_id = identifier
+                list_r = await client.get(f"{self.base_url}/v1/models")
+                if list_r.status_code == 200:
+                    for m in list_r.json().get("data", []):
+                        if m.get("id") == identifier or m.get("root") == identifier or (m.get("id") and identifier in m.get("id")):
+                            instance_id = m.get("id")
+                            break
                 r = await client.post(
                     f"{self.base_url}/api/v1/models/unload",
-                    json={"identifier": identifier},
+                    json={"instance_id": instance_id},
                 )
                 accepted = r.status_code in (200, 201)
                 if accepted:

@@ -1,7 +1,7 @@
 from enum import Enum
 from typing import Optional, Dict, Any, List
 from dataclasses import dataclass
-from datetime import datetime, timedelta
+from datetime import datetime, timezone, timedelta
 import time
 import structlog
 import httpx
@@ -76,7 +76,7 @@ class OllamaModelManager:
                 model_name=model_name,
                 status=ModelStatus.AVAILABLE,
                 is_available=True,
-                last_checked=datetime.utcnow(),
+                last_checked=datetime.now(timezone.utc),
                 latency_ms=round(latency, 2),
                 metadata=result,
             )
@@ -90,7 +90,7 @@ class OllamaModelManager:
                     model_name=model_name,
                     status=ModelStatus.OFFLOADED,
                     is_available=False,
-                    last_checked=datetime.utcnow(),
+                    last_checked=datetime.now(timezone.utc),
                     latency_ms=round(latency, 2),
                     error_message=f"Model not found - may be offloaded: {e.response.status_code}",
                 )
@@ -99,7 +99,7 @@ class OllamaModelManager:
                 model_name=model_name,
                 status=ModelStatus.ERROR,
                 is_available=False,
-                last_checked=datetime.utcnow(),
+                last_checked=datetime.now(timezone.utc),
                 latency_ms=round(latency, 2),
                 error_message=str(e),
             )
@@ -111,7 +111,7 @@ class OllamaModelManager:
                 model_name=model_name,
                 status=ModelStatus.UNKNOWN,
                 is_available=False,
-                last_checked=datetime.utcnow(),
+                last_checked=datetime.now(timezone.utc),
                 latency_ms=round(latency, 2),
                 error_message=str(e),
             )
@@ -137,7 +137,7 @@ class OllamaModelManager:
         return {
             "server_available": is_running,
             "endpoint": self.endpoint,
-            "timestamp": datetime.utcnow().isoformat(),
+            "timestamp": datetime.now(timezone.utc).isoformat(),
         }
 
 
@@ -168,12 +168,12 @@ class CloudRateLimitHandler:
         return None
     
     def register_rate_limit(self, model_name: str, retry_after: int) -> None:
-        reset_time = datetime.utcnow() + timedelta(seconds=retry_after)
+        reset_time = datetime.now(timezone.utc) + timedelta(seconds=retry_after)
         
         self._rate_limits[model_name] = {
             "reset_time": reset_time,
             "retry_after": retry_after,
-            "last_updated": datetime.utcnow(),
+            "last_updated": datetime.now(timezone.utc),
         }
         
         self.logger.warning(
@@ -190,11 +190,11 @@ class CloudRateLimitHandler:
         rate_limit_info = self._rate_limits[model_name]
         reset_time = rate_limit_info["reset_time"]
         
-        if datetime.utcnow() >= reset_time:
+        if datetime.now(timezone.utc) >= reset_time:
             del self._rate_limits[model_name]
             return None
         
-        remaining = (reset_time - datetime.utcnow()).total_seconds()
+        remaining = (reset_time - datetime.now(timezone.utc)).total_seconds()
         return int(remaining)
     
     def is_rate_limited(self, model_name: str) -> bool:
@@ -202,7 +202,7 @@ class CloudRateLimitHandler:
         return wait_time is not None and wait_time > 0
     
     def clear_expired(self) -> int:
-        now = datetime.utcnow()
+        now = datetime.now(timezone.utc)
         expired = [
             name for name, info in self._rate_limits.items()
             if now >= info["reset_time"]
@@ -237,7 +237,7 @@ class ModelResilienceManager:
     async def check_model_health(self, model_name: str, force_refresh: bool = False) -> ModelHealthStatus:
         if not force_refresh and model_name in self._model_status_cache:
             cached = self._model_status_cache[model_name]
-            age = (datetime.utcnow() - cached.last_checked).total_seconds()
+            age = (datetime.now(timezone.utc) - cached.last_checked).total_seconds()
             if age < self._cache_ttl_seconds:
                 return cached
 
@@ -320,7 +320,7 @@ class ModelResilienceManager:
                 model_name=model_name,
                 status=ModelStatus.OFFLOADED,
                 is_available=False,
-                last_checked=datetime.utcnow(),
+                last_checked=datetime.now(timezone.utc),
                 error_message=str(error),
             )
             

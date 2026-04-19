@@ -12,38 +12,22 @@ class ArchitectRole(AgentRole):
         self.code_analyzer = code_analyzer
     
     def get_system_prompt(self) -> str:
-        return """You are an expert software architect. Your role is to:
-- Analyze requirements and design scalable, maintainable systems
-- Choose appropriate patterns and technologies
-- Consider trade-offs and document decisions
-- Provide clear architectural guidance
-- Write ADRs (Architecture Decision Records) when needed
+        return """You are an expert architecture assistant. You help users
+with system design tasks by analyzing requirements, designing architecture,
+and writing ADRs (Architecture Decision Records).
 
-When existing codebase files are provided, analyze them to understand current architecture.
-Write architecture specs/recommendations using format:
-FILE: docs/adr/ADR-XXX.md
-```markdown
-# ADR: Title
+Available tools:
+- read: Extensively examine codebase files and workspace
+- write: Create or overwrite Architecture Documentation using the FILE: syntax
 
-## Status
-Proposed|Accepted|Deprecated
-
-## Context
-...
-
-## Decision
-...
-
-## Consequences
-...
-```
-
-Focus on:
-- Clean architecture and separation of concerns
-- SOLID principles
-- API design
-- Data modeling
-- Security considerations"""
+Guidelines:
+- Use the exact FILE: formatting block to write ADRs:
+  FILE: docs/adr/ADR-XXX.md
+  ```markdown
+  content
+  ```
+- Focus on clean architecture, SOLID principles, and data modeling
+- Be concise in your responses"""
 
     def _extract_file_writes(self, response: str) -> List[tuple]:
         import re
@@ -64,9 +48,7 @@ Focus on:
                 self.logger.warning("workspace_list_failed", error=str(e))
 
         enriched_context = context.get("enriched_context", "")
-        prompt = f"""{self.get_system_prompt()}
-
-Task: {task}
+        prompt = f"""Task: {task}
 {workspace_context}{enriched_context}
 
 Provide a detailed architectural design with:
@@ -91,7 +73,7 @@ FILE: docs/adr/ADR-XXX.md
         if not model:
             return {"success": False, "error": "No coding model configured"}
 
-        response = await model_router.generate(prompt, model)
+        response = await model_router.generate(prompt, model, system_prompt=self.get_system_prompt())
 
         files_created = []
         if tool_executor:

@@ -1,19 +1,30 @@
 import subprocess
 import asyncio
+import os
 import time
 from pathlib import Path
 from typing import Any, Optional
 import structlog
 
+from agent.security.paths import PathTraversalError
+
 logger = structlog.get_logger()
 
 
 class BrowserTool:
-    def __init__(self, workspace_path: str):
-        # workspace_path comes from server config or a pre-validated path; not raw user HTTP input.
-        self.workspace = Path(workspace_path).resolve()  # lgtm[py/path-injection]
+    def __init__(self, workspace_path: str):  # noqa: ARG002 — kept for API compat
+        # Read workspace from trusted env vars, never from the caller-supplied arg.
+        # This is the GitTool pattern: the HTTP-tainted parameter is intentionally
+        # ignored so it never flows into any path operation.
+        effective = os.getenv("AGENT_EFFECTIVE_WORKSPACE", "").strip()
+        if effective:
+            _ws = effective
+        else:
+            _ws = os.getenv("WORKSPACE_PATH", "./workspace")
+        self.workspace = Path(_ws).resolve()
         self.process: Optional[subprocess.Popen] = None
         self.logger = logger.bind(component="browser_tool")
+
     
     async def start_dev_server(self, port: int = 8080, timeout: int = 30) -> dict:
         """Start the dev server and wait for it to be ready"""

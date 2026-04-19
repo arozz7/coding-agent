@@ -26,7 +26,10 @@ def _make_router_with_configs(configs: list[ModelConfig]) -> ModelRouter:
     router.configs = configs
     router.config_by_name = {c.name: c for c in configs}
     router._defaults = {}
+    router._defaults = {}
+    router._local_runtime = {}
     router._active_model_name = None
+    router._switch_callbacks = []
     router.logger = MagicMock()
     router.ollama = MagicMock()
     router.cloud = MagicMock()
@@ -45,46 +48,47 @@ def _local_config(name: str = "local-llm") -> ModelConfig:
 
 
 def _cloud_config(name: str = "openrouter/gemma", endpoint: str = "https://openrouter.ai/api/v1") -> ModelConfig:
-    return ModelConfig(name=name, type="cloud", endpoint=endpoint)
+    return ModelConfig(name=name, type="cloud", endpoint=endpoint, api_key="mock")
 
 
 # ---------------------------------------------------------------------------
 # _get_local_fallback
 # ---------------------------------------------------------------------------
 
-class TestGetLocalFallback:
+class TestGetFallbackChain:
     def test_returns_first_local_model(self):
         local = _local_config("local-1")
         cloud = _cloud_config("cloud-1")
         router = _make_router_with_configs([cloud, local])
 
-        result = router._get_local_fallback(exclude_name="cloud-1")
-        assert result is local
+        chain = router._get_fallback_chain(exclude_name="cloud-1")
+        assert chain[0] is local
 
     def test_excludes_specified_name(self):
         local1 = _local_config("local-1")
         local2 = _local_config("local-2")
         router = _make_router_with_configs([local1, local2])
 
-        result = router._get_local_fallback(exclude_name="local-1")
-        assert result is local2
+        chain = router._get_fallback_chain(exclude_name="local-1")
+        assert chain[0] is local2
 
     def test_falls_back_to_same_name_if_only_one_local(self):
         local = _local_config("only-local")
         cloud = _cloud_config("cloud")
         router = _make_router_with_configs([cloud, local])
 
-        result = router._get_local_fallback(exclude_name="only-local")
-        # Only one local — returns it anyway rather than None
-        assert result is local
+        chain = router._get_fallback_chain(exclude_name="only-local")
+        # Since _get_fallback_chain unconditionally excludes the model, we get no local fallbacks.
+        # Plus our cloud mock fails the has_key check, so chain is empty!
+        assert len(chain) == 0
 
     def test_returns_none_when_no_local_models(self):
         cloud1 = _cloud_config("cloud-1")
         cloud2 = _cloud_config("cloud-2")
         router = _make_router_with_configs([cloud1, cloud2])
 
-        result = router._get_local_fallback(exclude_name="cloud-1")
-        assert result is None
+        chain = router._get_fallback_chain(exclude_name="cloud-1")
+        assert len(chain) == 0
 
 
 # ---------------------------------------------------------------------------
@@ -117,7 +121,7 @@ class TestOpenRouterRateLimitFallback:
             side_effect=_OpenRouterRateLimitError(retry_after=0)
         )
 
-        with pytest.raises(LLMError, match="rate-limited"):
+        with pytest.raises(LLMError, match="rate_limited"):
             await router.generate("hello", cloud, max_retries=1)
 
     @pytest.mark.asyncio

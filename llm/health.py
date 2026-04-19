@@ -1,7 +1,7 @@
 import asyncio
 from dataclasses import dataclass
 from typing import Dict, Optional
-from datetime import datetime, timedelta
+from datetime import datetime, timezone, timedelta
 import structlog
 
 from .circuit_breaker import (
@@ -37,7 +37,7 @@ class HealthChecker:
 
     async def check(self, config) -> bool:
         model = config.name
-        start = datetime.utcnow()
+        start = datetime.now(timezone.utc)
         cb = self._cb_manager.get_or_create(model)
 
         try:
@@ -46,12 +46,12 @@ class HealthChecker:
             else:
                 available = await self.router.cloud.health_check(config.endpoint)
 
-            latency = (datetime.utcnow() - start).total_seconds() * 1000
+            latency = (datetime.now(timezone.utc) - start).total_seconds() * 1000
             self._record_success(model, latency)
             self.statuses[model] = HealthStatus(
                 model=model,
                 available=True,
-                last_check=datetime.utcnow(),
+                last_check=datetime.now(timezone.utc),
                 success_rate=self._calculate_success_rate(model),
                 avg_latency_ms=self._calculate_avg_latency(model),
                 consecutive_failures=0,
@@ -63,7 +63,7 @@ class HealthChecker:
             self.statuses[model] = HealthStatus(
                 model=model,
                 available=False,
-                last_check=datetime.utcnow(),
+                last_check=datetime.now(timezone.utc),
                 success_rate=self._calculate_success_rate(model),
                 avg_latency_ms=self._calculate_avg_latency(model),
                 consecutive_failures=cb._failure_count,
@@ -72,7 +72,7 @@ class HealthChecker:
             return False
 
     def _record_success(self, model: str, latency_ms: float) -> None:
-        now = datetime.utcnow()
+        now = datetime.now(timezone.utc)
         if model not in self.successes:
             self.successes[model] = []
         self.successes[model].append((now, latency_ms))
@@ -84,7 +84,7 @@ class HealthChecker:
         cb._on_success()
 
     def _record_failure(self, model: str) -> None:
-        now = datetime.utcnow()
+        now = datetime.now(timezone.utc)
         if model not in self.failures:
             self.failures[model] = []
         self.failures[model].append(now)

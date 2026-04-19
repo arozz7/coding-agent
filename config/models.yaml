@@ -1,4 +1,14 @@
 models:
+  - name: qwen3.6-35b-a3b
+    type: local
+    provider: lmstudio   # lmstudio | ollama | llama_cpp
+    # Set LM_STUDIO_URL in .env to override; falls back to localhost:1234
+    endpoint: ${LM_STUDIO_URL:-http://127.0.0.1:1234}
+    context_window: 262144
+    is_coding_optimized: true
+    recommended_for: [coding, code_review, test_generation, planning, research]
+    rate_limit_rpm: 120
+
   - name: qwen3.5-35b-a3b
     type: local
     provider: lmstudio   # lmstudio | ollama | llama_cpp
@@ -13,7 +23,7 @@ models:
     type: local
     provider: lmstudio
     endpoint: ${LM_STUDIO_URL:-http://127.0.0.1:1234}
-    context_window: 109148
+    context_window: 109999
     is_coding_optimized: true
     recommended_for: [coding, code_review, test_generation, planning, research]
     rate_limit_rpm: 120
@@ -92,7 +102,7 @@ rate_limiting:
   max_backoff_seconds: 60
 
 defaults:
-  coding_model: qwen3.5-35b-a3b
+  coding_model: qwen3.6-35b-a3b
   planning_model: google_gemma-4-31b-it
   fallback_model: openai/gpt-oss-120b:free
 

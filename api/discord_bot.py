@@ -237,6 +237,10 @@ class AgentClient:
     async def restart(self) -> dict:
         return await self._post("/restart", {}, timeout=10.0)
 
+    async def get_recent_jobs(self, limit: int = 10) -> dict:
+        """Return the most recent jobs ordered newest-first."""
+        return await self._get("/jobs", limit=limit)
+
     async def wait_until_reachable(self) -> None:
         """Poll /health until the API responds. Never gives up.
 
@@ -343,28 +347,82 @@ bot = DiscordAgentBot()
 # ---------------------------------------------------------------------------
 
 _PHASE_LABELS: dict[str, str] = {
-    "queued":        "Queued",
-    "pending":       "Queued",
-    "planning":      "Building plan",
-    "developing":    "Writing code",
-    "reviewing":     "Reviewing",
-    "testing":       "Running tests",
-    "designing":     "Designing architecture",
-    "researching":   "Researching codebase",
-    "thinking":      "Thinking",
-    "working":       "Working",
-    "complete":      "Finishing up",
+    "queued":          "Queued",
+    "pending":         "Queued",
+    "planning":        "Building plan",
+    "planning:review": "Reviewing plan…",
+    "developing":      "Writing code",
+    "reviewing":       "Reviewing",
+    "testing":         "Running tests",
+    "designing":       "Designing architecture",
+    "researching":     "Researching codebase",
+    "mapping":         "Mapping project structure",
+    "securing":        "Security audit",
+    "documenting":     "Writing docs",
+    "thinking":        "Thinking",
+    "working":         "Working",
+    "complete":        "Finishing up",
     # SDLC pipeline phases
-    "sdlc:planning":  "SDLC — Planning",
-    "sdlc:building":  "SDLC — Building",
-    "sdlc:testing":   "SDLC — Running tests",
-    "sdlc:debugging": "SDLC — Debugging",
-    "sdlc:running":   "SDLC — Starting app",
-    "sdlc:verifying": "SDLC — Verifying (screenshot)",
+    "sdlc:planning":   "SDLC — Planning",
+    "sdlc:building":   "SDLC — Building",
+    "sdlc:testing":    "SDLC — Running tests",
+    "sdlc:debugging":  "SDLC — Debugging",
+    "sdlc:running":    "SDLC — Starting app",
+    "sdlc:verifying":  "SDLC — Verifying (screenshot)",
 }
 
 
 _HEARTBEAT_INTERVAL = 60     # seconds between "still working…" edits when server is silent
+
+
+async def _resolve_last_job_id(
+    ctx: commands.Context,
+    explicit_job_id: Optional[str],
+    *,
+    require_done: bool = False,
+) -> Optional[str]:
+    """Return the best job_id to use for !files / !result / !status.
+
+    Priority:
+      1. Explicit ``job_id`` argument passed by the user.
+      2. In-memory ``bot.user_jobs[user_id]`` set when this bot session submitted
+         the job (lost on bot restart).
+      3. Fallback: query GET /jobs and return the most recently DONE job.
+         This recovers state transparently after a bot restart.
+
+    Returns ``None`` if no job can be resolved, and posts an error message
+    to Discord on behalf of the caller.
+    """
+    user_id = str(ctx.author.id)
+
+    # 1 & 2: explicit or in-memory
+    job_id = explicit_job_id or bot.user_jobs.get(user_id)
+    if job_id:
+        return job_id
+
+    # 3: API fallback — find the most recently completed job
+    try:
+        data = await bot.client.get_recent_jobs(limit=5)
+        jobs = data.get("jobs", [])
+        target_statuses = ("done",) if require_done else ("done", "failed", "running")
+        for job in jobs:  # already ordered newest-first
+            if job.get("status") in target_statuses:
+                recovered_id = job["job_id"]
+                # Re-hydrate the in-memory map so subsequent commands are fast.
+                bot.user_jobs[user_id] = recovered_id
+                await ctx.send(
+                    f"ℹ️ Bot was restarted — auto-recovered last job `{recovered_id}`. "
+                    f"Use `!jobs` to see all recent jobs."
+                )
+                return recovered_id
+    except Exception:
+        pass  # fall through to the not-found message
+
+    await ctx.send(
+        "No recent job found. Use `!ask <task>` to start one, "
+        "or pass an explicit job ID: `!files <job_id>`."
+    )
+    return None
 
 
 async def _safe_edit(msg: discord.Message, content: str) -> None:
@@ -445,12 +503,37 @@ async def _poll_job(ctx: commands.Context, status_msg: discord.Message, job_id: 
         job_status = job.get("status", "unknown")
         phase = job.get("phase", "")
 
-        # Task-loop phases: "task:N/M:description" or "planning:tasks"
-        if phase.startswith("task:"):
-            parts = phase.split(":", 2)
+        # Chain phases: "chain:<name>:step:N/M:agent" or "chain:<name>:complete"
+        if phase.startswith("chain:"):
+            parts = phase.split(":", 4)
+            chain_name = parts[1] if len(parts) > 1 else "?"
+            rest = parts[2] if len(parts) > 2 else ""
+            if rest == "complete":
+                label = f"Chain `{chain_name}` — complete"
+            elif rest == "starting":
+                label = f"Chain `{chain_name}` — starting"
+            elif rest == "step" and len(parts) >= 5:
+                step_progress = parts[3]
+                agent = parts[4]
+                label = f"Chain `{chain_name}` step {step_progress} [{agent}]"
+            else:
+                label = f"Chain `{chain_name}` — {rest}"
+
+        # Task-loop phases: "task:N/M:agent_type:description" (or legacy "task:N/M:description")
+        elif phase.startswith("task:"):
+            parts = phase.split(":", 3)
             progress = parts[1] if len(parts) > 1 else "?"
-            desc = parts[2][:40] if len(parts) > 2 else ""
-            label = f"Task {progress} — {desc}" if desc else f"Task {progress}"
+            if len(parts) >= 4:
+                # New format: task:N/M:agent_type:label
+                agent = parts[2]
+                desc = parts[3][:40]
+                label = f"Task {progress} [{agent}] — {desc}" if desc else f"Task {progress} [{agent}]"
+            elif len(parts) == 3:
+                # Legacy format: task:N/M:description
+                desc = parts[2][:40]
+                label = f"Task {progress} — {desc}" if desc else f"Task {progress}"
+            else:
+                label = f"Task {progress}"
         elif phase == "planning:tasks":
             label = "Planning tasks…"
         elif phase.startswith("sdlc:debugging:"):
@@ -622,24 +705,64 @@ async def research(ctx: commands.Context, *, task: str):
     await _submit_task(ctx, task, force_task_type="research")
 
 
+@bot.command(name="chains")
+async def list_chains(ctx: commands.Context):
+    """List all available agent chains defined in agent-chain.yaml."""
+    try:
+        resp = await bot.client._get("/chains")
+        chains = resp.get("chains", [])
+        if not chains:
+            await ctx.send("No chains available.")
+            return
+        lines = ["**Available chains** (`!chain <name> <task>`):"]
+        for c in chains:
+            lines.append(f"  `{c['name']}` — {c.get('description', '')}")
+        await ctx.send("\n".join(lines))
+    except Exception as exc:
+        await ctx.send(f"Could not fetch chains: {exc}")
+
+
+@bot.command(name="chain")
+async def run_chain(ctx: commands.Context, chain_name: str, *, task: str):
+    """Run a named agent chain.  Example: `!chain plan-build-review add auth to the API`
+
+    Use `!chains` to list available chains.
+    """
+    await _submit_task(ctx, f"__chain__:{chain_name}:{task}", force_task_type="chain")
+
+
 @bot.command(name="continue")
 async def continue_task(ctx: commands.Context, *, note: str = ""):
     """Continue fixing the last task.  Use when the build still has errors after !ask/!dev.
 
     Optionally pass extra guidance: `!continue focus on the webpack config errors`.
+    Or pass a specific job ID if the bot restarted: `!continue job_123 xyz`
     The session context carries forward so the agent knows what was already tried.
     """
     user_id = str(ctx.author.id)
-    last_job_id = bot.user_jobs.get(user_id)
+    
+    # Check if user explicitly passed a job ID: `!continue job_123... some note`
+    job_id_override = None
+    if note.startswith("job_"):
+        parts = note.split(" ", 1)
+        job_id_override = parts[0].strip()
+        note = parts[1].strip() if len(parts) > 1 else ""
+
+    last_job_id = job_id_override or bot.user_jobs.get(user_id)
+
     if not last_job_id:
-        await ctx.send("No previous job found. Use `!ask` or `!dev` to start one.")
+        await ctx.send("No previous job found in memory. Use `!jobs` to find your job ID, then run `!continue <job_id>`.")
         return
 
     # Fetch the last job to pull the original task text
     try:
         last_job = await bot.client.get_job(last_job_id)
+        # Re-hydrate the bot's memory in case it restarted
+        bot.user_jobs[user_id] = last_job_id
+        if last_job.get("session_id"):
+             bot.user_sessions[user_id] = last_job["session_id"]
     except Exception as exc:
-        await ctx.send(f"Could not fetch last job: {exc}")
+        await ctx.send(f"Could not fetch job `{last_job_id}`: {exc}")
         return
 
     original_task = last_job.get("task", "the previous task")
@@ -655,12 +778,12 @@ async def continue_task(ctx: commands.Context, *, note: str = ""):
 
 
 @bot.command(name="status")
-async def status(ctx: commands.Context):
-    """Show the status of your current background job."""
+async def status(ctx: commands.Context, job_id: Optional[str] = None):
+    """Show the status of your current background job. Specify a job_id if the bot restarted."""
     user_id = str(ctx.author.id)
-    job_id = bot.user_jobs.get(user_id)
+    job_id = job_id or bot.user_jobs.get(user_id)
     if not job_id:
-        await ctx.send("No active job. Use `!ask <task>` to start one.")
+        await ctx.send("No active job. Use `!ask <task>` to start one, or pass an explicit job ID: `!status <job_id>`.")
         return
     try:
         job = await bot.client.get_job(job_id)
@@ -677,12 +800,12 @@ async def status(ctx: commands.Context):
 
 
 @bot.command(name="cancel")
-async def cancel(ctx: commands.Context):
-    """Cancel your current running job."""
+async def cancel(ctx: commands.Context, job_id: Optional[str] = None):
+    """Cancel your current running job. Specify a job_id if the bot restarted."""
     user_id = str(ctx.author.id)
-    job_id = bot.user_jobs.get(user_id)
+    job_id = job_id or bot.user_jobs.get(user_id)
     if not job_id:
-        await ctx.send("No active job to cancel.")
+        await ctx.send("No active job to cancel. Pass an explicit job ID: `!cancel <job_id>`.")
         return
     try:
         await bot.client.cancel_job(job_id)
@@ -692,13 +815,11 @@ async def cancel(ctx: commands.Context):
 
 
 @bot.command(name="result")
-async def result(ctx: commands.Context):
-    """Show the agent's prose response from the last job (code blocks stripped)."""
-    user_id = str(ctx.author.id)
-    job_id = bot.user_jobs.get(user_id)
+async def result(ctx: commands.Context, job_id: Optional[str] = None):
+    """Show the agent's prose response from the last job (code blocks stripped). Specify a job_id if the bot restarted."""
+    job_id = await _resolve_last_job_id(ctx, job_id, require_done=True)
     if not job_id:
-        await ctx.send("No recent job. Use `!ask <task>` first.")
-        return
+        return  # error already posted
     try:
         data = await bot.client.get_job_result(job_id)
     except Exception as exc:
@@ -725,13 +846,11 @@ async def result(ctx: commands.Context):
 
 
 @bot.command(name="files")
-async def files(ctx: commands.Context):
-    """List files created or modified by the last task."""
-    user_id = str(ctx.author.id)
-    job_id = bot.user_jobs.get(user_id)
+async def files(ctx: commands.Context, job_id: Optional[str] = None):
+    """List files created or modified by the last task. Specify a job_id if the bot restarted."""
+    job_id = await _resolve_last_job_id(ctx, job_id, require_done=False)
     if not job_id:
-        await ctx.send("No recent job. Use `!ask <task>` first.")
-        return
+        return  # error already posted by _resolve_last_job_id
     try:
         job = await bot.client.get_job(job_id)
     except Exception as exc:
@@ -740,10 +859,15 @@ async def files(ctx: commands.Context):
 
     created = job.get("files_created", [])
     if not created:
-        await ctx.send("No files were created or modified in the last task.")
+        await ctx.send(
+            f"No files were recorded for job `{job_id}` "
+            f"(status: {job.get('status', '?')}).\n"
+            "If files were created via the agent's response text (not FILE: blocks), "
+            "use `!result` to read the full output."
+        )
         return
 
-    lines = ["**Files from last task:**"] + [f"  `{f}`" for f in created]
+    lines = [f"**Files from job `{job_id}`:**"] + [f"  `{f}`" for f in created]
     lines.append("\nUse `!show <path>` to view any of these.")
     await ctx.send("\n".join(lines))
 
@@ -758,12 +882,12 @@ _STATUS_ICONS = {
 
 
 @bot.command(name="tasks")
-async def tasks_cmd(ctx: commands.Context):
-    """Show the task list for the current job."""
+async def tasks_cmd(ctx: commands.Context, job_id: Optional[str] = None):
+    """Show the task list for the current job. Specify a job_id if the bot restarted."""
     user_id = str(ctx.author.id)
-    job_id = bot.user_jobs.get(user_id)
+    job_id = job_id or bot.user_jobs.get(user_id)
     if not job_id:
-        await ctx.send("No recent job. Use `!ask <task>` first.")
+        await ctx.send("No recent job. Use `!ask <task>` first, or pass an explicit job ID.")
         return
 
     try:
@@ -1246,12 +1370,12 @@ async def helpme(ctx: commands.Context):
         "**Core workflow:**\n"
         "`!ask <task>` — Submit a task. Agent works in background; this message updates live.\n"
         "`!dev <task>` — Same as !ask but forces develop mode (use for debug/build/fix tasks).\n"
-        "`!continue [note]` — Continue fixing the last job when errors remain.\n"
-        "`!status` — Check your current job's status and phase\n"
-        "`!cancel` — Cancel your running job\n\n"
+        "`!continue [job_id] [note]` — Continue fixing the last job when errors remain.\n"
+        "`!status [job_id]` — Check your current job's status and phase\n"
+        "`!cancel [job_id]` — Cancel your running job\n\n"
         "**Viewing results:**\n"
-        "`!result` — Show prose response (code blocks stripped)\n"
-        "`!files` — List files created/modified in the last task\n"
+        "`!result [job_id]` — Show prose response (code blocks stripped)\n"
+        "`!files [job_id]` — List files created/modified in the last task\n"
         "`!show <path>` — View a workspace file (attachment for large files)\n\n"
         "**Session:**\n"
         "`!history` — Last 5 messages in your session\n"

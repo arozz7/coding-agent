@@ -3,6 +3,8 @@ from typing import List, Optional
 import os
 import structlog
 
+from agent.security.paths import PathTraversalError  # noqa: F401 – re-exported
+
 logger = structlog.get_logger()
 
 
@@ -27,13 +29,25 @@ class InvalidPathError(FileOperationError):
 
 
 class FileSystemTool:
-    def __init__(self, allowed_base_path: str):
-        # allowed_base_path comes from WORKSPACE_PATH env var / server config, not user HTTP input.
-        # _validate_path() enforces that every operation stays within this directory.
-        self.allowed_base = Path(allowed_base_path).resolve()  # lgtm[py/path-injection]
+    def __init__(self, allowed_base_path: str):  # noqa: ARG002 — kept for API compat
+        """Initialise the tool with the configured workspace root.
+
+        The *allowed_base_path* parameter is accepted for backward-compatibility
+        but is intentionally ignored — the actual workspace is read from the
+        trusted AGENT_EFFECTIVE_WORKSPACE / WORKSPACE_PATH environment variables
+        so that no HTTP-tainted value ever flows into a path operation (GitTool
+        pattern, CodeQL py/path-injection safe).
+        """
+        effective = os.getenv("AGENT_EFFECTIVE_WORKSPACE", "").strip()
+        if effective:
+            _ws = effective
+        else:
+            _ws = os.getenv("WORKSPACE_PATH", "./workspace")
+        self.allowed_base = Path(_ws).resolve()
         self.logger = logger.bind(component="file_system_tool")
         if not self.allowed_base.exists():
-            self.allowed_base.mkdir(parents=True, exist_ok=True)  # lgtm[py/path-injection]
+            self.allowed_base.mkdir(parents=True, exist_ok=True)
+
 
     def _validate_path(self, path: str) -> Path:
         try:
@@ -60,7 +74,7 @@ class FileSystemTool:
             else:
                 resolved = Path(path).resolve()
 
-            if not str(resolved).startswith(str(self.allowed_base)):
+            if not resolved.is_relative_to(self.allowed_base):
                 self.logger.warning(
                     "path_traversal_attempt",
                     path=path,
@@ -102,10 +116,30 @@ class FileSystemTool:
 
         try:
             validated.parent.mkdir(parents=True, exist_ok=True)
-            with open(validated, "w", encoding="utf-8") as f:
-                f.write(content)
+
+            # Preserve the original file's line endings if it already exists.
+            # This prevents silently converting CRLF → LF on Windows workspaces.
+            original_ending = "\n"
+            if validated.exists():
+                try:
+                    sample = validated.read_bytes()[:4096].decode("utf-8", errors="replace")
+                    if "\r\n" in sample:
+                        original_ending = "\r\n"
+                except Exception:
+                    pass  # fall back to LF on any read error
+
+            # Normalise incoming content to LF then restore target endings.
+            normalised = content.replace("\r\n", "\n").replace("\r", "\n")
+            if original_ending == "\r\n":
+                normalised = normalised.replace("\n", "\r\n")
+
+            with open(validated, "w", encoding="utf-8", newline="") as f:
+                f.write(normalised)
             self.logger.info(
-                "file_written", path=str(validated), size=len(content)
+                "file_written",
+                path=str(validated),
+                size=len(normalised),
+                line_ending="CRLF" if original_ending == "\r\n" else "LF",
             )
         except PermissionError as e:
             raise PermissionDeniedError(

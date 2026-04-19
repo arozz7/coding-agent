@@ -9,13 +9,16 @@ A comprehensive guide to using the Local Coding Agent.
 3. [Starting the Agent](#starting-the-agent)
 4. [Discord Commands Reference](#discord-commands-reference)
 5. [Task Types & Routing](#task-types--routing)
-6. [Workspace & Project Scoping](#workspace--project-scoping)
-7. [Model Management](#model-management)
-8. [Context Bridge](#context-bridge)
-9. [Agent Wiki Memory](#agent-wiki-memory)
-10. [Interactive Testing Tools](#interactive-testing-tools)
-11. [REST API Reference](#rest-api-reference)
-12. [Troubleshooting](#troubleshooting)
+6. [Agent Chains](#agent-chains)
+7. [Workspace & Project Scoping](#workspace--project-scoping)
+8. [Model Management](#model-management)
+9. [Context Bridge](#context-bridge)
+10. [Agent Wiki Memory](#agent-wiki-memory)
+11. [Interactive Testing Tools](#interactive-testing-tools)
+12. [REST API Reference](#rest-api-reference)
+13. [Advanced File Operations](#advanced-file-operations)
+14. [Security](#security)
+15. [Troubleshooting](#troubleshooting)
 
 ---
 
@@ -66,6 +69,10 @@ python -m pip install -e .
 | `RESTART_DELAY_SECS` | No | `3` | Seconds between stop and start during a supervisor restart |
 | `MAX_FIX_ITERATIONS` | No | `50` | Maximum fix-loop iterations the developer agent will attempt before giving up on a build error |
 | `BOT_STATUS_CHANNEL_ID` | No | — | Discord channel ID for model-switch alerts (e.g. when the agent falls back from local to remote). Leave unset to disable |
+| `STALE_JOB_THRESHOLD_SECS` | No | `2700` | Seconds before the watchdog kills a stuck job (45 min default). The timer automatically resets on task progress updates. |
+| `MAX_FIND_RESULTS` | No | `200` | Maximum results returned by `find_files` or `grep_code`. |
+| `SKIP_PATH_PREFIXES` | No | `dist/,build/,node_modules/,.cache/` | Comma-separated path prefixes excluded from fix-loop file context reads. Add project-specific compiled output dirs here. |
+| `AGENT_API_KEY` | No | _(none)_ | When set, callers must send `X-API-Key: <value>` on mutating endpoints (`POST /task`, `/task/start`, `/task/stream`, `/workspace/project`). Leave unset to disable auth (safe for local-only use). |
 
 ### Model Configuration (`config/models.yaml`)
 
@@ -184,22 +191,49 @@ Force the **research** path — bypasses the LLM classifier. Runs the full itera
 
 The Done message shows a one-line summary. Use `!result` to read the full report.
 
-#### `!continue [note]`
-Resume the current active debugging session. Optionally attach a note to guide the next iteration.
+#### `!continue [job_id] [note]`
+Resume the current active debugging session. Optionally attach a note to guide the next iteration. If the bot restarted, you can pass your `job_id` explicitly to recover state.
 
 ```
 !continue
 !continue the build is still failing on the test step
 ```
 
+#### `!chains`
+List all available agent chains (built-in + any defined in `agent-chain.yaml`).
+
+```
+!chains
+```
+
+Output example:
+```
+Available chains (!chain <name> <task>):
+  plan-build-review — Plan, implement, and review — the standard development cycle
+  full-review       — End-to-end pipeline — scout, plan, build, review
+  scout-flow        — Triple-scout deep recon — explore, validate, verify
+  plan-review-plan  — Iterative planning — plan, critique, then refine
+  secure-build      — Plan, build, then run a security audit
+  plan-build        — Plan then build — fast two-step without review
+```
+
+#### `!chain <name> <task>`
+Run a named agent chain — sequences multiple agents, passing each step's output to the next.
+
+```
+!chain plan-build-review add OAuth2 login to the API
+!chain full-review audit the entire Shadows-of-Eldoria codebase
+!chain secure-build implement the user registration endpoint
+```
+
 ---
 
 ### Job Monitoring
 
-#### `!status`
-Shows the current job's phase, elapsed time, and job ID.
+#### `!status [job_id]`
+Shows the current job's phase, elapsed time, and job ID. If the bot restarted, passing `job_id` recovers the state.
 
-#### `!tasks`
+#### `!tasks [job_id]`
 Shows the full task plan with status for each subtask:
 
 ```
@@ -210,16 +244,16 @@ Task plan (3/4 done)
 🔄 4. [develop] Verify fix with npm start
 ```
 
-#### `!result`
+#### `!result [job_id]`
 Returns the full response text from the most recent completed job.
 
-#### `!files`
+#### `!files [job_id]`
 Lists all files created or modified by the last task.
 
 #### `!jobs [n]`
 Lists the last N jobs (default 10) with status, type, and elapsed time.
 
-#### `!cancel`
+#### `!cancel [job_id]`
 Cancels the currently running job.
 
 ---
@@ -329,16 +363,66 @@ The agent auto-classifies every `!ask` task into one of these types:
 
 | Type | When it fires | What happens |
 |------|--------------|--------------|
-| `develop` | Write, fix, run, build, debug, compile, npm, execute | `DeveloperAgent` — writes files, runs shell, fix loop up to 10 iterations |
-| `research` | Investigate, find, explain, search for, how does | `ResearchAgent` — iterative: decomposes → parallel web search → gap analysis → synthesis. Fast-path for local file tasks. Full report via `!result` |
+| `develop` | Write, fix, run, build, debug, compile, npm, execute | `DeveloperAgent` — writes files, runs shell, anchor-and-patch fix loop |
+| `research` | Investigate, find, explain, search for, how does | `ResearchAgent` — iterative: decomposes → parallel web search → gap analysis → synthesis |
+| `mapper` | Map the project, generate architecture docs | `MapperAgent` — produces `ARCHITECTURE.md` + `STACK.md`; auto-runs as first step in develop/sdlc tasks |
 | `plan` | Plan first, show me a plan, roadmap | `PlanAgent` — creates implementation plan without writing code |
-| `sdlc` | Build me a complete app, end-to-end | Full SDLC pipeline: plan → build → test → debug → run → verify |
+| `sdlc` | Build me a complete app, end-to-end | Full SDLC pipeline: map → plan → build → test → debug → run → verify |
 | `test` | Write tests, pytest, unit tests | `TesterAgent` — writes and runs test suites |
-| `review` | Code review, security audit | `ReviewerAgent` — audits for bugs, style, security |
+| `review` | Code review, quality check | `ReviewerAgent` — audits for bugs, style, correctness |
+| `security` | Security audit, red-team, find vulnerabilities | `RedTeamAgent` — OWASP checklist, secrets scan, injection/auth review; severity-rated report |
+| `documenter` | Write README, docs, changelog | `DocumenterAgent` — writes and updates project documentation |
 | `architect` | System design, write an ADR | `ArchitectAgent` — high-level design decisions |
 | `chat` | Everything else | `ChatAgent` — conversational Q&A (no file tools) |
 
+**Plan-review-plan loop:** For `develop` and `sdlc` tasks with ≥ 3 steps, a `PlanReviewerAgent` automatically critiques the generated plan before execution — checking for wrong agent types, missing steps (e.g. no build step), and bad task ordering. The improved plan is used transparently.
+
 **Pre-LLM keyword fast-path:** Common develop patterns (fix, run, npm, build, compile, debug) are classified immediately without an LLM call. Use `!dev` to force the develop path, or `!research` to force the research path, if auto-classification is wrong.
+
+---
+
+## Agent Chains
+
+Agent chains sequence multiple agents into a named pipeline. Each step receives the previous step's output as `$INPUT` and the original user request as `$ORIGINAL`.
+
+### Built-in chains
+
+| Chain | Steps | Best for |
+|-------|-------|----------|
+| `plan-build-review` | planner → developer → reviewer | Standard feature implementation |
+| `plan-build` | planner → developer | Quick implementation without review |
+| `full-review` | scout → planner → developer → reviewer | First-time work on an unfamiliar codebase |
+| `scout-flow` | scout × 3 | Deep codebase investigation with cross-checking |
+| `plan-review-plan` | planner → plan-reviewer → planner | High-stakes planning — critique before building |
+| `secure-build` | planner → developer → security | Any feature that touches auth, SQL, or external input |
+
+### Running a chain
+
+```
+!chain plan-build-review add rate limiting to the API
+!chain secure-build implement user password reset
+!chain full-review why is the game crashing on startup
+```
+
+The Done message shows the output of the final step. `!result` returns the full multi-step trace.
+
+### Custom chains
+
+Add an `agent-chain.yaml` file to your workspace root:
+
+```yaml
+my-pipeline:
+  description: "My custom pipeline"
+  steps:
+    - agent: research
+      prompt: "Investigate the codebase for: $INPUT"
+    - agent: develop
+      prompt: "Based on this analysis, implement:\n\n$INPUT\n\nOriginal: $ORIGINAL"
+    - agent: security
+      prompt: "Security audit the implementation:\n\n$INPUT"
+```
+
+Then run it with `!chain my-pipeline <task>`. Use `!chains` to see all available chains including your custom ones.
 
 ---
 
@@ -697,7 +781,116 @@ POST /restart
 
 ---
 
+## Advanced File Operations
+
+### Surgical Edits (`EDIT:` format)
+
+Instead of rewriting an entire file, the agent can make specific, surgical edits using the `EDIT:` block. This is the preferred method for bug fixes and small refactors.
+
+**Format:**
+
+```
+EDIT: path/to/file.ext
+<<<OLD
+exact text to replace
+===
+new replacement text
+>>>
+```
+
+**Features:**
+- **Multi-hunk support**: Single response can contain multiple `EDIT:` blocks for different files or different parts of the same file.
+- **Overlap Protection**: All edits are matched against the original file content simultaneously. If two edits would overlap or conflict, the entire operation is rejected to prevent file corruption.
+- **Unified Diff**: The agent returns a standard unified diff of the changes, which is displayed in the job transcript for easy review.
+- **Atomic Writes**: Each file is locked during the edit to prevent concurrent write races.
+
+### Native Search Tools
+
+The agent includes Python-native replacements for `find` and `grep` that work consistently across Windows, macOS, and Linux without requiring external shell utilities.
+
+#### `find_files`
+
+Uses `pathlib` globs to find files. Automatically skips noisy directories like `node_modules`, `.git`, and `dist`.
+
+```json
+// Tool execution example
+{
+  "pattern": "**/*.py",
+  "path": "src"
+}
+```
+
+#### `grep_code`
+
+Performs a regex search across file contents. Skips binary files (images, PDFs, executables) and ignored directories.
+
+```json
+// Tool execution example
+{
+  "pattern": "def session_id",
+  "case_sensitive": false
+}
+```
+
+### Line Ending & BOM Preservation
+
+The agent automatically detects the line endings (`CRLF` on Windows, `LF` on Unix) and the presence of a Byte Order Mark (`BOM`) in existing files. When writing updates (via `FILE:` or `EDIT:`), it restores the original format, ensuring compatibility with your existing VCS and IDE settings.
+
+---
+
+## Security
+
+### API Authentication
+
+When `AGENT_API_KEY` is set in `.env`, the four mutating REST endpoints require the key in the `X-API-Key` header:
+
+```
+POST /task
+POST /task/start
+POST /task/stream
+POST /workspace/project
+```
+
+Example:
+```
+curl -X POST http://127.0.0.1:5005/task/start \
+  -H "X-API-Key: your-secret-key" \
+  -H "Content-Type: application/json" \
+  -d '{"task": "run the tests"}'
+```
+
+Read-only endpoints (`GET /health`, `/models`, `/task/{id}`, etc.) are always unauthenticated. Leave `AGENT_API_KEY` unset (or empty) for local-only development.
+
+### Prompt Injection Protection
+
+All task input (from the API, Discord, or any client) passes through a sanitizer before reaching any LLM prompt:
+
+1. **Control character stripping** — removes `\x00–\x1f` and Unicode private-use characters, caps input at 32 000 characters
+2. **Injection pattern detection** — 12 regex patterns detect known jailbreak phrases ("ignore previous instructions", "you are now a different AI", `<system>` tags, `[INST] ignore`, etc.)
+
+If a match is detected, the task is rejected immediately with an error message — no LLM call is made and no shell commands run.
+
+### Workspace Path Containment
+
+Shell commands run by the agent are checked against the workspace boundary. Any file-targeting command (`rm`, `del`, `copy`, `move`, `Remove-Item`, etc.) that references an **absolute path outside the workspace** is blocked:
+
+```
+# Blocked — targets a path outside the workspace
+del C:\Users\arozz\Documents\important.txt
+
+# Allowed — relative path, resolves inside workspace
+del src/old-file.js
+```
+
+Output redirections (`echo foo > /outside/path`) are checked the same way. Recursive destructive operations (`rm -rf /`, `rd /s`, `Remove-Item -Recurse`) are blocked unconditionally regardless of path.
+
+---
+
 ## Troubleshooting
+
+### Windows Process-Tree termination
+
+If a background process (like `npm start` or a local build server) times out, the shell tool and supervisor now use `taskkill /F /T` on Windows. This ensures that the entire child process tree is purged. If you find orphaned processes still running, check that `taskkill` is available in your system PATH.
 
 ### Bot says "supervisor.py is not running — restart not possible"
 
@@ -797,4 +990,4 @@ Get-Content logs\bot-20260415-120005.log -Wait   # tail the latest bot log
 
 ---
 
-*Last updated: 2026-04-16 — Phase 20 (bug fixes: path double-nesting, redundant cd, npm auto-install, research routing; interactive testing: `interactive_shell` + `browser_interact`)*
+*Last updated: 2026-04-18 — Phase 24 (security hardening: API key auth, prompt injection detection, workspace path containment, shell command blocking; SQLite WAL mode + thread-safe session store; datetime timezone fixes)*

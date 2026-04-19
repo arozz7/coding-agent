@@ -1,11 +1,13 @@
 from typing import TypedDict, Annotated, List, Optional, Callable
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 import os
 import re
 import subprocess
 import structlog
+
+from agent.security.prompt_guard import guard_task
 
 from llm import ModelRouter
 from agent.memory import SessionMemory, CodebaseMemory
@@ -14,11 +16,16 @@ from agent.tools import FileSystemTool, PytestTool, CodeAnalyzer
 from agent.agents.developer_agent import DeveloperAgent
 from agent.agents.plan_agent import PlanAgent
 from agent.agents.planner_agent import PlannerAgent
+from agent.agents.plan_reviewer_agent import PlanReviewerAgent
 from agent.agents.tester_agent import TesterAgent
 from agent.agents.reviewer_agent import ReviewerAgent
 from agent.agents.architect_agent import ArchitectAgent
 from agent.agents.chat_agent import ChatAgent
 from agent.agents.research_agent import ResearchAgent
+from agent.agents.mapper_agent import MapperAgent
+from agent.agents.red_team_agent import RedTeamAgent
+from agent.agents.documenter_agent import DocumenterAgent
+from agent.chain_runner import ChainRunner
 from agent.skills.skill_loader import SkillManager
 from agent.skills.wiki_manager import WikiManager
 from agent.skills.skill_executor import SkillExecutor
@@ -36,12 +43,16 @@ class AgentState(TypedDict):
 class AgentOrchestrator:
     def __init__(
         self,
-        workspace_path: str,
+        workspace_path: str,  # noqa: ARG002 — kept for API compat; env vars used instead
         model_router: ModelRouter,
         session_db_path: str = "data/memory.db",
         chroma_path: str = "data/chroma_db",
     ):
-        self.workspace_path = workspace_path
+        # Env-var-only pattern (GitTool pattern): workspace comes from trusted env vars,
+        # not the HTTP-tainted workspace_path parameter — breaks the CodeQL taint chain.
+        _effective = os.getenv("AGENT_EFFECTIVE_WORKSPACE", "").strip()
+        _ws = _effective if _effective else os.getenv("WORKSPACE_PATH", "./workspace")
+        self.workspace_path = _ws
         self.model_router = model_router
         self.session_memory = SessionMemory(session_db_path)
         self.codebase_memory = CodebaseMemory(chroma_path)
@@ -102,7 +113,12 @@ class AgentOrchestrator:
             file_system_tool=self.fs_tool,
             code_analyzer=self.code_analyzer,
         )
+        self.mapper_agent = MapperAgent(model_router, file_system_tool=self.fs_tool)
+        self.red_team_agent = RedTeamAgent(model_router)
+        self.documenter_agent = DocumenterAgent(model_router)
         self.planner_agent = PlannerAgent(model_router)
+        self.plan_reviewer_agent = PlanReviewerAgent(model_router)
+        self.chain_runner = ChainRunner(self)
 
         # Task store — shares the same SQLite file as the job store
         from api.task_store import TaskStore
@@ -197,7 +213,7 @@ class AgentOrchestrator:
             if files_created and result.get("success"):
                 project_id = Path(self.workspace_path).name
                 for rel_path in files_created:
-                    abs_path = Path(self.workspace_path) / rel_path  # lgtm[py/path-injection]
+                    abs_path = Path(self.workspace_path) / rel_path
                     if abs_path.exists() and abs_path.is_file():
                         try:
                             self.codebase_memory.index_files(
@@ -679,7 +695,7 @@ class AgentOrchestrator:
         bridge_text = await self.model_router.generate(prompt, config)
 
         # Create the new session and pre-seed it with the bridge document.
-        new_session_id = f"session_{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}_bridge"
+        new_session_id = f"session_{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S')}_bridge"
         self.session_memory.get_or_create_session(new_session_id, self.workspace_path)
         self.session_memory.save_message(
             new_session_id,
@@ -837,6 +853,19 @@ class AgentOrchestrator:
         For all other types (plan, review, test, architect, chat, sdlc) the
         agent is called directly as before.
         """
+        # Chain tasks: task string is "__chain__:<name>:<user_input>"
+        if task_type == "chain" or task.startswith("__chain__:"):
+            parts = task.split(":", 2)
+            if len(parts) == 3 and parts[0] == "__chain__":
+                chain_name = parts[1]
+                user_input = parts[2]
+            else:
+                chain_name = task_type
+                user_input = task
+            return await self.chain_runner.run(
+                chain_name, user_input, session_id, on_phase=on_phase, job_id=job_id
+            )
+
         # SDLC workflow is handled by its own class — does not need a context dict
         if task_type == "sdlc":
             from agent.sdlc_workflow import SDLCWorkflow
@@ -872,6 +901,12 @@ class AgentOrchestrator:
             return await self.architect_agent.run(task, context)
         elif task_type == "research":
             return await self.research_agent.run(task, context)
+        elif task_type == "mapper":
+            return await self.mapper_agent.run(task, context)
+        elif task_type == "security":
+            return await self.red_team_agent.run(task, context)
+        elif task_type == "documenter":
+            return await self.documenter_agent.run(task, context)
         elif task_type == "chat":
             return await self.chat_agent.run(task, context)
         else:
@@ -911,6 +946,12 @@ class AgentOrchestrator:
             context=enriched_preview[:600],
             task_type=task_type,
         )
+
+        # 1b. Review and improve the plan before executing (plan-review-plan loop).
+        # Only runs for develop/sdlc tasks with ≥3 steps — skips trivial plans.
+        if task_type in ("develop", "sdlc") and len(task_specs) >= 3:
+            _emit("planning:review")
+            task_specs = await self.plan_reviewer_agent.review(task_specs, objective)
 
         # 2. Persist tasks
         if job_id:
@@ -952,7 +993,7 @@ class AgentOrchestrator:
                 description = spec["description"]
                 agent_type = spec.get("agent_type", "develop")
 
-            _emit(f"task:{task_num}/{total}:{description[:40]}")
+            _emit(f"task:{task_num}/{total}:{agent_type}:{description[:40]}")
             self.logger.info(
                 "task_loop_executing",
                 task_num=task_num,
@@ -961,12 +1002,17 @@ class AgentOrchestrator:
                 description=description[:60],
             )
 
+            _current_agent_type = agent_type  # capture for closure
+
+            def _wrapped_on_phase(inner_label: str, _at=_current_agent_type) -> None:
+                _emit(f"task:{task_num}/{total}:{_at}:{inner_label}")
+
             try:
                 result = await self._run_specialized_agent(
                     description,
                     agent_type,
                     session_id,
-                    on_phase=on_phase,
+                    on_phase=_wrapped_on_phase,
                     job_id=None,     # prevent re-entering the loop
                     _direct=True,    # go straight to agent
                 )
@@ -1056,7 +1102,28 @@ class AgentOrchestrator:
                 break
 
         combined = "\n\n---\n\n".join(all_responses) if all_responses else "(no output)"
-        job_summary = "\n".join(task_summaries) if task_summaries else ""
+
+        # Build enhanced job summary: header counts + per-task lines + next-steps hint.
+        failed_count = sum(1 for s in task_summaries if s.startswith("❌"))
+        done_count = sum(1 for s in task_summaries if s.startswith("✅"))
+        if task_summaries:
+            header = (
+                f"**{done_count}/{task_num} tasks completed**"
+                + (f" · {failed_count} failed" if failed_count else "")
+            )
+            if failed_count:
+                next_steps = (
+                    "\n\n**Next steps:** Review the errors above. "
+                    "Use `!dev <description>` to continue fixing or `!result` for full details."
+                )
+            else:
+                next_steps = (
+                    "\n\n**Next steps:** Changes applied. Run your test suite to verify, "
+                    "or `!result` to review the full output."
+                )
+            job_summary = header + "\n\n" + "\n".join(task_summaries) + next_steps
+        else:
+            job_summary = ""
         # Deduplicate files while preserving order
         seen: set[str] = set()
         unique_files: list[str] = []
@@ -1138,7 +1205,14 @@ class AgentOrchestrator:
                     pass
 
         if not session_id:
-            session_id = f"session_{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}"
+            session_id = f"session_{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S')}"
+
+        # Sanitize input and reject known prompt-injection patterns before
+        # the task string enters any LLM prompt.
+        try:
+            task = guard_task(task)
+        except ValueError as e:
+            return {"success": False, "session_id": session_id, "error": str(e)}
 
         self.session_memory.get_or_create_session(session_id, self.workspace_path)
         self.session_memory.save_message(session_id, "user", task)
@@ -1319,7 +1393,7 @@ class AgentOrchestrator:
 
         # Populate MemoryWiki from static analysis of Python files
         self.memory_wiki.clear()
-        py_files = list(Path(self.workspace_path).rglob("*.py"))  # lgtm[py/path-injection]
+        py_files = list(Path(self.workspace_path).rglob("*.py"))
         wiki_errors = 0
         for py_file in py_files:
             rel_path = str(py_file.relative_to(self.workspace_path))
@@ -1372,8 +1446,14 @@ class AgentOrchestrator:
     async def run_stream(
         self, task: str, session_id: Optional[str] = None, include_history: bool = True
     ):
+        try:
+            task = guard_task(task)
+        except ValueError as e:
+            yield {"error": str(e), "chunk": "", "full_response": ""}
+            return
+
         if not session_id:
-            session_id = f"session_{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}"
+            session_id = f"session_{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S')}"
 
         self.session_memory.get_or_create_session(session_id, self.workspace_path)
         self.session_memory.save_message(session_id, "user", task)

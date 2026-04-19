@@ -1,6 +1,6 @@
 from typing import Dict, Any, Optional, List
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timezone
 import asyncio
 import structlog
 from uuid import uuid4
@@ -57,7 +57,7 @@ class SubagentSpawner:
             id=subagent_id,
             parent_id=parent_id,
             task=task,
-            created_at=datetime.utcnow(),
+            created_at=datetime.now(timezone.utc),
             tools=tools or [],
             max_depth=self.max_depth,
             current_depth=current_depth,
@@ -228,7 +228,7 @@ class SubagentOrchestrator:
             id=self.root_agent_id,
             parent_id="",
             task="root",
-            created_at=datetime.utcnow(),
+            created_at=datetime.now(timezone.utc),
             current_depth=0,
         )
     
