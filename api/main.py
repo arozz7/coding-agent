@@ -592,9 +592,7 @@ async def delete_session(session_id: str):
     if not _orchestrator:
         raise HTTPException(status_code=503, detail="Agent not initialized")
 
-    deleted = _orchestrator.session_memory.delete_session(session_id)
-    if not deleted:
-        raise HTTPException(status_code=404, detail="Session not found")
+    _orchestrator.session_memory.delete_session(session_id)
     return {"success": True, "session_id": session_id}
 
 

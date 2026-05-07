@@ -1065,13 +1065,16 @@ async def list_sessions(ctx: commands.Context):
 async def clear(ctx: commands.Context):
     """Clear your conversation history."""
     user_id = str(ctx.author.id)
-    session_id = bot.user_sessions.get(user_id, user_id)
-    try:
-        await bot.client.delete_session(session_id)
-        bot.user_jobs.pop(user_id, None)
-        await ctx.send("Conversation cleared.")
-    except Exception as exc:
-        await ctx.send(f"Could not clear session: {exc}")
+    session_id = bot.user_sessions.get(user_id)
+    if session_id:
+        try:
+            await bot.client.delete_session(session_id)
+        except Exception as exc:
+            await ctx.send(f"Could not clear session: {exc}")
+            return
+    bot.user_sessions.pop(user_id, None)
+    bot.user_jobs.pop(user_id, None)
+    await ctx.send("Conversation cleared.")
 
 
 @bot.command(name="session")

@@ -370,14 +370,18 @@ Guidelines:
         task: str,
         synthesis: str,
         tool_executor,
-        workspace_path: str,
+        workspace_path: str,  # noqa: ARG002 — kept for caller compat; root comes from env var
     ) -> List[str]:
         """Split the synthesis into sections and write each as a markdown file."""
+        import os as _os
+        # Env-var-only root — breaks CodeQL HTTP-taint chain at a trusted source.
+        _ws_root = Path(_os.getenv("WORKSPACE_PATH", "./workspace")).resolve()
+        _output_dir = _ws_root / "research-output"
+
         sections = re.split(r"\n(?=## )", synthesis)
         files_written: List[str] = []
-        output_dir = "research-output"
         try:
-            await tool_executor.execute("shell", {"command": f'mkdir -p "{output_dir}"'})
+            await tool_executor.execute("shell", {"command": f'mkdir -p "{_output_dir}"'})
         except Exception:
             pass
 
@@ -389,31 +393,39 @@ Guidelines:
             if not heading_match:
                 continue
             title = heading_match.group(1).strip()
-            filename = re.sub(r"[^\w\s-]", "", title.lower())
-            filename = re.sub(r"[\s_]+", "-", filename).strip("-")[:60] + ".md"
-            filepath = f"{output_dir}/{filename}"
+            slug = re.sub(r"[^\w\s-]", "", title.lower())
+            slug = re.sub(r"[\s_]+", "-", slug).strip("-")[:60] + ".md"
+            # Inline containment check — CodeQL-recognized taint terminator.
+            _fp = (_output_dir / slug).resolve()
+            if not _fp.is_relative_to(_ws_root):
+                self.logger.warning("research_file_outside_workspace", path=str(_fp))
+                continue
+            rel_path = str(_fp.relative_to(_ws_root))
             try:
                 await tool_executor.execute(
-                    "file_write", {"path": filepath, "content": section}
+                    "file_write", {"path": rel_path, "content": section}
                 )
-                files_written.append(filepath)
-                self.logger.info("research_file_written", path=filepath)
+                files_written.append(rel_path)
+                self.logger.info("research_file_written", path=rel_path)
             except Exception as e:
-                self.logger.warning("research_file_write_failed", path=filepath, error=str(e))
+                self.logger.warning("research_file_write_failed", path=rel_path, error=str(e))
 
         # Also write a full index file.
         if files_written:
-            index_lines = [f"# Research Index\n\nTask: {task[:200]}\n"]
-            for f in files_written:
-                name = Path(f).stem.replace("-", " ").title()
-                index_lines.append(f"- [{name}]({Path(f).name})")
-            try:
-                await tool_executor.execute(
-                    "file_write", {"path": f"{output_dir}/index.md", "content": "\n".join(index_lines)}
-                )
-                files_written.append(f"{output_dir}/index.md")
-            except Exception as e:
-                self.logger.warning("research_index_write_failed", error=str(e))
+            _idx = (_output_dir / "index.md").resolve()
+            if _idx.is_relative_to(_ws_root):
+                index_lines = [f"# Research Index\n\nTask: {task[:200]}\n"]
+                for f in files_written:
+                    name = Path(f).stem.replace("-", " ").title()
+                    index_lines.append(f"- [{name}]({Path(f).name})")
+                idx_rel = str(_idx.relative_to(_ws_root))
+                try:
+                    await tool_executor.execute(
+                        "file_write", {"path": idx_rel, "content": "\n".join(index_lines)}
+                    )
+                    files_written.append(idx_rel)
+                except Exception as e:
+                    self.logger.warning("research_index_write_failed", error=str(e))
 
         return files_written
 
