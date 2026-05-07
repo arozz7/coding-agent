@@ -33,16 +33,14 @@ class FileSystemTool:
         """Initialise the tool with the configured workspace root.
 
         The *allowed_base_path* parameter is accepted for backward-compatibility
-        but is intentionally ignored — the actual workspace is read from the
-        trusted AGENT_EFFECTIVE_WORKSPACE / WORKSPACE_PATH environment variables
-        so that no HTTP-tainted value ever flows into a path operation (GitTool
-        pattern, CodeQL py/path-injection safe).
+        but is intentionally ignored.  The actual workspace is read from the
+        per-task ContextVar (agent.workspace_context.get_workspace) so that
+        concurrent jobs stay isolated and a mid-run project switch cannot
+        redirect an in-flight job.  Value is always derived from trusted env
+        vars — no HTTP-tainted input ever reaches a path operation.
         """
-        effective = os.getenv("AGENT_EFFECTIVE_WORKSPACE", "").strip()
-        if effective:
-            _ws = effective
-        else:
-            _ws = os.getenv("WORKSPACE_PATH", "./workspace")
+        from agent.workspace_context import get_workspace
+        _ws = get_workspace()
         self.allowed_base = Path(_ws).resolve()
         self.logger = logger.bind(component="file_system_tool")
         if not self.allowed_base.exists():

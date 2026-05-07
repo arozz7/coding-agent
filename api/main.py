@@ -395,6 +395,11 @@ async def start_task_background(request: TaskRequest):
         _job_store.update(job_id, phase=label)
 
     async def _run():
+        # Snapshot the current effective workspace into the per-task ContextVar.
+        # This isolates concurrent jobs: a mid-run !project switch mutates the
+        # global env var but cannot redirect this job's in-flight file operations.
+        from agent.workspace_context import set_workspace, reset_workspace
+        _ws_token = set_workspace(os.getenv("AGENT_EFFECTIVE_WORKSPACE", ""))
         _job_store.update(job_id, status="running")
         try:
             result = await _orchestrator.run_task(
@@ -437,6 +442,8 @@ async def start_task_background(request: TaskRequest):
             logger.error("background_job_failed", job_id=job_id, error=str(e),
                          traceback=traceback.format_exc())
             _job_store.update(job_id, status="failed", error=str(e))
+        finally:
+            reset_workspace(_ws_token)
 
     asyncio.create_task(_run())
     return {"job_id": job_id, "session_id": session_id, "task_type": task_type}

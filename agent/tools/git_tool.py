@@ -13,21 +13,17 @@ class GitError(Exception):
 
 class GitTool:
     def __init__(self, repo_path: str):  # noqa: ARG002  repo_path kept for API compat
-        # Always resolve the workspace from the environment (trusted source only).
-        # repo_path is accepted for backward-compatibility but never used in any
-        # path operation — this ensures no user-supplied value reaches the filesystem.
+        # Always resolve the workspace from trusted sources only (never from the
+        # caller-supplied repo_path, which may be HTTP-tainted).
         #
         # Priority:
-        #   1. AGENT_EFFECTIVE_WORKSPACE — set by api/main.py to the fully-resolved
-        #      effective path (WORKSPACE_PATH / PROJECT_DIR).  Preferred because it
-        #      is set programmatically and is never stored in .env, so module reloads
-        #      cannot cause double-appending of PROJECT_DIR.
-        #   2. WORKSPACE_PATH + PROJECT_DIR — fallback for processes that don't go
-        #      through api/main.py (e.g. tests, CLI usage).
-        effective_env = os.environ.get("AGENT_EFFECTIVE_WORKSPACE", "").strip()
-        if effective_env:
-            workspace_env = effective_env
-        else:
+        #   1. Per-task ContextVar (agent.workspace_context) — set at job start,
+        #      isolates concurrent jobs and survives mid-run !project switches.
+        #   2. AGENT_EFFECTIVE_WORKSPACE env var — fallback for CLI/test callers.
+        #   3. WORKSPACE_PATH + PROJECT_DIR — last-resort fallback.
+        from agent.workspace_context import get_workspace
+        workspace_env = get_workspace()
+        if not workspace_env:
             workspace_env = os.environ.get("WORKSPACE_PATH", "").strip()
             if not workspace_env:
                 raise GitError("WORKSPACE_PATH environment variable is required")

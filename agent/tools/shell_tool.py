@@ -192,15 +192,11 @@ def _kill_process_tree(pid: int) -> None:
 
 class ShellTool:
     def __init__(self, workspace_path: str):  # noqa: ARG002 — kept for API compat
-        # Read workspace from trusted env vars, never from the caller-supplied arg.
-        # This is the GitTool pattern: the HTTP-tainted parameter is intentionally
-        # ignored so it never flows into any path operation.
-        effective = os.getenv("AGENT_EFFECTIVE_WORKSPACE", "").strip()
-        if effective:
-            _ws = effective
-        else:
-            _ws = os.getenv("WORKSPACE_PATH", "./workspace")
-        self.workspace = Path(_ws).resolve()
+        # Read workspace from the per-task ContextVar so concurrent jobs are
+        # isolated.  Value is always derived from trusted env vars — the
+        # HTTP-tainted workspace_path parameter is intentionally ignored.
+        from agent.workspace_context import get_workspace
+        self.workspace = Path(get_workspace()).resolve()
         self.logger = logger.bind(component="shell_tool")
         # Log which key tools are resolvable so PATH issues are visible at startup.
         _found = {t: shutil.which(t, path=_TOOL_ENV["PATH"]) for t in ("npm", "node", "python", "git", "cargo")}
