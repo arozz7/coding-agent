@@ -23,7 +23,10 @@ def workspace(tmp_path):
 
 @pytest.fixture
 def tool(workspace):
-    return EditTool(workspace)
+    from agent.workspace_context import set_workspace, reset_workspace
+    token = set_workspace(workspace)
+    yield EditTool(workspace)
+    reset_workspace(token)
 
 
 def create_file(workspace: str, rel_path: str, content: str) -> Path:
