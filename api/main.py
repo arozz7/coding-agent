@@ -33,10 +33,35 @@ except ImportError:
 
 WORKSPACE_PATH = os.getenv("WORKSPACE_PATH", os.path.abspath("./workspace"))
 
+# Runtime project state — survives restarts via .state/active_project.
+# Priority: .state/active_project (runtime switch) > PROJECT_DIR env var (.env default).
+_STATE_DIR = Path(".state")
+_ACTIVE_PROJECT_FILE = _STATE_DIR / "active_project"
+
+def _load_persisted_project() -> "str | None":
+    """Return last runtime project ('' = root cleared), or None if never set."""
+    try:
+        if _ACTIVE_PROJECT_FILE.exists():
+            return _ACTIVE_PROJECT_FILE.read_text(encoding="utf-8").strip()
+    except Exception:
+        pass
+    return None
+
+def _save_persisted_project(name: str) -> None:
+    """Persist the active project name ('' = workspace root) across restarts."""
+    try:
+        _STATE_DIR.mkdir(exist_ok=True)
+        _ACTIVE_PROJECT_FILE.write_text(name, encoding="utf-8")
+    except Exception as _e:
+        logger.warning("persist_project_failed", error=str(_e))
+
 # Optional active-project subdirectory within the workspace root.
 # When set, the agent always operates inside WORKSPACE_PATH/PROJECT_DIR
 # instead of the bare workspace root.
 PROJECT_DIR = os.getenv("PROJECT_DIR", "").strip()
+# Runtime switch overrides the .env default ('' means explicitly cleared to root).
+_persisted = _load_persisted_project()
+_startup_project: str = _persisted if _persisted is not None else PROJECT_DIR
 
 # Security: Disallowed paths (critical system folders)
 DISALLOWED_PATHS = [
@@ -165,7 +190,8 @@ def _effective_workspace(base: str = WORKSPACE_PATH, project: str = PROJECT_DIR)
         return str(Path(base) / project)
     return base
 
-_current_workspace: str = _effective_workspace()
+# Use persisted runtime project if available; otherwise fall back to .env default.
+_current_workspace: str = _effective_workspace(project=_startup_project)
 # Ensure the effective workspace directory exists.
 Path(_current_workspace).mkdir(parents=True, exist_ok=True)
 # Publish the effective workspace in a dedicated env var that GitTool reads.
@@ -802,6 +828,9 @@ async def set_project(request: dict):
     _safe_target.mkdir(parents=True, exist_ok=True)
     _current_workspace = str(_safe_target)
 
+    # Persist the project choice so it survives API restarts.
+    _save_persisted_project(raw_name)
+
     from local_coding_agent import create_agent
     _orchestrator = create_agent(_current_workspace, "config/models.yaml")
 
@@ -904,6 +933,10 @@ async def set_workspace(request: dict):
         raise HTTPException(status_code=400, detail="Path is not a directory")
 
     _current_workspace = str(_safe)
+    # Persist so restarts land on the same workspace.
+    _project_rel = str(Path(_current_workspace).relative_to(workspace_root)) \
+        if Path(_current_workspace) != workspace_root else ""
+    _save_persisted_project(_project_rel)
     # Recreate orchestrator with new workspace
     from local_coding_agent import create_agent
     _orchestrator = create_agent(_current_workspace, "config/models.yaml")
