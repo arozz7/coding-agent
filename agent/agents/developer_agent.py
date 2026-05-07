@@ -488,6 +488,10 @@ Summary: <one sentence>
             fix_attempt_blocks: int = 0
             # Ensure npm install runs at most once per fix session.
             _ran_npm_install: bool = False
+            # Detect cycling: if the same error hash appears twice in a row the
+            # model is stuck — abort rather than burning all iterations.
+            import hashlib as _hashlib
+            _prev_error_hash: str = ""
 
             for _attempt in range(MAX_FIX_ITERATIONS):
                 if on_phase:
@@ -501,6 +505,14 @@ Summary: <one sentence>
                 raw_errors = "\n\n".join(failed_outputs)
                 if len(raw_errors) > _MAX_ERROR_CHARS:
                     raw_errors = "…(truncated)…\n" + raw_errors[-_MAX_ERROR_CHARS:]
+
+                # Break early if the same error text repeats — the model is cycling.
+                _cur_hash = _hashlib.md5(raw_errors.encode()).hexdigest()
+                if _attempt > 0 and _cur_hash == _prev_error_hash:
+                    response += "\n\n*(Fix loop aborted: identical error on consecutive attempts — model is cycling)*"
+                    self.logger.info("fix_loop_cycling_detected", attempt=_attempt + 1)
+                    break
+                _prev_error_hash = _cur_hash
 
                 history_note = (
                     f"\nFiles already modified in prior fix attempts: {', '.join(files_fixed_history)}\n"

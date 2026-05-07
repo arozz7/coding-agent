@@ -120,17 +120,11 @@ Guidelines:
                     self.logger.warning("doc_read_failed", path=dp, error=str(e))
 
         # --- Routing decision ---
-        # "local content found" = actual file/document content was retrieved, OR
-        # the workspace listing returned real entries (📄/📁 icons present).
-        local_content_found = any(
-            s.startswith("---") or s.startswith("[PDF") or s.startswith("[DOCX")
-            or (("📄" in s or "📁" in s) and "Workspace contents:" in s)
-            for s in local_sections
-        )
-        is_local_task = bool(_LOCAL_TASK_RE.search(task))
-        needs_web = _SEARCH_TRIGGERS.search(task) or (
-            not local_content_found and not is_local_task
-        )
+        # Web search only when the task contains an explicit search trigger.
+        # The previous implicit fallback (no local content → web search) caused
+        # every task on an empty workspace to trigger a full web-research cycle,
+        # wasting context budget on irrelevant results.
+        needs_web = bool(_SEARCH_TRIGGERS.search(task))
 
         if not needs_web:
             # Fast path: task is about local code/files — single-pass synthesis.
