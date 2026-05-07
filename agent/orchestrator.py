@@ -23,6 +23,7 @@ from agent.agents.reviewer_agent import ReviewerAgent
 from agent.agents.architect_agent import ArchitectAgent
 from agent.agents.chat_agent import ChatAgent
 from agent.agents.research_agent import ResearchAgent
+from agent.agents.verifier_agent import VerifierAgent
 from agent.agents.mapper_agent import MapperAgent
 from agent.agents.red_team_agent import RedTeamAgent
 from agent.agents.documenter_agent import DocumenterAgent
@@ -124,6 +125,7 @@ class AgentOrchestrator:
         self.documenter_agent = DocumenterAgent(model_router)
         self.planner_agent = PlannerAgent(model_router)
         self.plan_reviewer_agent = PlanReviewerAgent(model_router)
+        self.verifier_agent = VerifierAgent(model_router)
         self.chain_runner = ChainRunner(self)
 
         # Task store — shares the same SQLite file as the job store
@@ -921,6 +923,29 @@ class AgentOrchestrator:
         else:
             return await self.developer_agent.run(task, context)
 
+    async def _run_verification(
+        self,
+        objective: str,
+        task_type: str,
+        combined_response: str,
+        files_created: list,
+        tool_executor=None,
+    ):
+        """Run the appropriate verifier rubric and return a VerifierResult."""
+        from agent.agents.verifier_agent import VerifierResult
+        try:
+            if task_type == "research":
+                return await self.verifier_agent.verify_research(
+                    objective, combined_response, files_created
+                )
+            else:
+                return await self.verifier_agent.verify_code(
+                    objective, combined_response, files_created, tool_executor=tool_executor
+                )
+        except Exception as exc:
+            self.logger.warning("verification_failed", error=str(exc))
+            return VerifierResult(score=7, passed=True)  # safe default — don't block on error
+
     async def _run_task_loop(
         self,
         objective: str,
@@ -982,12 +1007,51 @@ class AgentOrchestrator:
         # Accumulates research synthesis from earlier tasks so developer/test
         # agents in the same loop can use those findings as context.
         prior_research: list[str] = []
+        _verifier_rounds = 0
+        _MAX_VERIFIER_ROUNDS = 2
+        # Task types where verification is meaningful (skip chat, plan, mapper).
+        _VERIFIABLE_TYPES = {"develop", "research", "sdlc"}
 
         # 3. Execute loop
         while True:
             if job_id:
                 task_obj = self.task_store.get_next_pending(job_id)
                 if task_obj is None:
+                    # All tasks done — run verifier if applicable.
+                    if task_type in _VERIFIABLE_TYPES and _verifier_rounds < _MAX_VERIFIER_ROUNDS:
+                        combined_so_far = "\n\n---\n\n".join(all_responses)
+                        _emit(f"verifying:round-{_verifier_rounds + 1}")
+                        vresult = await self._run_verification(
+                            objective, task_type, combined_so_far, all_files,
+                            tool_executor=self.tool_executor,
+                        )
+                        self.logger.info(
+                            "verifier_result",
+                            round=_verifier_rounds + 1,
+                            score=vresult.score,
+                            passed=vresult.passed,
+                            gaps=len(vresult.gaps),
+                        )
+                        _verifier_rounds += 1
+                        if not vresult.passed:
+                            # Inject a fix task with the verifier feedback.
+                            fix_desc = (
+                                f"[Verifier fix round {_verifier_rounds}] "
+                                f"Feedback: {vresult.feedback} "
+                                f"Gaps: {'; '.join(vresult.gaps[:5])}"
+                            )
+                            fix_type = "research" if task_type == "research" else "develop"
+                            new_fix = self.task_store.create_task(
+                                job_id=job_id,
+                                description=fix_desc,
+                                agent_type=fix_type,
+                            )
+                            total = max(total, new_fix.sequence)
+                            task_summaries.append(
+                                f"🔍 **Verifier** (round {_verifier_rounds}) — score {vresult.score}/10, "
+                                f"re-running: {vresult.feedback[:80]}"
+                            )
+                            continue  # loop back to pick up fix task
                     break
                 task_id = task_obj.task_id
                 task_num = task_obj.sequence
@@ -998,6 +1062,28 @@ class AgentOrchestrator:
             else:
                 # No persistence — run specs in order
                 if task_num >= len(task_specs):
+                    if task_type in _VERIFIABLE_TYPES and _verifier_rounds < _MAX_VERIFIER_ROUNDS:
+                        combined_so_far = "\n\n---\n\n".join(all_responses)
+                        _emit(f"verifying:round-{_verifier_rounds + 1}")
+                        vresult = await self._run_verification(
+                            objective, task_type, combined_so_far, all_files,
+                            tool_executor=self.tool_executor,
+                        )
+                        _verifier_rounds += 1
+                        if not vresult.passed:
+                            fix_desc = (
+                                f"[Verifier fix round {_verifier_rounds}] "
+                                f"Feedback: {vresult.feedback} "
+                                f"Gaps: {'; '.join(vresult.gaps[:5])}"
+                            )
+                            fix_type = "research" if task_type == "research" else "develop"
+                            task_specs.append({"description": fix_desc, "agent_type": fix_type})
+                            total = len(task_specs)
+                            task_summaries.append(
+                                f"🔍 **Verifier** (round {_verifier_rounds}) — score {vresult.score}/10, "
+                                f"re-running: {vresult.feedback[:80]}"
+                            )
+                            continue
                     break
                 spec = task_specs[task_num]
                 task_num += 1

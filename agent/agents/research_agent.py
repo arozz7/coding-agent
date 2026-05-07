@@ -8,12 +8,13 @@ from agent.tools.web_tool import extract_urls
 
 _DOCUMENT_EXTS = {".pdf", ".docx", ".doc", ".xlsx", ".xls", ".csv", ".tsv"}
 
-# Maximum sub-questions from decomposition; follow-up queries per gap pass.
-_MAX_QUESTIONS = 5
-_MAX_FOLLOWUPS = 2
+# Maximum sub-questions from decomposition; follow-up queries per gap pass; coverage rounds.
+_MAX_QUESTIONS = 8
+_MAX_FOLLOWUPS = 4
+_MAX_COVERAGE_PASS = 3
 
 # Total character budget for web-gathered content.
-_WEB_CONTENT_BUDGET = 14_000
+_WEB_CONTENT_BUDGET = 28_000
 
 # Patterns that always trigger the iterative web-research path.
 _SEARCH_TRIGGERS = re.compile(
@@ -23,7 +24,27 @@ _SEARCH_TRIGGERS = re.compile(
     r"recent\s+news|last\s+night|yesterday|today|latest|recent(ly)?|"
     r"score|scores|weather|stock|price|market|news|headline|"
     r"who\s+(won|lost|is)|what\s+happened|"
-    r"released|launched|announced"
+    r"released|launched|announced|"
+    r"research\s+(on|about|into|for)|deep\s+research|in.?depth|"
+    r"comprehensive|thorough|exhaustive|"
+    r"investigate|explore|study|analyze|analyse|"
+    r"build.*agent|how\s+to\s+build|"
+    r"best\s+practices?|compare|evaluate|assess|"
+    r"survey|overview|landscape|state\s+of"
+    r")\b",
+    re.IGNORECASE,
+)
+
+# Patterns that indicate the user wants output captured to markdown/files.
+_FILE_WRITE_RE = re.compile(
+    r"\b("
+    r"capture\s+(to|into|in)\s+(markdown|files?|docs?|documents?)|"
+    r"save\s+(to|into|as)\s+(markdown|files?|docs?)|"
+    r"write\s+(to|into)\s+(markdown|files?|docs?)|"
+    r"create\s+(markdown\s+files?|docs?|documents?|files?)|"
+    r"output\s+(to|as)\s+(markdown|files?)|"
+    r"logically\s+(into\s+)?(files?|docs?|markdown)|"
+    r"into\s+markdown\s+files?|as\s+markdown\s+files?"
     r")\b",
     re.IGNORECASE,
 )
@@ -75,9 +96,11 @@ Available tools:
 
 Guidelines:
 - Prioritize reading real data from the context (e.g. [FETCHED PAGE CONTENT])
-- Do NOT write new code, create files, or modify anything
+- Do NOT write new code or modify existing files
+- When asked to capture findings to files, structure output with ## headings per topic
 - Format your findings with Summary, Sources, Findings, and Dependencies
-- Be concise and cite specific facts or URLs in your responses"""
+- Be exhaustive and thorough — cover ALL aspects of the research task
+- Cite specific facts, names, URLs, and examples in your responses"""
 
     async def execute(self, context: Dict[str, Any]) -> Dict[str, Any]:
         task = context.get("task", "")
@@ -126,6 +149,8 @@ Guidelines:
         # wasting context budget on irrelevant results.
         needs_web = bool(_SEARCH_TRIGGERS.search(task))
 
+        wants_files = bool(_FILE_WRITE_RE.search(task))
+
         if not needs_web:
             # Fast path: task is about local code/files — single-pass synthesis.
             _emit(on_phase, "researching:reading")
@@ -137,7 +162,15 @@ Guidelines:
                             local_sections.append(f"[FETCHED PAGE CONTENT: {url}]\n{fetched[:3000]}")
                     except Exception as e:
                         self.logger.warning("web_fetch_failed", url=url, error=str(e))
-            return await self._synthesize(task, local_sections, enriched_context, model, model_router)
+            result = await self._synthesize(
+                task, local_sections, enriched_context, model, model_router, wants_files=wants_files
+            )
+            if wants_files and tool_executor and result.get("success"):
+                _emit(on_phase, "researching:writing-files")
+                result["files_created"] = await self._write_research_files(
+                    task, result["response"], tool_executor, workspace_path
+                )
+            return result
 
         # --- Iterative web-research path ---
 
@@ -159,19 +192,47 @@ Guidelines:
             task, local_sections + web_sections, model, model_router
         )
 
-        # Step 4: Follow-up searches (max 2).
+        # Step 4: Follow-up searches (max _MAX_FOLLOWUPS).
         if follow_ups:
             _emit(on_phase, f"researching:follow-up ({len(follow_ups)} queries)")
             fu_coros = [self._search_question(q, tool_executor) for q in follow_ups]
             fu_results = await asyncio.gather(*fu_coros, return_exceptions=True)
             web_sections += [r for r in fu_results if isinstance(r, str) and r]
 
+        # Step 5: Coverage check — up to _MAX_COVERAGE_PASS additional rounds.
+        for _pass in range(_MAX_COVERAGE_PASS):
+            coverage_queries = await self._check_coverage(
+                task, local_sections + web_sections, model, model_router
+            )
+            if not coverage_queries:
+                break
+            _emit(on_phase, f"researching:coverage-pass-{_pass + 1} ({len(coverage_queries)} queries)")
+            cov_coros = [self._search_question(q, tool_executor) for q in coverage_queries]
+            cov_results = await asyncio.gather(*cov_coros, return_exceptions=True)
+            new_sections = [r for r in cov_results if isinstance(r, str) and r]
+            if not new_sections:
+                break
+            web_sections += new_sections
+
         web_sections = _trim_to_budget(web_sections, _WEB_CONTENT_BUDGET)
 
-        # Step 5: Synthesize everything.
+        # Step 6: Synthesize everything.
         _emit(on_phase, "researching:synthesizing")
         all_sections = local_sections + web_sections
-        return await self._synthesize(task, all_sections, enriched_context, model, model_router)
+        wants_files = bool(_FILE_WRITE_RE.search(task))
+        result = await self._synthesize(
+            task, all_sections, enriched_context, model, model_router, wants_files=wants_files
+        )
+
+        # Step 7: Write output files if requested.
+        if wants_files and tool_executor and result.get("success"):
+            _emit(on_phase, "researching:writing-files")
+            files_created = await self._write_research_files(
+                task, result["response"], tool_executor, workspace_path
+            )
+            result["files_created"] = files_created
+
+        return result
 
     # ------------------------------------------------------------------
     # Helpers
@@ -244,6 +305,29 @@ Guidelines:
             self.logger.warning("search_question_failed", query=query[:60], error=str(e))
         return "\n\n".join(sections)
 
+    async def _check_coverage(
+        self, task: str, gathered: List[str], model, model_router
+    ) -> List[str]:
+        """Return additional search queries for topics still not covered."""
+        combined = "\n\n".join(gathered)[:8000]
+        prompt = (
+            "You are a research quality checker. Review the gathered content against the task.\n"
+            f"Identify up to {_MAX_FOLLOWUPS} CRITICAL topics from the task that are COMPLETELY "
+            "absent or severely under-covered in the gathered content.\n"
+            "If coverage is already comprehensive, return nothing.\n"
+            "Return ONLY a numbered list of targeted search queries, one per line. No explanations.\n\n"
+            f"Research task: {task}\n\n"
+            f"Gathered so far (excerpt):\n{combined}"
+        )
+        try:
+            raw = await model_router.generate(prompt, model, enable_thinking=False)
+            queries = re.findall(r"^\d+\.\s*(.+)$", raw, re.MULTILINE)
+            queries = [q.strip() for q in queries if q.strip()]
+            return queries[:_MAX_FOLLOWUPS]
+        except Exception as e:
+            self.logger.warning("coverage_check_failed", error=str(e))
+        return []
+
     async def _synthesize(
         self,
         task: str,
@@ -251,17 +335,26 @@ Guidelines:
         enriched_context: str,
         model,
         model_router,
+        wants_files: bool = False,
     ) -> Dict[str, Any]:
         """Final LLM synthesis over all gathered content."""
         workspace_info = "\n\n".join(gathered)
+        if wants_files:
+            file_instruction = (
+                "Structure your response as multiple clearly delineated sections using "
+                "level-2 markdown headings (## Section Title). Each section should represent "
+                "a logical topic area that can be saved as a separate markdown file. "
+                "Be exhaustive — include ALL relevant details from the gathered content."
+            )
+        else:
+            file_instruction = "Provide a structured research report based on the gathered information above."
         prompt = (
             "The following information was gathered from the codebase, web, and documents:\n\n"
             f"{workspace_info}\n"
             f"{enriched_context}\n\n"
             f"Research task: {task}\n\n"
-            "Provide a structured research report based on the gathered information above.\n"
-            "If live web search results are included, cite them directly. "
-            "Do not write new code or create files."
+            f"{file_instruction}\n"
+            "If live web search results are included, cite them directly."
         )
         response = await model_router.generate(prompt, model, system_prompt=self.get_system_prompt())
         return {
@@ -271,6 +364,58 @@ Guidelines:
             "task": task,
             "files_created": [],
         }
+
+    async def _write_research_files(
+        self,
+        task: str,
+        synthesis: str,
+        tool_executor,
+        workspace_path: str,
+    ) -> List[str]:
+        """Split the synthesis into sections and write each as a markdown file."""
+        sections = re.split(r"\n(?=## )", synthesis)
+        files_written: List[str] = []
+        output_dir = "research-output"
+        try:
+            await tool_executor.execute("shell", {"command": f'mkdir -p "{output_dir}"'})
+        except Exception:
+            pass
+
+        for section in sections:
+            section = section.strip()
+            if not section:
+                continue
+            heading_match = re.match(r"^#+\s+(.+)$", section, re.MULTILINE)
+            if not heading_match:
+                continue
+            title = heading_match.group(1).strip()
+            filename = re.sub(r"[^\w\s-]", "", title.lower())
+            filename = re.sub(r"[\s_]+", "-", filename).strip("-")[:60] + ".md"
+            filepath = f"{output_dir}/{filename}"
+            try:
+                await tool_executor.execute(
+                    "file_write", {"path": filepath, "content": section}
+                )
+                files_written.append(filepath)
+                self.logger.info("research_file_written", path=filepath)
+            except Exception as e:
+                self.logger.warning("research_file_write_failed", path=filepath, error=str(e))
+
+        # Also write a full index file.
+        if files_written:
+            index_lines = [f"# Research Index\n\nTask: {task[:200]}\n"]
+            for f in files_written:
+                name = Path(f).stem.replace("-", " ").title()
+                index_lines.append(f"- [{name}]({Path(f).name})")
+            try:
+                await tool_executor.execute(
+                    "file_write", {"path": f"{output_dir}/index.md", "content": "\n".join(index_lines)}
+                )
+                files_written.append(f"{output_dir}/index.md")
+            except Exception as e:
+                self.logger.warning("research_index_write_failed", error=str(e))
+
+        return files_written
 
     def _extract_document_paths(self, task: str, workspace_path: str) -> List[str]:
         """Return absolute paths for document files (PDF/DOCX/XLSX/CSV) in the task."""
