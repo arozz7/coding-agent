@@ -222,13 +222,16 @@ class CodebaseMemory:
         )
 
     def search_files(
-        self, query: str, n_results: int = 5
+        self, query: str, n_results: int = 5, project_id: Optional[str] = None
     ) -> List[dict]:
-        results = self.files_collection.query(
-            query_texts=[query],
-            n_results=n_results,
-            include=["metadatas", "distances"],
-        )
+        query_kwargs: dict = {
+            "query_texts": [query],
+            "n_results": n_results,
+            "include": ["metadatas", "distances"],
+        }
+        if project_id:
+            query_kwargs["where"] = {"project_id": project_id}
+        results = self.files_collection.query(**query_kwargs)
 
         if not results["documents"]:
             return []
@@ -343,7 +346,7 @@ class CodebaseMemory:
         Returns:
             Formatted context string for agent prompts
         """
-        results = self.search_files(task, n_results=max_chunks)
+        results = self.search_files(task, n_results=max_chunks, project_id=project_id)
         
         if not results:
             return ""

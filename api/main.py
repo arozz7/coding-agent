@@ -1089,7 +1089,7 @@ async def search_codebase(q: str, limit: int = 5):
     
     try:
         project_id = Path(_current_workspace).name
-        results = _orchestrator.codebase_memory.search_files(q, n_results=limit)
+        results = _orchestrator.codebase_memory.search_files(q, n_results=limit, project_id=project_id)
         return {"query": q, "results": results}
     except Exception as e:
         logger.error("search_failed", error=str(e))
