@@ -29,7 +29,10 @@ An autonomous coding agent with LLM integration, multi-agent orchestration, SDLC
 - **Workspace Scoping** — `PROJECT_DIR` env var focuses all file operations on an active project subdirectory; no path double-nesting
 - **Security Layer** — Prompt injection detection blocks known jailbreak patterns before input reaches any LLM prompt; shell commands that reference absolute paths outside the workspace are rejected; optional `AGENT_API_KEY` header auth on all mutating API endpoints; SQLite session store uses WAL mode + `threading.RLock` for concurrent-access safety
 - **Agent Wiki Memory** — Per-project `.agent-wiki/` knowledge base: each project subdirectory owns its wiki; entries are tagged with the active project so queries never surface stale context from other projects; `!wiki status/query/clean/migrate` commands for full interactive control
-- **RAG Memory** — Codebase indexed in ChromaDB; retrieved context injected into every task
+- **RAG Memory** — Codebase indexed in ChromaDB; retrieved context injected into every task. Searches are project-scoped — Chroma queries include a `project_id` filter, eliminating cross-project content contamination.
+- **Verifier / Critic Agent** — After each develop or research job, a dedicated `VerifierAgent` scores the output 0–10 against the original objective. Scores below 7 trigger a targeted fix task and re-run (max 2 rounds). Research rubric checks coverage, depth, format compliance, and actionability; code rubric checks requirement fulfilment, completeness, correctness, and test results (runs pytest when available).
+- **Deep Research Mode** — Research agent decomposes into up to 8 sub-questions, runs up to 4 follow-up gap-fill passes, and performs up to 3 coverage-check rounds to ensure no topic is missed. Content budget is 28 k chars. When "capture to markdown files" is requested, the synthesis is split by section into individual `.md` files under `research-output/`.
+- **Project Lifecycle Management** — Full project delete via API (`DELETE /projects/{name}`) and Discord (`!project delete <name> confirm`). Dry-run preview shows artifact counts before deletion. Removes Chroma chunks, SQLite sessions/jobs/tasks, and `.agent-wiki/`. Workspace containment guard prevents deleting outside `WORKSPACE_PATH`.
 - **Shell PATH Auto-Discovery** — Scans 15+ common install dirs (nvm, volta, Homebrew, Cargo…) so npm/node/git are found even when the API starts with a minimal PATH
 
 ## Documentation
@@ -140,6 +143,8 @@ python -m api.discord_bot
 | `!clear` | Clear session history |
 | `!workspace` | Show workspace path and active project |
 | `!project [name]` | Get or set the active project directory |
+| `!project delete <name>` | Preview what would be deleted for a project (dry run) |
+| `!project delete <name> confirm` | Permanently delete all project data (Chroma, sessions, jobs, wiki) |
 | `!wiki [status\|query\|clean\|migrate]` | Inspect, search, clean, or migrate the active wiki knowledge base |
 
 ### Model Management
@@ -200,7 +205,7 @@ Logan [APP]: Configured Models · active: qwen3.5-35b-a3b
 | Type | Triggered by | What it does |
 |------|-------------|--------------|
 | `develop` | implement, fix, run, build, debug, npm, compile, execute | Writes files, runs shell commands, auto-fixes errors (up to 10 iterations) |
-| `research` | search for, find where, how does, investigate | **Iterative research**: decomposes query → parallel web searches → gap analysis → synthesis. Fast-path for local-only tasks. Full report via `!result` |
+| `research` | search for, find where, how does, investigate, deep research, comprehensive | **Deep iterative research**: decomposes into 8 sub-questions → parallel web searches → gap analysis (4 follow-ups) → 3 coverage rounds → synthesis. Writes section files to `research-output/` when requested. Fast-path for local-only tasks. Full report via `!result` |
 | `sdlc` | build me a complete, end-to-end | Full plan→build→test→debug→run→verify pipeline |
 | `plan` | plan first, show me a plan, before we build | Architecture plan before any code is written |
 | `test` | write tests, run tests, pytest | Writes and runs test suites |
@@ -265,6 +270,8 @@ Mutating endpoints (`POST /task`, `POST /task/start`, `POST /task/stream`, `POST
 | `GET` | `/wiki/query?terms=` | Search wiki (respects active project scope) |
 | `POST` | `/wiki/clean` | Remove out-of-scope index entries from the active wiki |
 | `POST` | `/wiki/migrate` | Move entries tagged for a project into that project's wiki `{"project": "name"}` |
+| `GET` | `/projects/{name}/delete-preview` | Dry-run count of artifacts to be removed |
+| `DELETE` | `/projects/{name}` | Delete all project data (Chroma, sessions, jobs, wiki) |
 | `GET` | `/sessions` | List sessions |
 | `DELETE` | `/sessions/{id}` | Delete a session |
 | `POST` | `/restart` | Signal supervisor to restart both services |
@@ -284,7 +291,8 @@ coding-agent/
 │   ├── agents/
 │   │   ├── developer_agent.py     # Write files, run commands, fix loop (10 iter)
 │   │   ├── planner_agent.py       # Decompose objectives into task lists
-│   │   ├── research_agent.py      # Web search, file reading, synthesis
+│   │   ├── research_agent.py      # Web search, file reading, synthesis, file output
+│   │   ├── verifier_agent.py      # Critic: scores output 0-10, injects fix tasks on fail
 │   │   ├── tester_agent.py        # Test generation and execution
 │   │   ├── reviewer_agent.py      # Code review and security audit
 │   │   ├── architect_agent.py     # System design and ADRs
@@ -297,6 +305,7 @@ coding-agent/
 │   │   ├── skill_executor.py      # Pre/post skill execution (wiki-query, wiki-compile)
 │   │   ├── skill_loader.py        # Lazy skill content loading
 │   │   └── wiki_manager.py        # .agent-wiki/ read/write, index upsert, lint
+│   ├── workspace_context.py           # ContextVar-based per-task workspace isolation
 │   ├── security/
 │   │   ├── paths.py                   # resolve_within() — canonical path-containment validator (CodeQL-safe)
 │   │   └── prompt_guard.py            # guard_task() — strips control chars, detects 12 injection patterns
