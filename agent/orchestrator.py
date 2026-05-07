@@ -1524,7 +1524,16 @@ class AgentOrchestrator:
         """
         import shutil
 
-        project_name = Path(project_path).name
+        # Inline containment check — _ws_root is env-var-only (untainted).
+        # Mirrors the allowed_base / is_relative_to pattern in FileSystemTool.
+        _ws_root = Path(os.getenv("WORKSPACE_PATH", "./workspace")).resolve()
+        _project_dir = Path(project_path).resolve()
+        if not _project_dir.is_relative_to(_ws_root):
+            raise ValueError(
+                f"project_path {project_path!r} is outside workspace root {_ws_root}"
+            )
+
+        project_name = _project_dir.name
 
         # --- Preview phase (always runs) ---
         session_ids = self.session_memory.list_sessions_by_project(project_path)
@@ -1532,7 +1541,7 @@ class AgentOrchestrator:
         chroma_chunks = self.codebase_memory.count_project_chunks(project_name)
 
         wiki_entries = 0
-        wiki_dir = Path(project_path) / ".agent-wiki"
+        wiki_dir = _project_dir / ".agent-wiki"   # derived from validated resolved path
         wiki_index = wiki_dir / "index.md"
         if wiki_index.exists():
             try:

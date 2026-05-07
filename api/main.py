@@ -1096,16 +1096,34 @@ async def search_codebase(q: str, limit: int = 5):
         raise HTTPException(status_code=500, detail="Internal server error")
 
 
+_PROJECT_NAME_RE = re.compile(r'^[a-zA-Z0-9][a-zA-Z0-9_.-]*$')
+
+
+def _resolve_project_path(project_name: str) -> str:
+    """Validate *project_name* and return its absolute path within WORKSPACE_PATH.
+
+    Base is read from the env var only (untainted).  An inline is_relative_to
+    check confirms the resolved path stays inside the workspace root before
+    the string is returned.  Raises HTTPException on any violation.
+    """
+    if not _PROJECT_NAME_RE.match(project_name):
+        raise HTTPException(status_code=400, detail="Invalid project name")
+    _ws_root = Path(os.getenv("WORKSPACE_PATH", "./workspace")).resolve()
+    _candidate = (_ws_root / project_name).resolve()
+    if not _candidate.is_relative_to(_ws_root):
+        raise HTTPException(status_code=400, detail="Project name escapes workspace root")
+    return str(_candidate)
+
+
 @app.get("/projects/{project_name}/delete-preview")
-async def preview_delete_project(project_name: str, workspace_root: str = ""):
+async def preview_delete_project(project_name: str):
     """Return a count of what would be removed by DELETE /projects/{project_name}.
 
-    No data is modified.  workspace_root defaults to the WORKSPACE_PATH env var.
+    No data is modified.
     """
     if not _orchestrator:
         raise HTTPException(status_code=503, detail="Agent not initialized")
-    root = workspace_root.strip() or os.getenv("WORKSPACE_PATH", "./workspace")
-    project_path = str(Path(root) / project_name)
+    project_path = _resolve_project_path(project_name)
     try:
         return _orchestrator.delete_project(project_path, dry_run=True)
     except Exception as e:
@@ -1114,20 +1132,17 @@ async def preview_delete_project(project_name: str, workspace_root: str = ""):
 
 
 @app.delete("/projects/{project_name}")
-async def delete_project(project_name: str, workspace_root: str = ""):
+async def delete_project(project_name: str):
     """Remove all agent-managed data for a project.
 
     Deletes: Chroma vectors, jobs, agent_tasks, sessions, and .agent-wiki/.
-    Project source files are never touched.  workspace_root defaults to
-    the WORKSPACE_PATH env var.
+    Project source files are never touched.
     """
     if not _orchestrator:
         raise HTTPException(status_code=503, detail="Agent not initialized")
-    root = workspace_root.strip() or os.getenv("WORKSPACE_PATH", "./workspace")
-    project_path = str(Path(root) / project_name)
+    project_path = _resolve_project_path(project_name)
     try:
-        result = _orchestrator.delete_project(project_path, dry_run=False)
-        return result
+        return _orchestrator.delete_project(project_path, dry_run=False)
     except Exception as e:
         logger.error("delete_project_failed", project=project_name, error=str(e))
         raise HTTPException(status_code=500, detail="Internal server error")

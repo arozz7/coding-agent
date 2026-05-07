@@ -225,6 +225,12 @@ class AgentClient:
     async def set_project(self, name: str) -> dict:
         return await self._post("/workspace/project", {"name": name})
 
+    async def preview_delete_project(self, name: str) -> dict:
+        return await self._get(f"/projects/{name}/delete-preview")
+
+    async def delete_project(self, name: str) -> dict:
+        return await self._delete(f"/projects/{name}")
+
     async def get_session_history(self, session_id: str) -> dict:
         return await self._get(f"/sessions/{session_id}")
 
@@ -1098,11 +1104,13 @@ async def workspace(ctx: commands.Context):
 
 @bot.command(name="project")
 async def project_cmd(ctx: commands.Context, *, name: str = ""):
-    """Show or switch the active project.
+    """Show, switch, or delete a project.
 
-    !project              — show current project and workspace root
-    !project <name>       — switch to WORKSPACE_PATH/<name> (created if needed)
-    !project clear        — return to workspace root (for starting a new project)
+    !project                        — show current project and workspace root
+    !project <name>                 — switch to WORKSPACE_PATH/<name>
+    !project clear                  — return to workspace root
+    !project delete <name>          — preview what would be removed
+    !project delete <name> confirm  — permanently remove all agent data for project
     """
     name = name.strip()
 
@@ -1118,7 +1126,8 @@ async def project_cmd(ctx: commands.Context, *, name: str = ""):
                 f"**Active project:** `{project}`\n"
                 f"**Workspace root:** `{root}`\n"
                 f"**Effective path:** `{ws}`\n\n"
-                f"Use `!project <name>` to switch, `!project clear` to return to root."
+                f"Use `!project <name>` to switch, `!project clear` to return to root.\n"
+                f"Use `!project delete <name>` to preview project cleanup."
             )
         except Exception as exc:
             await ctx.send(f"Error fetching project info: {exc}")
@@ -1134,6 +1143,56 @@ async def project_cmd(ctx: commands.Context, *, name: str = ""):
             )
         except Exception as exc:
             await ctx.send(f"Could not clear project: {exc}")
+        return
+
+    # Delete subcommand — two-step: preview then confirm.
+    if name.lower().startswith("delete "):
+        rest = name[7:].strip()          # everything after "delete "
+        confirm = rest.endswith(" confirm")
+        project_name = rest[: -len(" confirm")].strip() if confirm else rest.strip()
+
+        if not project_name:
+            await ctx.send("Usage: `!project delete <name>` or `!project delete <name> confirm`")
+            return
+
+        if not confirm:
+            # Preview — show counts, prompt for confirmation.
+            try:
+                msg = await ctx.send(f"Checking data for project **{project_name}**…")
+                data = await bot.client.preview_delete_project(project_name)
+                await _safe_edit(
+                    msg,
+                    f"**Delete preview — `{project_name}`**\n"
+                    f"```\n"
+                    f"Sessions   : {data.get('sessions', 0)}\n"
+                    f"Jobs       : {data.get('jobs', 0)}\n"
+                    f"RAG chunks : {data.get('chroma_chunks', 0)}\n"
+                    f"Wiki entries: {data.get('wiki_entries', 0)}\n"
+                    f"```\n"
+                    f"Source files are **never** deleted.\n"
+                    f"To proceed: `!project delete {project_name} confirm`"
+                )
+            except Exception as exc:
+                await ctx.send(f"Preview failed: {exc}")
+            return
+
+        # Confirmed delete.
+        try:
+            msg = await ctx.send(f"Deleting agent data for **{project_name}**…")
+            data = await bot.client.delete_project(project_name)
+            await _safe_edit(
+                msg,
+                f"**Deleted — `{project_name}`**\n"
+                f"```\n"
+                f"Sessions removed : {data.get('deleted_sessions', 0)}\n"
+                f"Jobs removed     : {data.get('jobs', 0)}\n"
+                f"RAG chunks cleared: {data.get('chroma_chunks', 0)}\n"
+                f"Wiki entries     : {data.get('wiki_entries', 0)}\n"
+                f"```\n"
+                f"Source files untouched. Use `!project {project_name}` to reinitialise."
+            )
+        except Exception as exc:
+            await ctx.send(f"Delete failed: {exc}")
         return
 
     # Switch to named project.
@@ -1478,7 +1537,9 @@ async def helpme(ctx: commands.Context):
         "`!workspace` — Show workspace path and top-level contents\n"
         "`!project` — Show active project\n"
         "`!project <name>` — Switch to (or create) a project subdirectory\n"
-        "`!project clear` — Return to workspace root to start a new project\n\n"
+        "`!project clear` — Return to workspace root to start a new project\n"
+        "`!project delete <name>` — Preview agent data that would be removed\n"
+        "`!project delete <name> confirm` — Permanently remove all agent data (source files untouched)\n\n"
         "**Models:**\n"
         "`!models` — List all configured models\n"
         "`!model` — Show active model\n"

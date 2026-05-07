@@ -198,7 +198,8 @@ class TestOrchestratorDeleteProject:
         orch.task_store = TaskStore(jobs_db)
         return orch
 
-    def test_dry_run_returns_counts_without_deleting(self, tmp_path):
+    def test_dry_run_returns_counts_without_deleting(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("WORKSPACE_PATH", str(tmp_path))
         proj_path = tmp_path / "my-proj"
         proj_path.mkdir()
         (proj_path / ".agent-wiki").mkdir()
@@ -222,7 +223,8 @@ class TestOrchestratorDeleteProject:
         # Session still exists
         assert orch.session_memory.list_sessions_by_project(str(proj_path)) == ["sess-1"]
 
-    def test_full_delete_clears_all_stores(self, tmp_path):
+    def test_full_delete_clears_all_stores(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("WORKSPACE_PATH", str(tmp_path))
         proj_path = tmp_path / "my-proj"
         proj_path.mkdir()
         wiki_dir = proj_path / ".agent-wiki"
@@ -243,7 +245,8 @@ class TestOrchestratorDeleteProject:
         # Source files untouched
         assert proj_path.exists()
 
-    def test_delete_project_no_wiki_dir(self, tmp_path):
+    def test_delete_project_no_wiki_dir(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("WORKSPACE_PATH", str(tmp_path))
         proj_path = tmp_path / "bare-proj"
         proj_path.mkdir()
 
@@ -252,3 +255,12 @@ class TestOrchestratorDeleteProject:
 
         assert result["wiki_entries"] == 0
         assert result["deleted_sessions"] == 0
+
+    def test_delete_project_rejects_path_outside_workspace(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("WORKSPACE_PATH", str(tmp_path))
+        orch = self._make_orchestrator(tmp_path)
+        import tempfile, pytest
+        outside = Path(tempfile.gettempdir()) / "evil-proj"
+        outside.mkdir(exist_ok=True)
+        with pytest.raises(ValueError, match="outside workspace root"):
+            orch.delete_project(str(outside), dry_run=True)
