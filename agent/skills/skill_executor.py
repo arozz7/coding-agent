@@ -156,8 +156,14 @@ class SkillExecutor:
             )
             return {"report": f"wiki-compile: entry written to {rel_path} (no LLM synthesis)"}
 
+        project_scope = self.wiki.project_name or "workspace-root"
         synthesis_prompt = f"""You are a knowledge compiler for an agent wiki.
 Given the task and result below, write a concise wiki entry in markdown.
+
+IMPORTANT: This wiki belongs to project "{project_scope}".
+Only capture knowledge that is directly relevant to THIS project.
+Do NOT include details, names, or references from unrelated projects that may appear in the result text.
+If the result mixes multiple projects, only extract the portion relevant to "{project_scope}".
 
 Task: {task}
 
@@ -171,7 +177,7 @@ Write a wiki entry with:
 4. Confidence on the fourth line starting with "CONFIDENCE: " (high, medium, or speculative)
 5. Then the body: ## Summary (2-3 sentences), ## Key Details (bullet points), ## Connections (wikilinks if any)
 
-Be concise. The entry should be useful for future tasks, not a task log."""
+Be concise. The entry should be useful for future tasks on project "{project_scope}", not a task log."""
 
         try:
             config = model_router.get_model("coding")

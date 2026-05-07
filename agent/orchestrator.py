@@ -892,7 +892,14 @@ class AgentOrchestrator:
         # --- Direct execution (all other types, or inner loop calls) ---
         session_executor = self._create_session_executor(session_id)
         enriched_context = await self._build_enriched_context(task)
-        history = self._build_context_from_events(session_id)
+        # Session history is NOT injected for research/develop tasks inside
+        # the task loop — only the wiki+RAG enriched context is used.  This
+        # prevents cross-project session events (from a prior project switch)
+        # from bleeding into the current project's research output and wiki.
+        # Chat and other interactive types still get the full history so
+        # conversational continuity is preserved.
+        _include_history = task_type not in ("research", "develop", "test", "researcher")
+        history = self._build_context_from_events(session_id) if _include_history else ""
         context = {
             "session_id": session_id,
             "workspace_path": get_workspace(),

@@ -1136,13 +1136,22 @@ async def project_cmd(ctx: commands.Context, *, name: str = ""):
             await ctx.send(f"Error fetching project info: {exc}")
         return
 
-    # Clear back to workspace root.
+    # Clear back to workspace root — also reset the session.
     if name.lower() == "clear":
+        user_id = str(ctx.author.id)
+        old_session = bot.user_sessions.get(user_id)
         try:
             data = await bot.client.set_project("")
+            if old_session:
+                try:
+                    await bot.client.delete_session(old_session)
+                except Exception:
+                    pass
+            bot.user_sessions.pop(user_id, None)
+            bot.user_jobs.pop(user_id, None)
             await ctx.send(
                 f"Cleared to workspace root: `{data.get('workspace')}`\n"
-                f"The agent will now create a new subdirectory for the next project."
+                f"Session cleared — ready for a new project."
             )
         except Exception as exc:
             await ctx.send(f"Could not clear project: {exc}")
@@ -1198,13 +1207,24 @@ async def project_cmd(ctx: commands.Context, *, name: str = ""):
             await ctx.send(f"Delete failed: {exc}")
         return
 
-    # Switch to named project.
+    # Switch to named project — also reset the session so no prior-project
+    # history bleeds into the new project's context.
+    user_id = str(ctx.author.id)
+    old_session = bot.user_sessions.get(user_id)
     try:
         data = await bot.client.set_project(name)
+        # Clear old session (idempotent even if none existed).
+        if old_session:
+            try:
+                await bot.client.delete_session(old_session)
+            except Exception:
+                pass
+        bot.user_sessions.pop(user_id, None)
+        bot.user_jobs.pop(user_id, None)
         await ctx.send(
             f"Switched to project **{name}**\n"
             f"Workspace: `{data.get('workspace')}`\n"
-            f"Directory created if it did not exist. Ready for `!ask`."
+            f"Session cleared — fresh context for this project. Ready for `!ask`."
         )
     except Exception as exc:
         await ctx.send(f"Could not switch project: {exc}")
