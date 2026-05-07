@@ -8,6 +8,7 @@ import subprocess
 import structlog
 
 from agent.security.prompt_guard import guard_task
+from agent.workspace_context import get_workspace
 
 from llm import ModelRouter
 from agent.memory import SessionMemory, CodebaseMemory
@@ -161,14 +162,15 @@ class AgentOrchestrator:
         self.logger.info("spawning_subagent", subagent_id=subagent_id, role=role, task=task[:100])
 
         # Ensure session exists before creating executor (EventEmittingExecutor requires it)
-        self.session_memory.get_or_create_session(subagent_id, self.workspace_path)
+        _ws_now = get_workspace()
+        self.session_memory.get_or_create_session(subagent_id, _ws_now)
         enriched_context = await self._build_enriched_context(task)
 
         # Create isolated context for subagent
         isolated_context = {
             "session_id": subagent_id,
             "parent_session_id": parent_session_id,
-            "workspace_path": self.workspace_path,
+            "workspace_path": _ws_now,
             "model_router": self.model_router,
             "tool_executor": self._create_session_executor(subagent_id),
             "enriched_context": enriched_context,
@@ -216,9 +218,9 @@ class AgentOrchestrator:
             # so future searches in the parent session can find them.
             files_created = result.get("files_created", [])
             if files_created and result.get("success"):
-                project_id = Path(self.workspace_path).name
+                project_id = Path(_ws_now).name
                 for rel_path in files_created:
-                    abs_path = Path(self.workspace_path) / rel_path
+                    abs_path = Path(_ws_now) / rel_path
                     if abs_path.exists() and abs_path.is_file():
                         try:
                             self.codebase_memory.index_files(
@@ -787,7 +789,8 @@ class AgentOrchestrator:
         # 0b. Workspace file listing — shallow snapshot so agents know what files exist
         #     without having to run a shell command. Capped at 80 entries to stay concise.
         try:
-            ws_root = Path(self.workspace_path)
+            _ws_now = get_workspace()
+            ws_root = Path(_ws_now)
             if ws_root.exists():
                 ws_lines: list[str] = []
                 _IGNORE = {".git", "node_modules", "__pycache__", ".agent-wiki", "logs", "-p"}
@@ -803,7 +806,7 @@ class AgentOrchestrator:
                         break
                 if ws_lines:
                     parts.append(
-                        f"\n\n## Workspace Files ({self.workspace_path})\n"
+                        f"\n\n## Workspace Files ({_ws_now})\n"
                         + "\n".join(ws_lines)
                     )
         except Exception as _ws_err:
@@ -816,7 +819,7 @@ class AgentOrchestrator:
 
         # 2. RAG — semantic code search from vector store
         try:
-            project_id = Path(self.workspace_path).name
+            project_id = Path(get_workspace()).name
             rag_ctx = self.codebase_memory.get_relevant_context(task, project_id, max_chunks=3)
             if rag_ctx:
                 parts.append(rag_ctx)
@@ -847,6 +850,7 @@ class AgentOrchestrator:
         on_phase: Optional[Callable[[str], None]] = None,
         job_id: Optional[str] = None,
         _direct: bool = False,
+        extra_context: str = "",
     ) -> dict:
         """Route a task to the appropriate agent.
 
@@ -889,10 +893,10 @@ class AgentOrchestrator:
         history = self._build_context_from_events(session_id)
         context = {
             "session_id": session_id,
-            "workspace_path": self.workspace_path,
+            "workspace_path": get_workspace(),
             "model_router": self.model_router,
             "tool_executor": session_executor,
-            "enriched_context": enriched_context + history,
+            "enriched_context": enriched_context + history + extra_context,
             "on_phase": on_phase,
         }
 
@@ -975,6 +979,9 @@ class AgentOrchestrator:
         task_summaries: list[str] = []
         screenshot_path: Optional[str] = None
         task_num = 0
+        # Accumulates research synthesis from earlier tasks so developer/test
+        # agents in the same loop can use those findings as context.
+        prior_research: list[str] = []
 
         # 3. Execute loop
         while True:
@@ -1013,6 +1020,12 @@ class AgentOrchestrator:
                 _emit(f"task:{task_num}/{total}:{_at}:{inner_label}")
 
             try:
+                # Inject prior research findings for develop/test tasks so the
+                # agent has context from preceding research steps in this loop.
+                _extra = ""
+                if prior_research and agent_type in ("develop", "test"):
+                    _extra = "\n\n## Prior research findings\n\n" + "\n\n---\n\n".join(prior_research)
+
                 result = await self._run_specialized_agent(
                     description,
                     agent_type,
@@ -1020,6 +1033,7 @@ class AgentOrchestrator:
                     on_phase=_wrapped_on_phase,
                     job_id=None,     # prevent re-entering the loop
                     _direct=True,    # go straight to agent
+                    extra_context=_extra,
                 )
 
                 # Surface any model-switch events that fired during this step.
@@ -1038,6 +1052,10 @@ class AgentOrchestrator:
                     all_files.extend(new_files)
                     if result.get("screenshot_path"):
                         screenshot_path = result.get("screenshot_path")
+
+                    # Capture research synthesis so later develop/test tasks can use it.
+                    if agent_type in ("research", "researcher"):
+                        prior_research.append(response_text[:2000])
 
                     # Agent may append new tasks dynamically
                     new_task_specs = result.get("new_tasks", [])
