@@ -1096,6 +1096,43 @@ async def search_codebase(q: str, limit: int = 5):
         raise HTTPException(status_code=500, detail="Internal server error")
 
 
+@app.get("/projects/{project_name}/delete-preview")
+async def preview_delete_project(project_name: str, workspace_root: str = ""):
+    """Return a count of what would be removed by DELETE /projects/{project_name}.
+
+    No data is modified.  workspace_root defaults to the WORKSPACE_PATH env var.
+    """
+    if not _orchestrator:
+        raise HTTPException(status_code=503, detail="Agent not initialized")
+    root = workspace_root.strip() or os.getenv("WORKSPACE_PATH", "./workspace")
+    project_path = str(Path(root) / project_name)
+    try:
+        return _orchestrator.delete_project(project_path, dry_run=True)
+    except Exception as e:
+        logger.error("preview_delete_failed", project=project_name, error=str(e))
+        raise HTTPException(status_code=500, detail="Internal server error")
+
+
+@app.delete("/projects/{project_name}")
+async def delete_project(project_name: str, workspace_root: str = ""):
+    """Remove all agent-managed data for a project.
+
+    Deletes: Chroma vectors, jobs, agent_tasks, sessions, and .agent-wiki/.
+    Project source files are never touched.  workspace_root defaults to
+    the WORKSPACE_PATH env var.
+    """
+    if not _orchestrator:
+        raise HTTPException(status_code=503, detail="Agent not initialized")
+    root = workspace_root.strip() or os.getenv("WORKSPACE_PATH", "./workspace")
+    project_path = str(Path(root) / project_name)
+    try:
+        result = _orchestrator.delete_project(project_path, dry_run=False)
+        return result
+    except Exception as e:
+        logger.error("delete_project_failed", project=project_name, error=str(e))
+        raise HTTPException(status_code=500, detail="Internal server error")
+
+
 @app.get("/memory/stats")
 async def get_memory_stats():
     """Get statistics about the vector store and MemoryWiki graph (with lint results)."""

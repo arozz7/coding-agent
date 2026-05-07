@@ -401,5 +401,37 @@ class SessionMemory:
         self.logger.info("session_deleted", session_id=session_id)
         return True
 
+    def list_sessions_by_project(self, project_path: str) -> List[str]:
+        """Return all session IDs whose project_path matches *project_path*.
+
+        Normalises path separators before comparing so Windows/POSIX paths
+        stored from different environments still match.
+        """
+        normalised = str(Path(project_path))
+        with self._lock:
+            cursor = self.conn.cursor()
+            cursor.execute("SELECT id, project_path FROM sessions")
+            rows = cursor.fetchall()
+        return [
+            row[0]
+            for row in rows
+            if row[1] and str(Path(row[1])) == normalised
+        ]
+
+    def delete_sessions_by_project(self, project_path: str) -> int:
+        """Delete every session (plus messages and tasks) for *project_path*.
+
+        Returns the number of sessions removed.
+        """
+        session_ids = self.list_sessions_by_project(project_path)
+        for sid in session_ids:
+            self.delete_session(sid)
+        self.logger.info(
+            "sessions_deleted_by_project",
+            project_path=project_path,
+            count=len(session_ids),
+        )
+        return len(session_ids)
+
     def close(self) -> None:
         self.conn.close()

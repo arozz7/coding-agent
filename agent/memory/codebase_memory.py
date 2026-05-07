@@ -283,6 +283,17 @@ class CodebaseMemory:
 
         return formatted
 
+    def count_project_chunks(self, project_id: str) -> int:
+        """Return the number of file chunks indexed for *project_id*."""
+        try:
+            result = self.files_collection.get(
+                where={"project_id": project_id},
+                include=[],
+            )
+            return len(result["ids"])
+        except Exception:
+            return 0
+
     def clear_project(self, project_id: str) -> None:
         try:
             self.files_collection.delete(where={"project_id": project_id})

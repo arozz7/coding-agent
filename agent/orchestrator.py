@@ -1508,3 +1508,63 @@ class AgentOrchestrator:
 
     def get_session_info(self, session_id: str) -> dict:
         return self.session_memory.get_session_summary(session_id)
+
+    def delete_project(self, project_path: str, dry_run: bool = False) -> dict:
+        """Remove all agent-managed data for a project from every storage layer.
+
+        Clears the Chroma vector index, SQLite jobs/tasks, SQLite sessions, and
+        the .agent-wiki directory.  The project source files are never touched.
+
+        Args:
+            project_path: Absolute path to the project workspace directory.
+            dry_run:      When True, return a count preview without deleting.
+
+        Returns:
+            Summary dict with counts of what was (or would be) deleted.
+        """
+        import shutil
+
+        project_name = Path(project_path).name
+
+        # --- Preview phase (always runs) ---
+        session_ids = self.session_memory.list_sessions_by_project(project_path)
+        job_count = self.task_store.count_by_session_ids(session_ids)
+        chroma_chunks = self.codebase_memory.count_project_chunks(project_name)
+
+        wiki_entries = 0
+        wiki_dir = Path(project_path) / ".agent-wiki"
+        wiki_index = wiki_dir / "index.md"
+        if wiki_index.exists():
+            try:
+                lines = wiki_index.read_text(encoding="utf-8").splitlines()
+                wiki_entries = sum(
+                    1 for ln in lines
+                    if ln.startswith("|") and ".md" in ln and "Path" not in ln
+                )
+            except OSError:
+                pass
+
+        summary = {
+            "project_path": project_path,
+            "project_name": project_name,
+            "sessions": len(session_ids),
+            "jobs": job_count,
+            "chroma_chunks": chroma_chunks,
+            "wiki_entries": wiki_entries,
+            "dry_run": dry_run,
+        }
+
+        if dry_run:
+            return summary
+
+        # --- Delete phase ---
+        self.codebase_memory.clear_project(project_name)
+        self.task_store.delete_by_session_ids(session_ids)
+        deleted_sessions = self.session_memory.delete_sessions_by_project(project_path)
+
+        if wiki_dir.exists():
+            shutil.rmtree(wiki_dir)
+
+        summary["deleted_sessions"] = deleted_sessions
+        self.logger.info("project_deleted", **{k: v for k, v in summary.items() if isinstance(v, (str, int, bool, float))})
+        return summary
