@@ -881,8 +881,11 @@ async def wiki_migrate(request: dict):
     project = (request.get("project") or "").strip()
     if not project or not re.fullmatch(r"[A-Za-z0-9._\-]+", project):
         raise HTTPException(status_code=400, detail="Invalid project name")
+    safe_project = Path(project).name
+    if safe_project != project:
+        raise HTTPException(status_code=400, detail="Invalid project name")
     workspace_root = Path(WORKSPACE_PATH).resolve()
-    target_path = (workspace_root / project).resolve()
+    target_path = (workspace_root / safe_project).resolve()
     if not target_path.is_relative_to(workspace_root):
         raise HTTPException(status_code=400, detail="Invalid project name")
     target_path.mkdir(parents=True, exist_ok=True)

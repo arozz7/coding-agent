@@ -3,7 +3,10 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 import os
+import re
 import structlog
+
+_PROJECT_NAME_RE = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9_.\-]*$")
 
 from agent.security.prompt_guard import guard_task
 from agent.workspace_context import get_workspace
@@ -1146,8 +1149,16 @@ class AgentOrchestrator:
         """
         import shutil
 
+        _project_name = project_name.strip()
+        if (
+            not _project_name
+            or not _PROJECT_NAME_RE.match(_project_name)
+            or _project_name in {".", ".."}
+            or Path(_project_name).name != _project_name
+        ):
+            raise ValueError(f"Invalid project_name {project_name!r}")
         _ws_root = Path(os.getenv("WORKSPACE_PATH", "./workspace")).resolve()
-        _project_dir = (_ws_root / project_name).resolve()
+        _project_dir = (_ws_root / _project_name).resolve()
         if not _project_dir.is_relative_to(_ws_root):
             raise ValueError(
                 f"project_name {project_name!r} is outside workspace root {_ws_root}"

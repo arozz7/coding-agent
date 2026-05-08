@@ -260,5 +260,5 @@ class TestOrchestratorDeleteProject:
         monkeypatch.setenv("WORKSPACE_PATH", str(tmp_path))
         orch = self._make_orchestrator(tmp_path)
         import pytest
-        with pytest.raises(ValueError, match="outside workspace root"):
+        with pytest.raises(ValueError):
             orch.delete_project("../evil-traversal", dry_run=True)
