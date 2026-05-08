@@ -1,3 +1,4 @@
+import os
 from pathlib import Path
 from typing import List, Dict, Optional, Set
 import networkx as nx
@@ -339,6 +340,89 @@ class MemoryWiki:
                         if module and (f1_module.endswith(module) or module.endswith(f1_module)):
                             return True
         return False
+
+    def query(self, terms: list[str], max_results: int = 10) -> str:
+        """Keyword search across all graph nodes; returns a formatted context block.
+
+        Searches node IDs (file paths, function names, class names) for any of
+        the given terms.  Returns an empty string when the graph is empty or no
+        terms match — callers should treat empty-string as "no context available."
+        """
+        if not terms or not self.graph.nodes:
+            return ""
+
+        hits: list[tuple[str, dict]] = []
+        for node_id, data in self.graph.nodes(data=True):
+            if any(t.lower() in node_id.lower() for t in terms):
+                hits.append((node_id, data))
+
+        if not hits:
+            return ""
+
+        lines = [f"## Code graph — {len(hits)} match(es) for {terms[:3]}"]
+        for node_id, data in hits[:max_results]:
+            ntype = data.get("type", "?")
+            if ntype == "function":
+                lines.append(
+                    f"- `{node_id}` function  "
+                    f"{data.get('file_path', '')}:{data.get('line_start', '?')}"
+                )
+            elif ntype == "class":
+                lines.append(
+                    f"- `{node_id}` class  "
+                    f"{data.get('file_path', '')}:{data.get('line_start', '?')}"
+                )
+            elif ntype == "file":
+                lines.append(f"- `{node_id}` file")
+            elif ntype == "import":
+                lines.append(f"- `{node_id}` → `{data.get('to_module', '?')}`")
+        return "\n".join(lines)
+
+    def update_from_files(self, file_paths: list[str]) -> None:
+        """Populate/update the graph by scanning Python files with ast.parse.
+
+        Idempotent: re-adding a known file is a no-op (add_file/add_function
+        guard against duplicates).
+        """
+        import ast
+
+        _ws_base = Path(os.getenv("WORKSPACE_PATH", "./workspace")).resolve()
+        for file_path in file_paths:
+            fp = (_ws_base / file_path).resolve()
+            if not fp.is_relative_to(_ws_base) or fp.suffix != ".py" or not fp.exists():
+                continue
+            try:
+                source = fp.read_text(encoding="utf-8", errors="ignore")
+                tree = ast.parse(source, filename=str(fp))
+            except (SyntaxError, UnicodeDecodeError, OSError):
+                continue
+
+            self.add_file(file_path, file_type="source", language="python")
+
+            for node in ast.walk(tree):
+                if isinstance(node, ast.FunctionDef):
+                    self.add_function(
+                        file_path=file_path,
+                        function_name=node.name,
+                        signature=node.name,
+                        line_start=node.lineno,
+                        line_end=getattr(node, "end_lineno", node.lineno),
+                    )
+                elif isinstance(node, ast.ClassDef):
+                    self.add_class(
+                        file_path=file_path,
+                        class_name=node.name,
+                        line_start=node.lineno,
+                        line_end=getattr(node, "end_lineno", node.lineno),
+                    )
+                elif isinstance(node, ast.ImportFrom) and node.module:
+                    names = [a.name for a in node.names]
+                    self.add_import(file_path, node.module, names)
+                elif isinstance(node, ast.Import):
+                    for alias in node.names:
+                        self.add_import(file_path, alias.name, [alias.asname or alias.name])
+
+        self.logger.debug("memory_wiki_updated", files=len(file_paths))
 
     def clear(self) -> None:
         self.graph.clear()

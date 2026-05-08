@@ -80,6 +80,20 @@ class SessionMemory:
         """
         )
 
+        cursor.execute(
+            """
+            CREATE TABLE IF NOT EXISTS episodic_memory (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                session_id TEXT,
+                task_text TEXT NOT NULL,
+                result_summary TEXT,
+                score INTEGER DEFAULT 0,
+                task_type TEXT DEFAULT '',
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+            """
+        )
+
         self.conn.commit()
 
     def create_session(
@@ -337,6 +351,79 @@ class SessionMemory:
                 "message_count": row[6],
             }
             for row in rows
+        ]
+
+    # ------------------------------------------------------------------
+    # Episodic memory
+    # ------------------------------------------------------------------
+
+    def store_episodic(
+        self,
+        session_id: str,
+        task_text: str,
+        result_summary: str,
+        score: int,
+        task_type: str = "",
+    ) -> None:
+        """Persist a high-quality task result for future episodic retrieval."""
+        with self._lock:
+            cursor = self.conn.cursor()
+            cursor.execute(
+                """
+                INSERT INTO episodic_memory (session_id, task_text, result_summary, score, task_type)
+                VALUES (?, ?, ?, ?, ?)
+                """,
+                (session_id, task_text[:500], result_summary[:1000], score, task_type),
+            )
+            self.conn.commit()
+        self.logger.debug("episodic_stored", score=score, task_type=task_type)
+
+    def get_similar_tasks(
+        self,
+        query: str,
+        limit: int = 3,
+        min_score: int = 7,
+    ) -> List[dict]:
+        """Return past high-quality task results whose text overlaps with query.
+
+        Uses SQLite LIKE matching on individual words (stopwords excluded).
+        Returns an empty list when no matches are found or the table is empty.
+        """
+        _STOP = {"the", "a", "an", "and", "or", "in", "on", "to", "for", "of", "is", "it"}
+        terms = [
+            w for w in query.lower().split()
+            if w not in _STOP and len(w) > 2
+        ][:6]
+        if not terms:
+            return []
+
+        cursor = self.conn.cursor()
+        try:
+            conditions = " OR ".join(["task_text LIKE ?"] * len(terms))
+            params = [f"%{t}%" for t in terms] + [min_score, limit]
+            cursor.execute(
+                f"""
+                SELECT task_text, result_summary, score, task_type, created_at
+                FROM episodic_memory
+                WHERE ({conditions}) AND score >= ?
+                ORDER BY score DESC, created_at DESC
+                LIMIT ?
+                """,
+                params,
+            )
+            rows = cursor.fetchall()
+        except Exception:
+            return []
+
+        return [
+            {
+                "task_text": r[0],
+                "result_summary": r[1],
+                "score": r[2],
+                "task_type": r[3],
+                "created_at": r[4],
+            }
+            for r in rows
         ]
 
     def get_or_create_session(

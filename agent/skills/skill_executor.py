@@ -81,12 +81,13 @@ class SkillExecutor:
         task: str,
         result: dict[str, Any],
         model_router=None,
+        verifier_score: int | None = None,
     ) -> dict[str, Any]:
         """Run a post-task skill. Returns a report dict."""
         self.logger.info("skill_post_execute", skill=skill_name)
 
         if skill_name == "wiki-compile":
-            return await self._wiki_compile(task, result, model_router)
+            return await self._wiki_compile(task, result, model_router, verifier_score=verifier_score)
 
         if skill_name == "wiki-lint":
             return {"report": self.wiki.lint()}
@@ -138,9 +139,16 @@ class SkillExecutor:
             return ""
 
     async def _wiki_compile(
-        self, task: str, result: dict[str, Any], model_router=None
+        self, task: str, result: dict[str, Any], model_router=None,
+        verifier_score: int | None = None,
     ) -> dict[str, Any]:
         """Synthesize a wiki entry from task+result using the LLM, then write it."""
+        if verifier_score is not None and verifier_score < 7:
+            self.logger.info(
+                "wiki_compile_skipped_low_quality", verifier_score=verifier_score
+            )
+            return {"report": f"wiki-compile: skipped (verifier score {verifier_score}/10 < 7)"}
+
         response = result.get("response", "")
         if not response:
             return {"report": "wiki-compile: no response to compile."}
@@ -208,6 +216,9 @@ Be concise. The entry should be useful for future tasks on project "{project_sco
                     body_start = i + 1
 
             body = "\n".join(lines[body_start:]).strip()
+            # Verifier-passed outputs are always high-confidence regardless of LLM opinion.
+            if verifier_score is not None and verifier_score >= 7:
+                confidence = "high"
             rel_path = self.wiki.compile(
                 title=title,
                 content=body,

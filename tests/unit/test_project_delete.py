@@ -213,7 +213,7 @@ class TestOrchestratorDeleteProject:
         orch = self._make_orchestrator(tmp_path)
         orch.session_memory.create_session("sess-1", str(proj_path))
 
-        result = orch.delete_project(str(proj_path), dry_run=True)
+        result = orch.delete_project("my-proj", dry_run=True)
 
         assert result["dry_run"] is True
         assert result["sessions"] == 1
@@ -234,7 +234,7 @@ class TestOrchestratorDeleteProject:
         orch = self._make_orchestrator(tmp_path)
         orch.session_memory.create_session("sess-2", str(proj_path))
 
-        result = orch.delete_project(str(proj_path), dry_run=False)
+        result = orch.delete_project("my-proj", dry_run=False)
 
         assert result["dry_run"] is False
         assert result["deleted_sessions"] == 1
@@ -251,7 +251,7 @@ class TestOrchestratorDeleteProject:
         proj_path.mkdir()
 
         orch = self._make_orchestrator(tmp_path)
-        result = orch.delete_project(str(proj_path), dry_run=False)
+        result = orch.delete_project("bare-proj", dry_run=False)
 
         assert result["wiki_entries"] == 0
         assert result["deleted_sessions"] == 0
@@ -259,8 +259,6 @@ class TestOrchestratorDeleteProject:
     def test_delete_project_rejects_path_outside_workspace(self, tmp_path, monkeypatch):
         monkeypatch.setenv("WORKSPACE_PATH", str(tmp_path))
         orch = self._make_orchestrator(tmp_path)
-        import tempfile, pytest
-        outside = Path(tempfile.gettempdir()) / "evil-proj"
-        outside.mkdir(exist_ok=True)
+        import pytest
         with pytest.raises(ValueError, match="outside workspace root"):
-            orch.delete_project(str(outside), dry_run=True)
+            orch.delete_project("../evil-traversal", dry_run=True)

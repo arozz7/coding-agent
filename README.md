@@ -30,6 +30,9 @@ An autonomous coding agent with LLM integration, multi-agent orchestration, SDLC
 - **Security Layer** — Prompt injection detection blocks known jailbreak patterns before input reaches any LLM prompt; shell commands that reference absolute paths outside the workspace are rejected; optional `AGENT_API_KEY` header auth on all mutating API endpoints; SQLite session store uses WAL mode + `threading.RLock` for concurrent-access safety
 - **Agent Wiki Memory** — Per-project `.agent-wiki/` knowledge base: each project subdirectory owns its wiki; entries are tagged with the active project so queries never surface stale context from other projects; `!wiki status/query/clean/migrate` commands for full interactive control
 - **RAG Memory** — Codebase indexed in ChromaDB; retrieved context injected into every task. Searches are project-scoped — Chroma queries include a `project_id` filter, eliminating cross-project content contamination.
+- **Write-path Quality Gate** — Wiki-compile (post-task knowledge extraction) only runs when the verifier scores the output ≥ 7/10. Below-threshold outputs are silently skipped, keeping the wiki free of incomplete or low-quality entries.
+- **Code-Graph Context (MemoryWiki)** — For developer, reviewer, and tester tasks, the orchestrator builds a live AST-based dependency graph from workspace Python files and injects matching nodes (functions, classes, import chains) as context before each task.
+- **Episodic Memory** — High-scoring past task results (verifier score ≥ 7) are persisted in SQLite. Before each task the orchestrator retrieves keyword-matched similar work and injects it as context, enabling the agent to reuse proven approaches across sessions.
 - **Verifier / Critic Agent** — After each develop or research job, a dedicated `VerifierAgent` scores the output 0–10 against the original objective. Scores below 7 trigger a targeted fix task and re-run (max 2 rounds). Research rubric checks coverage, depth, format compliance, and actionability; code rubric checks requirement fulfilment, completeness, correctness, and test results (runs pytest when available).
 - **Deep Research Mode** — Research agent decomposes into up to 8 sub-questions, runs up to 4 follow-up gap-fill passes, and performs up to 3 coverage-check rounds to ensure no topic is missed. Content budget is 28 k chars. When "capture to markdown files" is requested, the synthesis is split by section into individual `.md` files under `research-output/`.
 - **Project Lifecycle Management** — Full project delete via API (`DELETE /projects/{name}`) and Discord (`!project delete <name> confirm`). Dry-run preview shows artifact counts before deletion. Removes Chroma chunks, SQLite sessions/jobs/tasks, and `.agent-wiki/`. Workspace containment guard prevents deleting outside `WORKSPACE_PATH`.
@@ -298,9 +301,15 @@ coding-agent/
 │   │   ├── architect_agent.py     # System design and ADRs
 │   │   ├── plan_agent.py          # Implementation planning
 │   │   └── chat_agent.py          # Conversational responses
+│   ├── orchestration/
+│   │   ├── __init__.py            # Re-exports ContextBuilder, TaskRouter, VerifierCoordinator
+│   │   ├── context_builder.py     # Enriched prompt context: wiki-query, RAG, env, code-graph, episodic memory
+│   │   ├── task_router.py         # Task-type classification (keyword fast-path + LLM fallback)
+│   │   └── verifier_coordinator.py # Runs verifier rubrics, builds fix-task specs
 │   ├── memory/
-│   │   ├── session_memory.py      # SQLite conversation history
-│   │   └── codebase_memory.py     # ChromaDB vector store (RAG)
+│   │   ├── session_memory.py      # SQLite conversation history + episodic memory table
+│   │   ├── codebase_memory.py     # ChromaDB vector store (RAG)
+│   │   └── memory_wiki.py         # In-memory AST code-dependency graph (MemoryWiki)
 │   ├── skills/
 │   │   ├── skill_executor.py      # Pre/post skill execution (wiki-query, wiki-compile)
 │   │   ├── skill_loader.py        # Lazy skill content loading

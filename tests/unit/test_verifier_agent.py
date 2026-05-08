@@ -56,7 +56,8 @@ def _make_agent(json_response: str) -> VerifierAgent:
 class TestVerifierAgentResearch:
     @pytest.mark.asyncio
     async def test_pass_on_high_score(self):
-        agent = _make_agent('{"score": 8, "gaps": [], "feedback": "Comprehensive."}')
+        # New two-call format: Call 1 uses coverage (0-5) + depth (0-5)
+        agent = _make_agent('{"coverage": 4, "depth": 4, "gaps": [], "feedback": "Comprehensive."}')
         result = await agent.verify_research("do deep research on X", "full report here", [])
         assert result.passed is True
         assert result.score == 8
@@ -88,15 +89,17 @@ class TestVerifierAgentResearch:
 
     @pytest.mark.asyncio
     async def test_malformed_json_returns_default(self):
+        # Malformed JSON → coverage=2, depth=2 → score=4 (0-5 defaults)
         agent = _make_agent("I cannot evaluate this.")
         result = await agent.verify_research("objective", "response", [])
-        assert result.score == 5
-        assert result.passed is False  # 5 < 7
+        assert result.score == 4
+        assert result.passed is False  # 4 < 7
 
     @pytest.mark.asyncio
     async def test_extra_fields_in_json_ignored(self):
+        # New format: coverage + depth; extra keys are ignored
         agent = _make_agent(
-            '{"score": 9, "gaps": [], "feedback": "Good.", "unexpected_key": "value"}'
+            '{"coverage": 5, "depth": 4, "gaps": [], "feedback": "Good.", "unexpected_key": "value"}'
         )
         result = await agent.verify_research("obj", "resp", [])
         assert result.score == 9

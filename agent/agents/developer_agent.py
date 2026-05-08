@@ -102,7 +102,7 @@ def _npm_install_cmd(verify_cmd: str) -> str:
 # Maximum characters of error output sent to the LLM per iteration.
 # TypeScript / webpack errors repeat the same stack endlessly — cap them
 # so we don't blow up the context window on iteration 3+.
-_MAX_ERROR_CHARS = 4000
+_MAX_ERROR_CHARS = 2000
 
 # Regex to extract source file paths from compiler / runtime error messages.
 # Matches patterns like:  src/foo/bar.ts:10:5  or  ./src/foo/bar.tsx
@@ -117,7 +117,7 @@ _SKIP_PATH_PREFIXES: tuple[str, ...] = tuple(
         "SKIP_PATH_PREFIXES", "dist/,build/,node_modules/,.cache/"
     ).split(",") if p.strip()
 )
-_MAX_FIX_FILE_CONTEXT = 8000   # total chars of source included in fix prompts
+_MAX_FIX_FILE_CONTEXT = 4000   # total chars of source included in fix prompts
 _MAX_FIX_FILE_PER_FILE = 3000  # chars per individual file
 
 # Maximum number of fix-attempt prose blocks accumulated into the response
@@ -205,7 +205,14 @@ Guidelines:
 - Prefer EDIT: over FILE: for bug fixes when line numbers are unavailable.
 - Use FILE: only for new files or when rewriting more than 60% of a file.
 - Use find_files and grep_code instead of shell find/grep — they work cross-platform.
-- Be concise in your responses."""
+- Be concise in your responses.
+
+Code quality rules (apply to all code you write):
+- Function names: verb-noun pattern (fetch_user, calculate_total, is_valid_email)
+- Early returns: guard at the top, never nest more than 2 levels deep
+- Named constants: UPPER_CASE for magic numbers/strings (MAX_RETRIES = 3, not if count > 3)
+- One responsibility per function; keep functions under 50 lines
+- No comments that restate the code — only comment the WHY when non-obvious"""
 
     async def _run_shell_blocks(
         self, response: str, tool_executor

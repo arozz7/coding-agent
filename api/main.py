@@ -882,7 +882,9 @@ async def wiki_migrate(request: dict):
     if not project or not re.fullmatch(r"[A-Za-z0-9._\-]+", project):
         raise HTTPException(status_code=400, detail="Invalid project name")
     workspace_root = Path(WORKSPACE_PATH).resolve()
-    target_path = workspace_root / project
+    target_path = (workspace_root / project).resolve()
+    if not target_path.is_relative_to(workspace_root):
+        raise HTTPException(status_code=400, detail="Invalid project name")
     target_path.mkdir(parents=True, exist_ok=True)
     result = _orchestrator.wiki_manager.migrate_to(project, str(target_path))
     return {"success": True, "project": project, **result}
@@ -1130,22 +1132,6 @@ async def search_codebase(q: str, limit: int = 5):
 _PROJECT_NAME_RE = re.compile(r'^[a-zA-Z0-9][a-zA-Z0-9_.-]*$')
 
 
-def _resolve_project_path(project_name: str) -> str:
-    """Validate *project_name* and return its absolute path within WORKSPACE_PATH.
-
-    Base is read from the env var only (untainted).  An inline is_relative_to
-    check confirms the resolved path stays inside the workspace root before
-    the string is returned.  Raises HTTPException on any violation.
-    """
-    if not _PROJECT_NAME_RE.match(project_name):
-        raise HTTPException(status_code=400, detail="Invalid project name")
-    _ws_root = Path(os.getenv("WORKSPACE_PATH", "./workspace")).resolve()
-    _candidate = (_ws_root / project_name).resolve()
-    if not _candidate.is_relative_to(_ws_root):
-        raise HTTPException(status_code=400, detail="Project name escapes workspace root")
-    return str(_candidate)
-
-
 @app.get("/projects/{project_name}/delete-preview")
 async def preview_delete_project(project_name: str):
     """Return a count of what would be removed by DELETE /projects/{project_name}.
@@ -1154,9 +1140,12 @@ async def preview_delete_project(project_name: str):
     """
     if not _orchestrator:
         raise HTTPException(status_code=503, detail="Agent not initialized")
-    project_path = _resolve_project_path(project_name)
+    if not _PROJECT_NAME_RE.match(project_name):
+        raise HTTPException(status_code=400, detail="Invalid project name")
     try:
-        return _orchestrator.delete_project(project_path, dry_run=True)
+        return _orchestrator.delete_project(project_name, dry_run=True)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Project name escapes workspace root")
     except Exception as e:
         logger.error("preview_delete_failed", project=project_name, error=str(e))
         raise HTTPException(status_code=500, detail="Internal server error")
@@ -1171,9 +1160,12 @@ async def delete_project(project_name: str):
     """
     if not _orchestrator:
         raise HTTPException(status_code=503, detail="Agent not initialized")
-    project_path = _resolve_project_path(project_name)
+    if not _PROJECT_NAME_RE.match(project_name):
+        raise HTTPException(status_code=400, detail="Invalid project name")
     try:
-        return _orchestrator.delete_project(project_path, dry_run=False)
+        return _orchestrator.delete_project(project_name, dry_run=False)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Project name escapes workspace root")
     except Exception as e:
         logger.error("delete_project_failed", project=project_name, error=str(e))
         raise HTTPException(status_code=500, detail="Internal server error")

@@ -9,9 +9,9 @@ from agent.tools.web_tool import extract_urls
 _DOCUMENT_EXTS = {".pdf", ".docx", ".doc", ".xlsx", ".xls", ".csv", ".tsv"}
 
 # Maximum sub-questions from decomposition; follow-up queries per gap pass; coverage rounds.
-_MAX_QUESTIONS = 8
-_MAX_FOLLOWUPS = 4
-_MAX_COVERAGE_PASS = 3
+_MAX_QUESTIONS = 5
+_MAX_FOLLOWUPS = 3
+_MAX_COVERAGE_PASS = 2
 
 # Total character budget for web-gathered content.
 _WEB_CONTENT_BUDGET = 28_000
@@ -117,6 +117,10 @@ Guidelines:
         if not model:
             return {"success": False, "error": "No model configured"}
 
+        # Scale web content budget to the active model's context window.
+        # Use 25 % of total chars (tokens * 4) for raw web content, cap at 120k.
+        _web_budget = min(120_000, int(model.context_window * 4 * 0.25))
+
         # --- Local orientation (always runs) ---
         local_sections: List[str] = []
         if tool_executor:
@@ -143,11 +147,12 @@ Guidelines:
                     self.logger.warning("doc_read_failed", path=dp, error=str(e))
 
         # --- Routing decision ---
-        # Web search only when the task contains an explicit search trigger.
-        # The previous implicit fallback (no local content → web search) caused
-        # every task on an empty workspace to trigger a full web-research cycle,
-        # wasting context budget on irrelevant results.
-        needs_web = bool(_SEARCH_TRIGGERS.search(task))
+        # Default to web search for research tasks. Only skip it when the task
+        # explicitly refers to the local workspace/codebase (errors, logs, files).
+        # _SEARCH_TRIGGERS was too narrow — planner-generated subtasks like
+        # "Research state persistence..." don't contain trigger words but clearly
+        # need web search, not local file scanning.
+        needs_web = not bool(_LOCAL_TASK_RE.search(task))
 
         wants_files = bool(_FILE_WRITE_RE.search(task))
 
@@ -184,7 +189,6 @@ Guidelines:
         search_coros = [self._search_question(q, tool_executor) for q in sub_questions]
         raw_results = await asyncio.gather(*search_coros, return_exceptions=True)
         web_sections: List[str] = [r for r in raw_results if isinstance(r, str) and r]
-        web_sections = _trim_to_budget(web_sections, _WEB_CONTENT_BUDGET // 2)
 
         # Step 3: Gap analysis — identify what's still missing.
         _emit(on_phase, "researching:checking gaps")
@@ -214,9 +218,15 @@ Guidelines:
                 break
             web_sections += new_sections
 
-        web_sections = _trim_to_budget(web_sections, _WEB_CONTENT_BUDGET)
+        web_sections = _trim_to_budget(web_sections, _web_budget)
 
-        # Step 6: Synthesize everything.
+        # Step 6: Persist raw gathered content to disk so it survives synthesis
+        # and is available for fix rounds, manual review, and deeper re-synthesis.
+        if tool_executor and web_sections:
+            _emit(on_phase, "researching:saving-raw")
+            await self._save_raw_research(task, web_sections, tool_executor, workspace_path)
+
+        # Step 7: Synthesize everything.
         _emit(on_phase, "researching:synthesizing")
         all_sections = local_sections + web_sections
         wants_files = bool(_FILE_WRITE_RE.search(task))
@@ -224,7 +234,7 @@ Guidelines:
             task, all_sections, enriched_context, model, model_router, wants_files=wants_files
         )
 
-        # Step 7: Write output files if requested.
+        # Step 8: Write output files if requested.
         if wants_files and tool_executor and result.get("success"):
             _emit(on_phase, "researching:writing-files")
             files_created = await self._write_research_files(
@@ -296,9 +306,18 @@ Guidelines:
                     try:
                         page = await tool_executor.execute("web_fetch", {"url": urls[0]})
                         if page and not page.startswith("Error"):
-                            sections.append(
-                                f"[Page: {urls[0][:80]}]\n{page[:1500]}"
-                            )
+                            sections.append(f"[Page: {urls[0][:80]}]\n{page[:1500]}")
+                        elif len(page or "") < 500:
+                            # JS-heavy page — fall back to headless browser.
+                            try:
+                                browser_result = await tool_executor.execute(
+                                    "browser_interact",
+                                    {"url": urls[0], "actions": [{"type": "text", "selector": "body"}]},
+                                )
+                                if browser_result and not str(browser_result).startswith("Error"):
+                                    sections.append(f"[Browser: {urls[0][:80]}]\n{str(browser_result)[:1500]}")
+                            except Exception:
+                                pass
                     except Exception:
                         pass
         except Exception as e:
@@ -339,22 +358,46 @@ Guidelines:
     ) -> Dict[str, Any]:
         """Final LLM synthesis over all gathered content."""
         workspace_info = "\n\n".join(gathered)
+        detail_rules = (
+            "Quality rules — follow all of them:\n"
+            "1. CITE SOURCES: Every factual claim must include an inline source URL "
+            "(e.g. 'According to https://example.com, ...'). No unsourced assertions.\n"
+            "2. CROSS-REFERENCE: If only one source mentions a claim, note it as "
+            "'(single source — unverified)'.\n"
+            "3. ACKNOWLEDGE GAPS: If the gathered content has insufficient data on a "
+            "sub-topic, write 'Insufficient data found on: [topic]' rather than guessing.\n"
+            "4. NO HALLUCINATION: Only state facts that appear in the gathered content above. "
+            "Do not invent details, names, or numbers.\n"
+            "5. SPECIFIC DETAILS: Include library names, version numbers, code examples, and "
+            "exact URLs wherever the sources contain them.\n"
+            "6. COMPARE OPTIONS: When multiple approaches exist, compare them explicitly.\n"
+            "7. DO NOT END EARLY: Cover every aspect of the research task before stopping."
+        )
         if wants_files:
-            file_instruction = (
-                "Structure your response as multiple clearly delineated sections using "
-                "level-2 markdown headings (## Section Title). Each section should represent "
-                "a logical topic area that can be saved as a separate markdown file. "
-                "Be exhaustive — include ALL relevant details from the gathered content."
+            structure_instruction = (
+                "Structure your response using level-2 markdown headings (## Section Title). "
+                "Each section covers one logical topic and will be saved as a separate file. "
+                "Include ALL relevant technical details — do not compress or omit.\n"
+                "End with a final section:\n"
+                "## Sources\n"
+                "List every URL encountered, one per line, with a one-sentence description."
             )
         else:
-            file_instruction = "Provide a structured research report based on the gathered information above."
+            structure_instruction = (
+                "Write a detailed research report with these exact sections:\n"
+                "## Summary\n(2-3 sentences — what was found and what it means)\n"
+                "## Findings\n(detailed subsections per topic using ### subheadings — "
+                "3-5 sentences each with specific facts)\n"
+                "## Recommendations\n(specific, actionable next steps numbered 1-N)\n"
+                "## Sources\n(every URL encountered, one per line, with a one-sentence description)\n"
+                "## Methodology\n(list the sub-questions investigated and number of sources analyzed)"
+            )
         prompt = (
             "The following information was gathered from the codebase, web, and documents:\n\n"
-            f"{workspace_info}\n"
-            f"{enriched_context}\n\n"
+            f"{workspace_info}\n\n"
             f"Research task: {task}\n\n"
-            f"{file_instruction}\n"
-            "If live web search results are included, cite them directly."
+            f"{structure_instruction}\n\n"
+            f"{detail_rules}"
         )
         response = await model_router.generate(prompt, model, system_prompt=self.get_system_prompt())
         return {
@@ -429,6 +472,41 @@ Guidelines:
 
         return files_written
 
+    async def _save_raw_research(
+        self,
+        task: str,
+        web_sections: List[str],
+        tool_executor,
+        workspace_path: str,
+    ) -> None:
+        """Write raw gathered web content to research-cache/ for traceability."""
+        import os as _os
+        _ws_root = Path(_os.getenv("WORKSPACE_PATH", "./workspace")).resolve()
+        _cache_dir = _ws_root / "research-cache"
+        try:
+            await tool_executor.execute("shell", {"command": f'mkdir -p "{_cache_dir}"'})
+        except Exception:
+            pass
+
+        slug = re.sub(r"[^\w\s-]", "", task[:50].lower())
+        slug = re.sub(r"[\s_]+", "-", slug).strip("-")
+        filename = f"{slug}-raw.md"
+        _fp = (_cache_dir / filename).resolve()
+        if not _fp.is_relative_to(_ws_root):
+            return
+
+        lines = [f"# Raw Research: {task[:120]}\n"]
+        for i, section in enumerate(web_sections, 1):
+            lines.append(f"\n## Source {i}\n\n{section}")
+        rel_path = str(_fp.relative_to(_ws_root))
+        try:
+            await tool_executor.execute(
+                "file_write", {"path": rel_path, "content": "\n".join(lines)}
+            )
+            self.logger.info("raw_research_saved", path=rel_path)
+        except Exception as e:
+            self.logger.warning("raw_research_save_failed", error=str(e))
+
     def _extract_document_paths(self, task: str, workspace_path: str) -> List[str]:
         """Return absolute paths for document files (PDF/DOCX/XLSX/CSV) in the task."""
         pattern = r'[\w./\\-]+\.(?:pdf|docx?|xlsx?|csv|tsv)'
@@ -436,8 +514,9 @@ Guidelines:
         results: List[str] = []
         for candidate in candidates:
             for base in ([Path(workspace_path)] if workspace_path else []) + [Path(".")]:
-                p = (base / candidate).resolve()
-                if p.is_file() and p.suffix.lower() in _DOCUMENT_EXTS:
+                resolved_base = base.resolve()
+                p = (resolved_base / candidate).resolve()
+                if p.is_relative_to(resolved_base) and p.is_file() and p.suffix.lower() in _DOCUMENT_EXTS:
                     results.append(str(p))
                     break
         return results
@@ -451,8 +530,9 @@ Guidelines:
         results: List[str] = []
         for candidate in candidates:
             for base in ([Path(workspace_path)] if workspace_path else []) + [Path(".")]:
-                p = (base / candidate).resolve()
-                if p.is_file():
+                resolved_base = base.resolve()
+                p = (resolved_base / candidate).resolve()
+                if p.is_relative_to(resolved_base) and p.is_file():
                     results.append(str(p))
                     break
         return results

@@ -30,7 +30,7 @@ VALID_AGENT_TYPES = frozenset({
 
 # Agent types safe for research tasks. architect is excluded because it writes
 # ADR files to disk, which is wrong for a read-only research workflow.
-_RESEARCH_SAFE_TYPES = frozenset({"research", "documenter", "chat", "develop"})
+_RESEARCH_SAFE_TYPES = frozenset({"research", "documenter", "chat"})
 
 # Matches a JSON array in the LLM response even if wrapped in prose/markdown
 _JSON_ARRAY_RE = re.compile(r'\[[\s\S]*?\]', re.DOTALL)
@@ -63,6 +63,7 @@ class PlannerAgent:
             "You are an expert task planning assistant for an autonomous coding agent.\n\n"
             "Break the following objective into 5–8 concrete, ordered tasks.\n"
             "Each task must be small enough that a single agent call can complete it.\n"
+            "Each task description must be ≤ 60 words and describe exactly ONE concrete action.\n"
             "Assign the correct agent_type to each task.\n\n"
             "Valid agent_type values:\n"
             "- mapper:     map project structure → ARCHITECTURE.md + STACK.md (use as first step for unfamiliar projects)\n"
@@ -159,11 +160,11 @@ class PlannerAgent:
         if task_type == "research":
             return (
                 "Strategy for research objectives:\n"
-                "1. One or more 'research' tasks to search/gather information\n"
-                "2. A 'documenter' task to synthesize findings into a structured report\n"
-                "3. Optionally a 'develop' task if code output is needed\n"
-                "IMPORTANT: NEVER use 'architect' agent_type for research tasks — "
-                "it writes ADR files to disk which is wrong for a research workflow.\n"
+                "1. One or more 'research' tasks to search/gather information from the web or files\n"
+                "2. A 'documenter' task to synthesize findings into a structured markdown report\n"
+                "IMPORTANT: NEVER use 'architect' or 'develop' agent_type for research tasks.\n"
+                "NEVER create scaffold, directory structure, or project setup tasks.\n"
+                "Research tasks produce REPORTS, not code or folders.\n"
             )
         if task_type in ("sdlc", "develop"):
             return (

@@ -10,16 +10,20 @@ A comprehensive guide to using the Local Coding Agent.
 4. [Discord Commands Reference](#discord-commands-reference)
 5. [Task Types & Routing](#task-types--routing)
 6. [Agent Chains](#agent-chains)
-7. [Workspace & Project Scoping](#workspace--project-scoping)
+7. [Deep Research Mode](#deep-research-mode)
+8. [Verifier / Critic Agent](#verifier--critic-agent)
+9. [Workspace & Project Scoping](#workspace--project-scoping)
    - [!wiki commands](#wiki-commands)
-8. [Model Management](#model-management)
-9. [Context Bridge](#context-bridge)
-10. [Agent Wiki Memory](#agent-wiki-memory)
-11. [Interactive Testing Tools](#interactive-testing-tools)
-12. [REST API Reference](#rest-api-reference)
-13. [Advanced File Operations](#advanced-file-operations)
-14. [Security](#security)
-15. [Troubleshooting](#troubleshooting)
+   - [Project Lifecycle Management](#project-lifecycle-management)
+10. [Model Management](#model-management)
+11. [Context Bridge](#context-bridge)
+12. [Agent Wiki Memory](#agent-wiki-memory)
+13. [Memory Architecture](#memory-architecture)
+14. [Interactive Testing Tools](#interactive-testing-tools)
+15. [REST API Reference](#rest-api-reference)
+16. [Advanced File Operations](#advanced-file-operations)
+17. [Security](#security)
+18. [Troubleshooting](#troubleshooting)
 
 ---
 
@@ -429,45 +433,59 @@ Then run it with `!chain my-pipeline <task>`. Use `!chains` to see all available
 
 ---
 
-## Iterative Research
+## Deep Research Mode
 
-The research agent uses a multi-step approach inspired by deep-research systems for web-facing tasks:
+The research agent uses a multi-round deep-research approach for web-facing tasks. Use `!research <task>` to force this path, or let the classifier route automatically.
 
 ### Flow
 
 ```
-1. Decompose   LLM breaks the task into 3–5 focused sub-questions
-                (thinking disabled — structured output, no trace needed)
+1. Decompose      LLM breaks the task into up to 8 focused sub-questions
+                   (thinking disabled — structured output only)
 
-2. Search      asyncio.gather runs web search + top-page deep-fetch
-                for each sub-question in parallel
-                (one failed search doesn't block the others)
+2. Search         asyncio.gather runs web search + top-page deep-fetch
+                   for each sub-question in parallel
+                   (one failed search does not block the others)
 
-3. Gap check   LLM reviews gathered content and identifies up to 2
-                follow-up queries for missing information
-                (thinking disabled)
+3. Gap analysis   LLM reviews gathered content and identifies missing topics;
+   × 4 rounds     up to 4 follow-up gap-fill passes, each running parallel searches
 
-4. Follow-up   Parallel searches for the identified gaps (max 2)
+4. Coverage       3 coverage-check rounds verify all requested topics are present;
+   checks         each failed check triggers a targeted follow-up search
 
-5. Synthesize  Single LLM call over all gathered content produces
-                a structured report (Summary / Sources / Findings / Dependencies)
+5. Synthesize     Single LLM call over all gathered content produces a structured
+                   report (Summary / Sources / Key Findings / Recommendations)
+
+6. Verify         VerifierAgent scores coverage, depth, format, and actionability
+                   (0–10). Score < 7 triggers a targeted fix round (max 2).
 ```
 
 ### Fast path
 
-If the task references local files and contains no web-trigger keywords (latest, news, released, search for…), the agent skips decomposition and runs a single-pass synthesis directly. This keeps simple codebase questions fast.
+If the task references local files and contains no web-trigger keywords (`latest`, `news`, `released`, `search for`…), the agent skips decomposition and runs a single-pass synthesis directly.
 
 Examples:
-- **Iterative path:** `!research best practices for async Python error handling` → decomposes + 5 parallel web searches
+- **Deep research path:** `!research best practices for async Python error handling` → decomposes + up to 8 parallel web searches
 - **Fast path:** `!research how does orchestrator.py handle the context bridge` → reads the file, single synthesis
+
+### Capturing output to files
+
+When the task includes phrases like "capture to file", "save to markdown", or "write a report", the research agent splits its synthesis into individual `.md` section files under `research-output/` inside the active project directory. Each section becomes a separate file (e.g. `research-output/01-overview.md`, `02-findings.md`, etc.).
+
+```
+!research compare FastAPI vs Django REST Framework for a new project, save to markdown
+```
+
+Files are listed in `!files` after the job completes and can be viewed with `!show research-output/01-overview.md`.
 
 ### Limits
 
 | Parameter | Value |
 |-----------|-------|
-| Max sub-questions | 5 |
-| Max follow-up queries | 2 |
-| Total web content budget | 14 000 chars |
+| Max sub-questions | 8 |
+| Max follow-up gap passes | 4 |
+| Coverage-check rounds | 3 |
+| Total web content budget | 28 000 chars |
 | Per search-result snippet | 1 200 chars |
 | Per deep-fetched page | 1 500 chars |
 
@@ -477,6 +495,48 @@ The Done message shows a one-line summary. The full structured report is always 
 ```
 !result
 ```
+
+---
+
+## Verifier / Critic Agent
+
+After every develop or research task (including each subtask in a multi-step job), a dedicated `VerifierAgent` reviews the output and scores it 0–10 against the original objective.
+
+### Scoring rubrics
+
+**Research rubric** — checks four dimensions:
+
+| Dimension | What is checked |
+|-----------|----------------|
+| Coverage | Every topic named in the objective has a corresponding section or answer |
+| Depth | Findings go beyond surface-level mentions; actionable detail is present |
+| Format compliance | Required sections (Summary, Findings, Recommendations, etc.) are present |
+| Actionability | A reader can act on the report without needing further research |
+
+**Code rubric** — checks four dimensions:
+
+| Dimension | What is checked |
+|-----------|----------------|
+| Requirement fulfilment | All features described in the task are implemented |
+| Completeness | No obvious gaps, TODO stubs, or placeholder logic |
+| Correctness | Code structure and logic appear sound |
+| Test results | When pytest is available, it is run and results are checked |
+
+### Pass / fail threshold
+
+| Score | Action |
+|-------|--------|
+| ≥ 7 | Task passes; output is accepted and wiki-compile runs |
+| < 7 | A targeted **fix round** is injected (max 2 rounds per task) |
+| Stagnating | If scores are not improving across rounds, the loop exits early |
+
+### Fix round behaviour
+
+- **Code task**: a new developer task is injected listing the specific gaps identified.
+- **Research task with output files**: targeted gap-fill research sub-tasks are injected, followed by a documenter task that extends the existing files (existing content is never truncated).
+- **Research task without files**: a single combined research fix task covers all gaps.
+
+The fix rounds are transparent — Discord shows them as additional task steps, and the final result reflects all rounds. You can always see what gaps triggered a fix in the job transcript (`!result`).
 
 ---
 
@@ -675,6 +735,109 @@ If entries from an old project have accumulated in the workspace root wiki:
 !wiki clean                        ← remove any remaining stale tagged rows
 !wiki status                       ← confirm the root wiki is clean
 ```
+
+---
+
+### Project Lifecycle Management
+
+Projects accumulate Chroma vectors, SQLite sessions, job records, tasks, and wiki entries over time. The project delete commands let you purge all of this cleanly.
+
+#### Dry-run preview
+
+Before deleting, see exactly how much data would be removed:
+
+```
+!project delete Shadows-of-Eldoria
+```
+
+Output:
+```
+Preview — artifacts that would be removed for 'Shadows-of-Eldoria':
+  Chroma chunks   : 142
+  SQLite sessions : 7
+  SQLite jobs     : 38
+  Wiki entries    : 29
+Run `!project delete Shadows-of-Eldoria confirm` to permanently remove all data.
+```
+
+#### Permanent delete
+
+```
+!project delete Shadows-of-Eldoria confirm
+```
+
+This removes:
+- All ChromaDB vectors for the project (`project_id` filter)
+- All SQLite sessions, their messages, and their tasks
+- All SQLite jobs and job tasks for the project
+- The entire `.agent-wiki/` directory under the project
+
+> **Note:** The workspace files themselves (source code, assets) are **not** deleted — only agent-managed metadata is removed. The workspace directory remains intact.
+
+#### API equivalent
+
+```
+GET  /projects/{name}/delete-preview   # dry-run artifact counts
+DELETE /projects/{name}                # permanent delete (auth required if AGENT_API_KEY set)
+```
+
+---
+
+## Memory Architecture
+
+The agent uses three complementary memory layers that work together to inject relevant context before every task and persist learnings for future sessions.
+
+### Agent Wiki Memory (persistent knowledge base)
+
+Covered in detail in the [Agent Wiki Memory](#agent-wiki-memory) section. The wiki stores synthesised task learnings per project and is queried before every task (`wiki-query` pre-skill).
+
+### Code-Graph Context (MemoryWiki)
+
+For `developer`, `reviewer`, and `tester` tasks, the orchestrator builds a live dependency graph from the workspace Python files using Python's `ast` module. Before each task, the graph is queried with keywords extracted from the task description and matching nodes are injected as context.
+
+**What is indexed:** every function definition, class definition, and import statement in `.py` files under the workspace.
+
+**What the agent sees:**
+
+```
+## Code graph — 3 match(es) for ['session', 'memory', 'store']
+- `agent/memory/session_memory.py:store_episodic` function  agent/memory/session_memory.py:361
+- `agent/memory/session_memory.py:get_similar_tasks` function  agent/memory/session_memory.py:381
+- `agent/memory/session_memory.py:SessionMemory` class  agent/memory/session_memory.py:12
+```
+
+This context is injected automatically — no configuration required. The graph is refreshed after each developer task that creates new files.
+
+### Episodic Memory (cross-session task reuse)
+
+When a task passes verification (verifier score ≥ 7), the result is stored in an `episodic_memory` SQLite table alongside its task description, score, and task type. Before each subsequent task, the orchestrator retrieves the top 3 most similar past results (keyword matching, score ≥ 7) and injects them as context.
+
+**What the agent sees:**
+
+```
+## Episodic memory — similar past work (score ≥ 7)
+- [develop, score 8/10] **Add rate limiting middleware to FastAPI app**
+  Added SlowAPI middleware in api/main.py; registered limiter on /task/start and /task endpoints;
+  tested with concurrent curl calls — all requests beyond limit returned 429.
+```
+
+This enables the agent to reuse proven patterns across sessions without re-discovering them.
+
+### Write-path Quality Gate
+
+Wiki-compile (the post-task knowledge extraction step) only runs when the task passes the verifier threshold (score ≥ 7). Tasks that fail verification are retried via fix rounds, and only the final passing result is compiled into the wiki. This prevents low-quality or incomplete outputs from polluting the knowledge base.
+
+The gate is transparent — you will see `wiki_compile_skipped_low_quality` in the API log when a below-threshold output is filtered, and the fix-round result that replaces it will be compiled if it passes.
+
+### Dynamic Content Budgets
+
+All context injections (wiki context, RAG results, code-graph, episodic memory) are size-limited relative to the active model's `context_window`. The limits scale automatically:
+
+- For a 32k-context model, each component gets a smaller slice
+- For a 200k-context model, each component gets proportionally more space
+- Hard caps (e.g. 20 000 chars for code-graph) prevent any single component from dominating
+
+If you switch to a model with a different context window, the budgets adjust at the next task — no configuration change needed.
 
 ---
 
@@ -1104,4 +1267,4 @@ Get-Content logs\bot-20260415-120005.log -Wait   # tail the latest bot log
 
 ---
 
-*Last updated: 2026-04-19 — Phase 25 (per-project wiki isolation: project-scoped `.agent-wiki/`, entry tagging, query filtering, `!wiki status/query/clean/migrate` commands, wiki API endpoints; planner research-type enforcement; architect agent path sanitization)*
+*Last updated: 2026-05-08 — Phases 26–29: deep research mode (8 sub-questions, 4 gap passes, 3 coverage rounds, 28k budget, file output); verifier/critic agent with research and code rubrics, fix rounds, stagnation detection; project lifecycle management (`!project delete`, dry-run preview, API endpoints); memory architecture (write-path quality gate, MemoryWiki code-graph context, episodic memory, dynamic content budgets); orchestrator split into `agent/orchestration/` package (`ContextBuilder`, `TaskRouter`, `VerifierCoordinator`)*
