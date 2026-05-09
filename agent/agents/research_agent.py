@@ -305,10 +305,20 @@ Guidelines:
                 if urls:
                     try:
                         page = await tool_executor.execute("web_fetch", {"url": urls[0]})
-                        if page and not page.startswith("Error"):
+                        _needs_browser = (
+                            not page
+                            or page.startswith("Error")
+                            or len(page) < 500
+                            or any(s in page.lower() for s in (
+                                "access denied", "403 forbidden", "cloudflare",
+                                "just a moment", "enable javascript", "captcha",
+                                "robot", "checking your browser",
+                            ))
+                        )
+                        if not _needs_browser:
                             sections.append(f"[Page: {urls[0][:80]}]\n{page[:1500]}")
-                        elif len(page or "") < 500:
-                            # JS-heavy page — fall back to headless browser.
+                        else:
+                            # JS-heavy or access-denied page — fall back to headless browser.
                             try:
                                 browser_result = await tool_executor.execute(
                                     "browser_interact",
@@ -316,8 +326,12 @@ Guidelines:
                                 )
                                 if browser_result and not str(browser_result).startswith("Error"):
                                     sections.append(f"[Browser: {urls[0][:80]}]\n{str(browser_result)[:1500]}")
+                                elif page and not page.startswith("Error") and len(page) >= 500:
+                                    # Browser also failed — use the original fetch result anyway
+                                    sections.append(f"[Page: {urls[0][:80]}]\n{page[:1500]}")
                             except Exception:
-                                pass
+                                if page and not page.startswith("Error") and len(page) >= 500:
+                                    sections.append(f"[Page: {urls[0][:80]}]\n{page[:1500]}")
                     except Exception:
                         pass
         except Exception as e:
