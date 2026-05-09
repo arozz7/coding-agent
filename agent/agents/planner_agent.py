@@ -15,6 +15,7 @@ Falls back to a single-task plan if the LLM fails or returns invalid JSON.
 import json
 import re
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Dict, List, Optional
 
 import structlog
@@ -46,6 +47,7 @@ class PlanResult:
 
     tasks: List[Dict[str, str]]
     completion_criteria: List[str] = field(default_factory=list)
+    acceptance_criteria: List[str] = field(default_factory=list)
 
     # Backward compat: allow iteration/indexing so callers that treat the
     # result as a plain list continue to work without modification.
@@ -62,8 +64,9 @@ class PlanResult:
 class PlannerAgent:
     """Decomposes an objective into a typed task list via a single LLM call."""
 
-    def __init__(self, model_router):
+    def __init__(self, model_router, requirements_extractor=None):
         self.model_router = model_router
+        self.requirements_extractor = requirements_extractor
         self.logger = logger.bind(component="planner_agent")
 
     async def plan(
@@ -139,6 +142,7 @@ class PlannerAgent:
         objective: str,
         context: str = "",
         task_type: str = "develop",
+        workspace: Optional[Path] = None,
     ) -> PlanResult:
         """Plan tasks AND generate testable completion criteria.
 
@@ -147,17 +151,28 @@ class PlannerAgent:
           2. A focused follow-up that asks for 3-5 testable criteria based on
              the tasks and any tech-stack context already in `context`.
 
-        Falls back gracefully — if the criteria call fails the tasks are still
-        returned with an empty criteria list.
+        If a requirements_extractor is available and a workspace path is provided,
+        also generates behavioral acceptance criteria for the running app.
+
+        Falls back gracefully — if any criteria call fails the tasks are still
+        returned with whatever criteria were produced.
         """
         tasks = await self.plan(objective, context=context, task_type=task_type)
 
         # Skip criteria for non-develop workflows (research is verified differently)
         if task_type not in ("develop", "sdlc"):
-            return PlanResult(tasks=tasks, completion_criteria=[])
+            return PlanResult(tasks=tasks, completion_criteria=[], acceptance_criteria=[])
 
         criteria = await self._generate_criteria(objective, tasks, context)
-        return PlanResult(tasks=tasks, completion_criteria=criteria)
+
+        acceptance_criteria: List[str] = []
+        if self.requirements_extractor is not None and workspace is not None:
+            try:
+                acceptance_criteria = await self.requirements_extractor.extract(objective, workspace)
+            except Exception as exc:
+                self.logger.warning("acceptance_criteria_extraction_failed", error=str(exc))
+
+        return PlanResult(tasks=tasks, completion_criteria=criteria, acceptance_criteria=acceptance_criteria)
 
     # ------------------------------------------------------------------
     # Internal helpers

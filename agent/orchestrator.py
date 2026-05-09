@@ -28,11 +28,14 @@ from agent.agents.verifier_agent import VerifierAgent, VerifierResult
 from agent.agents.mapper_agent import MapperAgent
 from agent.agents.red_team_agent import RedTeamAgent
 from agent.agents.documenter_agent import DocumenterAgent
+from agent.agents.acceptance_tester_agent import AcceptanceTesterAgent
 from agent.chain_runner import ChainRunner
 from agent.skills.skill_loader import SkillManager
 from agent.skills.wiki_manager import WikiManager
 from agent.skills.skill_executor import SkillExecutor
 from agent.orchestration import ContextBuilder, TaskRouter, VerifierCoordinator
+from agent.orchestration.requirements_extractor import RequirementsExtractor
+from agent.orchestration.app_probe import AppProbe
 from observability.logging import AgentLogger
 
 logger = structlog.get_logger()
@@ -125,9 +128,11 @@ class AgentOrchestrator:
         self.mapper_agent = MapperAgent(model_router, file_system_tool=self.fs_tool)
         self.red_team_agent = RedTeamAgent(model_router)
         self.documenter_agent = DocumenterAgent(model_router)
-        self.planner_agent = PlannerAgent(model_router)
+        self.requirements_extractor = RequirementsExtractor(model_router)
+        self.planner_agent = PlannerAgent(model_router, requirements_extractor=self.requirements_extractor)
         self.plan_reviewer_agent = PlanReviewerAgent(model_router)
         self.verifier_agent = VerifierAgent(model_router)
+        self.acceptance_tester_agent = AcceptanceTesterAgent(model_router)
         self.chain_runner = ChainRunner(self)
 
         # Task store — shares the same SQLite file as the job store
@@ -485,13 +490,16 @@ class AgentOrchestrator:
         # 1. Plan — build compact planning context then generate tasks + criteria
         _emit("planning:tasks")
         planning_ctx = await self.context_builder.build_planning_context(objective)
+        _ws_path = Path(getattr(self.tool_executor, "workspace_path", ".") if self.tool_executor else ".")
         plan_result = await self.planner_agent.plan_with_criteria(
             objective,
             context=planning_ctx,
             task_type=task_type,
+            workspace=_ws_path,
         )
         task_specs = list(plan_result.tasks)
         completion_criteria = plan_result.completion_criteria
+        _acceptance_criteria = plan_result.acceptance_criteria
 
         # 1b. Review and improve the plan before executing (plan-review-plan loop).
         # Only runs for develop/sdlc tasks with ≥3 steps — skips trivial plans.
@@ -529,6 +537,10 @@ class AgentOrchestrator:
         _fix_budget = max(1, int(os.getenv("FIX_BUDGET", "20")))
         _criterion_fix_count = 0
         _criterion_attempts: dict[str, int] = {}  # per-criterion failure count
+        # Acceptance test loop state
+        _acceptance_budget = max(1, int(os.getenv("ACCEPTANCE_BUDGET", "5")))
+        _acceptance_fix_count = 0
+        _last_acceptance_screenshot: Optional[str] = None
         # Develop/sdlc tasks get more rounds — complex builds need more fix cycles.
         # Research stays at 3 since each round is an LLM-heavy web search.
         if task_type in ("develop", "sdlc"):
@@ -584,32 +596,95 @@ class AgentOrchestrator:
                         if not _failing:
                             _vr = await _run_final_verifier_jid()
                             task_summaries.append(f"✅ **All {len(completion_criteria)} criteria satisfied** — score {_vr.score}/10")
-                            break
-
-                        if _criterion_fix_count >= _fix_budget:
+                            _build_criteria_done = True
+                        elif _criterion_fix_count >= _fix_budget:
                             _vr = await _run_final_verifier_jid()
                             task_summaries.append(
                                 f"🎯 Fix budget ({_fix_budget}) exhausted — {_passed_count}/{len(completion_criteria)} criteria passing — score {_vr.score}/10"
                             )
-                            break
+                            _build_criteria_done = True
+                        else:
+                            _target = next(
+                                (r for r in _failing if _criterion_attempts.get(r.criterion, 0) < 3),
+                                None,
+                            )
+                            if _target is None:
+                                _vr = await _run_final_verifier_jid()
+                                task_summaries.append(f"🔍 All failing criteria abandoned after 3 attempts — score {_vr.score}/10")
+                                _build_criteria_done = True
+                            else:
+                                _build_criteria_done = False
 
-                        _target = next(
-                            (r for r in _failing if _criterion_attempts.get(r.criterion, 0) < 3),
-                            None,
-                        )
-                        if _target is None:
-                            _vr = await _run_final_verifier_jid()
-                            task_summaries.append(f"🔍 All failing criteria abandoned after 3 attempts — score {_vr.score}/10")
-                            break
+                        if not _build_criteria_done:
+                            _criterion_attempts[_target.criterion] = _criterion_attempts.get(_target.criterion, 0) + 1
+                            _criterion_fix_count += 1
+                            _fix_spec = self.verifier_coordinator.make_targeted_fix_spec(
+                                _target, objective, _criterion_fix_count,
+                                screenshot_path=_last_acceptance_screenshot,
+                            )
+                            new_fix = self.task_store.create_task(job_id=job_id, description=_fix_spec["description"], agent_type=_fix_spec["agent_type"])
+                            total = max(total, new_fix.sequence)
+                            task_summaries.append(f"🎯 **Criterion fix** ({_criterion_fix_count}/{_fix_budget}) — failing: {_target.criterion[:60]}")
+                            self.logger.info("criterion_fix_injected", criterion=_target.criterion[:60], attempt=_criterion_attempts[_target.criterion], fix_num=_criterion_fix_count)
+                            continue
 
-                        _criterion_attempts[_target.criterion] = _criterion_attempts.get(_target.criterion, 0) + 1
-                        _criterion_fix_count += 1
-                        _fix_spec = self.verifier_coordinator.make_targeted_fix_spec(_target, objective, _criterion_fix_count)
-                        new_fix = self.task_store.create_task(job_id=job_id, description=_fix_spec["description"], agent_type=_fix_spec["agent_type"])
-                        total = max(total, new_fix.sequence)
-                        task_summaries.append(f"🎯 **Criterion fix** ({_criterion_fix_count}/{_fix_budget}) — failing: {_target.criterion[:60]}")
-                        self.logger.info("criterion_fix_injected", criterion=_target.criterion[:60], attempt=_criterion_attempts[_target.criterion], fix_num=_criterion_fix_count)
-                        continue
+                        # Acceptance test loop — run after build criteria complete
+                        if _acceptance_criteria and task_type in ("develop", "sdlc") and _acceptance_fix_count < _acceptance_budget:
+                            _emit(f"verifying:acceptance-{_acceptance_fix_count + 1}")
+                            _tex_acc = self.tool_executor
+
+                            async def _acc_shell(cmd: str, _t=_tex_acc) -> str:
+                                if not _t:
+                                    return ""
+                                try:
+                                    out = await _t.execute("shell", {"command": cmd})
+                                    return str(out) if out else ""
+                                except Exception:
+                                    return ""
+
+                            _ws_acc = Path(getattr(_tex_acc, "workspace_path", ".") if _tex_acc else ".")
+                            _app_probe = AppProbe(_ws_acc, shell_fn=_acc_shell)
+                            acc_results = await self.verifier_coordinator.run_acceptance_tests(
+                                _acceptance_criteria, _ws_acc, _app_probe, self.acceptance_tester_agent
+                            )
+                            _acc_failing = [r for r in acc_results if not r.passed]
+                            _acc_passed = len(acc_results) - len(_acc_failing)
+
+                            if not _acc_failing:
+                                task_summaries.append(f"✅ **All {len(_acceptance_criteria)} acceptance criteria satisfied**")
+                                break
+
+                            if _acceptance_fix_count >= _acceptance_budget - 1:
+                                task_summaries.append(
+                                    f"🎯 Acceptance budget ({_acceptance_budget}) exhausted — {_acc_passed}/{len(_acceptance_criteria)} passing"
+                                )
+                                break
+
+                            _acceptance_fix_count += 1
+                            _acc_target = _acc_failing[0]
+                            _acc_fix_spec = self.verifier_coordinator.make_targeted_fix_spec(
+                                type("CR", (), {"criterion": _acc_target.criterion, "passed": False, "detail": _acc_target.detail})(),
+                                objective,
+                                _acceptance_fix_count,
+                                screenshot_path=_last_acceptance_screenshot,
+                            )
+                            new_acc_fix = self.task_store.create_task(
+                                job_id=job_id,
+                                description=_acc_fix_spec["description"],
+                                agent_type=_acc_fix_spec["agent_type"],
+                            )
+                            total = max(total, new_acc_fix.sequence)
+                            task_summaries.append(
+                                f"🖼️ **Acceptance fix** ({_acceptance_fix_count}/{_acceptance_budget}) — {_acc_target.criterion[:60]}"
+                            )
+                            self.logger.info(
+                                "acceptance_fix_injected",
+                                criterion=_acc_target.criterion[:60],
+                                fix_num=_acceptance_fix_count,
+                            )
+                            continue
+
+                        break
 
                     elif task_type in _VERIFIABLE_TYPES and _verifier_rounds < _MAX_VERIFIER_ROUNDS:
                         combined_so_far = "\n\n---\n\n".join(all_responses)
@@ -740,32 +815,91 @@ class AgentOrchestrator:
                         if not _failing2:
                             _vr2 = await _run_final_verifier_np()
                             task_summaries.append(f"✅ **All {len(completion_criteria)} criteria satisfied** — score {_vr2.score}/10")
-                            break
-
-                        if _criterion_fix_count >= _fix_budget:
+                            _build_criteria_done2 = True
+                        elif _criterion_fix_count >= _fix_budget:
                             _vr2 = await _run_final_verifier_np()
                             task_summaries.append(
                                 f"🎯 Fix budget ({_fix_budget}) exhausted — {_passed_count2}/{len(completion_criteria)} criteria passing — score {_vr2.score}/10"
                             )
-                            break
+                            _build_criteria_done2 = True
+                        else:
+                            _target2 = next(
+                                (r for r in _failing2 if _criterion_attempts.get(r.criterion, 0) < 3),
+                                None,
+                            )
+                            if _target2 is None:
+                                _vr2 = await _run_final_verifier_np()
+                                task_summaries.append(f"🔍 All failing criteria abandoned after 3 attempts — score {_vr2.score}/10")
+                                _build_criteria_done2 = True
+                            else:
+                                _build_criteria_done2 = False
 
-                        _target2 = next(
-                            (r for r in _failing2 if _criterion_attempts.get(r.criterion, 0) < 3),
-                            None,
-                        )
-                        if _target2 is None:
-                            _vr2 = await _run_final_verifier_np()
-                            task_summaries.append(f"🔍 All failing criteria abandoned after 3 attempts — score {_vr2.score}/10")
-                            break
+                        if not _build_criteria_done2:
+                            _criterion_attempts[_target2.criterion] = _criterion_attempts.get(_target2.criterion, 0) + 1
+                            _criterion_fix_count += 1
+                            _fix_spec2 = self.verifier_coordinator.make_targeted_fix_spec(
+                                _target2, objective, _criterion_fix_count,
+                                screenshot_path=_last_acceptance_screenshot,
+                            )
+                            task_specs.append(_fix_spec2)
+                            total = len(task_specs)
+                            task_summaries.append(f"🎯 **Criterion fix** ({_criterion_fix_count}/{_fix_budget}) — failing: {_target2.criterion[:60]}")
+                            self.logger.info("criterion_fix_injected", criterion=_target2.criterion[:60], attempt=_criterion_attempts[_target2.criterion], fix_num=_criterion_fix_count)
+                            continue
 
-                        _criterion_attempts[_target2.criterion] = _criterion_attempts.get(_target2.criterion, 0) + 1
-                        _criterion_fix_count += 1
-                        _fix_spec2 = self.verifier_coordinator.make_targeted_fix_spec(_target2, objective, _criterion_fix_count)
-                        task_specs.append(_fix_spec2)
-                        total = len(task_specs)
-                        task_summaries.append(f"🎯 **Criterion fix** ({_criterion_fix_count}/{_fix_budget}) — failing: {_target2.criterion[:60]}")
-                        self.logger.info("criterion_fix_injected", criterion=_target2.criterion[:60], attempt=_criterion_attempts[_target2.criterion], fix_num=_criterion_fix_count)
-                        continue
+                        # Acceptance test loop — run after build criteria complete
+                        if _acceptance_criteria and task_type in ("develop", "sdlc") and _acceptance_fix_count < _acceptance_budget:
+                            _emit(f"verifying:acceptance-{_acceptance_fix_count + 1}")
+                            _tex_acc2 = self.tool_executor
+
+                            async def _acc_shell2(cmd: str, _t=_tex_acc2) -> str:
+                                if not _t:
+                                    return ""
+                                try:
+                                    out = await _t.execute("shell", {"command": cmd})
+                                    return str(out) if out else ""
+                                except Exception:
+                                    return ""
+
+                            _ws_acc2 = Path(getattr(_tex_acc2, "workspace_path", ".") if _tex_acc2 else ".")
+                            _app_probe2 = AppProbe(_ws_acc2, shell_fn=_acc_shell2)
+                            acc_results2 = await self.verifier_coordinator.run_acceptance_tests(
+                                _acceptance_criteria, _ws_acc2, _app_probe2, self.acceptance_tester_agent
+                            )
+                            _acc_failing2 = [r for r in acc_results2 if not r.passed]
+                            _acc_passed2 = len(acc_results2) - len(_acc_failing2)
+
+                            if not _acc_failing2:
+                                task_summaries.append(f"✅ **All {len(_acceptance_criteria)} acceptance criteria satisfied**")
+                                break
+
+                            if _acceptance_fix_count >= _acceptance_budget - 1:
+                                task_summaries.append(
+                                    f"🎯 Acceptance budget ({_acceptance_budget}) exhausted — {_acc_passed2}/{len(_acceptance_criteria)} passing"
+                                )
+                                break
+
+                            _acceptance_fix_count += 1
+                            _acc_target2 = _acc_failing2[0]
+                            _acc_fix_spec2 = self.verifier_coordinator.make_targeted_fix_spec(
+                                type("CR", (), {"criterion": _acc_target2.criterion, "passed": False, "detail": _acc_target2.detail})(),
+                                objective,
+                                _acceptance_fix_count,
+                                screenshot_path=_last_acceptance_screenshot,
+                            )
+                            task_specs.append(_acc_fix_spec2)
+                            total = len(task_specs)
+                            task_summaries.append(
+                                f"🖼️ **Acceptance fix** ({_acceptance_fix_count}/{_acceptance_budget}) — {_acc_target2.criterion[:60]}"
+                            )
+                            self.logger.info(
+                                "acceptance_fix_injected",
+                                criterion=_acc_target2.criterion[:60],
+                                fix_num=_acceptance_fix_count,
+                            )
+                            continue
+
+                        break
 
                     elif task_type in _VERIFIABLE_TYPES and _verifier_rounds < _MAX_VERIFIER_ROUNDS:
                         combined_so_far = "\n\n---\n\n".join(all_responses)
