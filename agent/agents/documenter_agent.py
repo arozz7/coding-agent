@@ -43,12 +43,22 @@ class DocumenterRole:
         if not model:
             return {"success": False, "error": "No coding model configured"}
 
-        enriched = context.get("enriched_context", "")
+        enriched_full = context.get("enriched_context", "")
+        # Research content is appended after the standard context under a known marker.
+        # Cap the standard preamble tightly but let the research section through in full
+        # so the documenter has all gathered findings to synthesize from.
+        _RESEARCH_MARKER = "## Research findings to synthesize"
+        if _RESEARCH_MARKER in enriched_full:
+            split_idx = enriched_full.index(_RESEARCH_MARKER)
+            enriched = enriched_full[:split_idx][:800] + "\n\n" + enriched_full[split_idx:]
+        else:
+            enriched = enriched_full[:1500]
         prompt = (
             f"{enriched}\n\n"
             f"## Documentation Task\n{task}\n\n"
-            f"Read the relevant source files from the workspace listing above, "
-            f"then write the requested documentation using FILE: blocks."
+            f"Using the research findings above, write comprehensive documentation "
+            f"with FILE: blocks. Include specific facts, names, comparisons, and "
+            f"recommendations from the research — do not summarize or compress."
         )
 
         response = await model_router.generate(

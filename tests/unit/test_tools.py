@@ -2,6 +2,7 @@
 import pytest
 import tempfile
 from pathlib import Path
+from agent.workspace_context import set_workspace, reset_workspace
 
 
 class TestFileSystemTool:
@@ -9,62 +10,90 @@ class TestFileSystemTool:
         from agent.tools import FileSystemTool
 
         with tempfile.TemporaryDirectory() as tmpdir:
-            tool = FileSystemTool(tmpdir)
-            assert tool.allowed_base == Path(tmpdir).resolve()
+            token = set_workspace(tmpdir)
+            try:
+                tool = FileSystemTool(tmpdir)
+                assert tool.allowed_base == Path(tmpdir).resolve()
+            finally:
+                reset_workspace(token)
 
     def test_write_and_read_file(self):
         from agent.tools import FileSystemTool
 
         with tempfile.TemporaryDirectory() as tmpdir:
-            tool = FileSystemTool(tmpdir)
-            tool.write_file("test.txt", "Hello, World!")
-            content = tool.read_file("test.txt")
-            assert content == "Hello, World!"
+            token = set_workspace(tmpdir)
+            try:
+                tool = FileSystemTool(tmpdir)
+                tool.write_file("test.txt", "Hello, World!")
+                content = tool.read_file("test.txt")
+                assert content == "Hello, World!"
+            finally:
+                reset_workspace(token)
 
     def test_list_directory(self):
         from agent.tools import FileSystemTool
 
         with tempfile.TemporaryDirectory() as tmpdir:
-            tool = FileSystemTool(tmpdir)
-            tool.write_file("test1.txt", "Content 1")
-            tool.write_file("test2.txt", "Content 2")
-            entries = tool.list_directory(".")
-            names = [e["name"] for e in entries]
-            assert "test1.txt" in names
-            assert "test2.txt" in names
+            token = set_workspace(tmpdir)
+            try:
+                tool = FileSystemTool(tmpdir)
+                tool.write_file("test1.txt", "Content 1")
+                tool.write_file("test2.txt", "Content 2")
+                entries = tool.list_directory(".")
+                names = [e["name"] for e in entries]
+                assert "test1.txt" in names
+                assert "test2.txt" in names
+            finally:
+                reset_workspace(token)
 
     def test_path_traversal_blocked(self):
         from agent.tools import FileSystemTool, PathTraversalError
 
         with tempfile.TemporaryDirectory() as tmpdir:
-            tool = FileSystemTool(tmpdir)
-            with pytest.raises(PathTraversalError):
-                tool.read_file("../etc/passwd")
+            token = set_workspace(tmpdir)
+            try:
+                tool = FileSystemTool(tmpdir)
+                with pytest.raises(PathTraversalError):
+                    tool.read_file("../etc/passwd")
+            finally:
+                reset_workspace(token)
 
     def test_file_not_found(self):
         from agent.tools import FileSystemTool, FileOperationError
 
         with tempfile.TemporaryDirectory() as tmpdir:
-            tool = FileSystemTool(tmpdir)
-            with pytest.raises(FileOperationError):
-                tool.read_file("nonexistent.txt")
+            token = set_workspace(tmpdir)
+            try:
+                tool = FileSystemTool(tmpdir)
+                with pytest.raises(FileOperationError):
+                    tool.read_file("nonexistent.txt")
+            finally:
+                reset_workspace(token)
 
     def test_search_files(self):
         from agent.tools import FileSystemTool
 
         with tempfile.TemporaryDirectory() as tmpdir:
-            tool = FileSystemTool(tmpdir)
-            tool.write_file("test.py", "# Python file")
-            tool.write_file("test.txt", "Text file")
-            matches = tool.search_files("*.py", ".")
-            assert len(matches) >= 1
+            token = set_workspace(tmpdir)
+            try:
+                tool = FileSystemTool(tmpdir)
+                tool.write_file("test.py", "# Python file")
+                tool.write_file("test.txt", "Text file")
+                matches = tool.search_files("*.py", ".")
+                assert len(matches) >= 1
+            finally:
+                reset_workspace(token)
 
     def test_delete_file(self):
         from agent.tools import FileSystemTool
 
         with tempfile.TemporaryDirectory() as tmpdir:
-            tool = FileSystemTool(tmpdir)
-            tool.write_file("delete_me.txt", "Content")
-            assert tool.file_exists("delete_me.txt")
-            tool.delete_file("delete_me.txt")
-            assert not tool.file_exists("delete_me.txt")
+            token = set_workspace(tmpdir)
+            try:
+                tool = FileSystemTool(tmpdir)
+                tool.write_file("delete_me.txt", "Content")
+                assert tool.file_exists("delete_me.txt")
+                tool.delete_file("delete_me.txt")
+                assert not tool.file_exists("delete_me.txt")
+            finally:
+                reset_workspace(token)

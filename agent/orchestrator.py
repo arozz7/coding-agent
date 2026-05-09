@@ -4,10 +4,12 @@ from datetime import datetime, timezone
 from pathlib import Path
 import os
 import re
-import subprocess
 import structlog
 
+_PROJECT_NAME_RE = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9_.\-]*$")
+
 from agent.security.prompt_guard import guard_task
+from agent.workspace_context import get_workspace
 
 from llm import ModelRouter
 from agent.memory import SessionMemory, CodebaseMemory
@@ -22,6 +24,7 @@ from agent.agents.reviewer_agent import ReviewerAgent
 from agent.agents.architect_agent import ArchitectAgent
 from agent.agents.chat_agent import ChatAgent
 from agent.agents.research_agent import ResearchAgent
+from agent.agents.verifier_agent import VerifierAgent
 from agent.agents.mapper_agent import MapperAgent
 from agent.agents.red_team_agent import RedTeamAgent
 from agent.agents.documenter_agent import DocumenterAgent
@@ -29,6 +32,7 @@ from agent.chain_runner import ChainRunner
 from agent.skills.skill_loader import SkillManager
 from agent.skills.wiki_manager import WikiManager
 from agent.skills.skill_executor import SkillExecutor
+from agent.orchestration import ContextBuilder, TaskRouter, VerifierCoordinator
 from observability.logging import AgentLogger
 
 logger = structlog.get_logger()
@@ -67,7 +71,12 @@ class AgentOrchestrator:
         self.browser_tool = BrowserTool(workspace_path)
         self.tool_executor = ToolExecutor(workspace_path, self.code_analyzer, self.pytest_tool)
         self.skill_manager = SkillManager("skills")
-        self.wiki_manager = WikiManager(workspace_path)
+        # Derive project name: non-empty when workspace is a subdirectory of the root.
+        _ws_root = os.getenv("WORKSPACE_PATH", "./workspace")
+        _ws_root_resolved = str(Path(_ws_root).resolve())
+        _ws_resolved = str(Path(_ws).resolve())
+        _project_name = Path(_ws).name if _ws_resolved != _ws_root_resolved else ""
+        self.wiki_manager = WikiManager(workspace_path, project_name=_project_name)
         self.wiki_manager._ensure_dirs()   # create .agent-wiki/ structure on startup
         self.skill_executor = SkillExecutor(self.wiki_manager, self.skill_manager)
         self.memory_wiki = MemoryWiki(project_id=Path(workspace_path).name)
@@ -118,11 +127,25 @@ class AgentOrchestrator:
         self.documenter_agent = DocumenterAgent(model_router)
         self.planner_agent = PlannerAgent(model_router)
         self.plan_reviewer_agent = PlanReviewerAgent(model_router)
+        self.verifier_agent = VerifierAgent(model_router)
         self.chain_runner = ChainRunner(self)
 
         # Task store — shares the same SQLite file as the job store
         from api.task_store import TaskStore
         self.task_store = TaskStore("data/jobs.db")
+
+        # Orchestration sub-components
+        self.task_router = TaskRouter(model_router)
+        self.context_builder = ContextBuilder(
+            model_router=model_router,
+            skill_executor=self.skill_executor,
+            codebase_memory=self.codebase_memory,
+            session_memory=self.session_memory,
+            skill_manager=self.skill_manager,
+            memory_wiki=self.memory_wiki,
+            skill_router=self.task_router,
+        )
+        self.verifier_coordinator = VerifierCoordinator(self.verifier_agent, model_router)
 
         # Collect model-switch notices emitted by the router during task execution.
         # Drained at each task-loop boundary and surfaced in job phase + response text.
@@ -156,14 +179,15 @@ class AgentOrchestrator:
         self.logger.info("spawning_subagent", subagent_id=subagent_id, role=role, task=task[:100])
 
         # Ensure session exists before creating executor (EventEmittingExecutor requires it)
-        self.session_memory.get_or_create_session(subagent_id, self.workspace_path)
-        enriched_context = await self._build_enriched_context(task)
+        _ws_now = get_workspace()
+        self.session_memory.get_or_create_session(subagent_id, _ws_now)
+        enriched_context = await self.context_builder.build(task)
 
         # Create isolated context for subagent
         isolated_context = {
             "session_id": subagent_id,
             "parent_session_id": parent_session_id,
-            "workspace_path": self.workspace_path,
+            "workspace_path": _ws_now,
             "model_router": self.model_router,
             "tool_executor": self._create_session_executor(subagent_id),
             "enriched_context": enriched_context,
@@ -211,9 +235,9 @@ class AgentOrchestrator:
             # so future searches in the parent session can find them.
             files_created = result.get("files_created", [])
             if files_created and result.get("success"):
-                project_id = Path(self.workspace_path).name
+                project_id = Path(_ws_now).name
                 for rel_path in files_created:
-                    abs_path = Path(self.workspace_path) / rel_path
+                    abs_path = Path(_ws_now) / rel_path
                     if abs_path.exists() and abs_path.is_file():
                         try:
                             self.codebase_memory.index_files(
@@ -338,494 +362,6 @@ class AgentOrchestrator:
                 pass
         return notices
 
-    def _detect_task_type_keyword(self, task: str) -> str:
-        """Keyword-based task classifier — used as fallback when LLM is unavailable.
-
-        Priority (highest first):
-          0. SDLC — full plan+build+test+debug+run+verify pipeline
-          1. Plan — user explicitly wants a plan before any code is written
-          2. Explicit coding — output is new/modified source files
-          3. Review / security audit
-          4. Testing — write or run tests
-          5. Architecture / ADR
-          6. Research — investigate the existing codebase
-          7. Chat — everything else (conversation, general questions)
-        """
-        t = task.lower()
-
-        # 0. Full SDLC pipeline — build, run, test, and verify autonomously
-        _SDLC = [
-            "build me a complete", "build a complete", "build a full",
-            "create a full", "create a complete",
-            "develop a complete", "develop a full",
-            "build and test", "build, test",
-            "build and run", "build and deploy",
-            "implement and test", "implement, test",
-            "full app", "full application", "entire application",
-            "end to end", "end-to-end",
-            "full development", "full stack",
-            "build the whole", "build the entire",
-        ]
-        if any(kw in t for kw in _SDLC):
-            return "sdlc"
-
-        # 0b. Run / debug / launch — user wants to execute existing code and fix errors
-        _RUN_DEBUG = [
-            "run and debug", "run and fix", "debug and fix", "run the game",
-            "run the app", "run the server", "run the project", "run the code",
-            "run and test", "launch the", "start the app", "start the server",
-            "start the game", "start the project",
-            "debug the", "debug it", "debug and", "debugging",
-            "fix the runtime", "fix the error", "fix the errors", "fix the bug",
-            "fix the bugs", "fix and run", "fix this error", "fix these errors",
-            "fix the code errors", "fix code errors", "fix all errors",
-            "there are still errors", "still not running", "not starting",
-            "can't run", "cannot run", "won't run", "fails to run",
-            "fails to start", "failing to run",
-            "get it running", "get the game running", "get the app running",
-            "get the server running", "get the project running", "get it working",
-            # Execution / build phrases commonly missed by above
-            "run the build", "running the build", "try running", "run it",
-            "run with verbose", "run with", "run verbose",
-            "go ahead and run", "go run", "now run", "run now",
-            "run the application", "run the program",
-            "run npm", "npm run", "npm install", "npm start",
-            "compile the", "execute the", "execute it",
-            "build it", "build the project", "build the app",
-            "running builds", "running the app", "running the application",
-        ]
-        if any(kw in t for kw in _RUN_DEBUG):
-            return "develop"
-
-        # 1. Planning mode — user wants a blueprint before implementation
-        _PLAN = [
-            "plan first", "solid plan", "show me a plan", "want to plan",
-            "want first work on a", "planning phase", "let's plan", "lets plan",
-            "before we build", "before building", "before implementing",
-            "roadmap", "outline the approach", "outline a plan", "create a plan",
-            "work on a plan", "i want a plan",
-        ]
-        if any(kw in t for kw in _PLAN):
-            return "plan"
-
-        # 1. Explicit development: output is code/files (including document/content writing)
-        _DEVELOP = [
-            "implement", "refactor", "write a function", "write a class",
-            "write a script", "write the code", "write code",
-            "create a file", "create the file",
-            "build a ", "build the ", "develop a ",
-            "add feature", "add a feature",
-            "fix the bug", "fix this bug", "fix the error", "fix this error",
-            "fix the issue", "fix this issue",
-            "update the code", "update the function", "update the class",
-            "generate code", "generate a script",
-            "create an api", "create a server", "create a bot", "create a cli",
-            "make an app", "make a server", "make a bot", "make a script",
-            "make a function", "make a class",
-            # Content / document writing — these all produce files
-            "flush out", "flesh out", "fill in", "fill out",
-            "complete the", "complete this", "finish the", "finish writing",
-            "continue to write", "continue writing", "continue to flush",
-            "continue to flesh", "continue to fill", "continue to build",
-            "continue to develop", "continue to work on",
-            "write the narrative", "write the story", "write the lore",
-            "write the docs", "write the document", "write the content",
-            "draft the", "draft a document", "draft a narrative",
-            "expand the", "expand on", "add content", "add more content",
-            "add to the", "update the doc", "update the narrative",
-            "update the story", "write more", "add more detail",
-            "create the document", "create the narrative", "create the story",
-            "create the lore", "create the wiki", "create the design doc",
-            "write up", "document the", "write out",
-        ]
-        if any(kw in t for kw in _DEVELOP):
-            return "develop"
-
-        # 2. Code review / security audit
-        if any(kw in t for kw in [
-            "review the code", "code review", "critique", "check for bugs",
-            "security audit", "security review", "analyze this code",
-            "review this file", "review this function",
-        ]):
-            return "review"
-
-        # 3. Tests
-        if any(kw in t for kw in [
-            "write tests", "write unit tests", "add tests", "create tests",
-            "generate tests", "unit test", "pytest", "test suite", "test case",
-            "run the tests", "run tests",
-        ]):
-            return "test"
-
-        # 4. Architecture
-        if any(kw in t for kw in [
-            "system design", "design the architecture", "architecture for",
-            "write an adr", "create an adr", "architect the", "high-level design",
-            "design pattern for", "design a system",
-        ]):
-            return "architect"
-
-        # 5. Research: codebase investigation (read-only)
-        if any(kw in t for kw in [
-            "where is ", "where are ", "find the ", "find where",
-            "locate ", "which file", "what file",
-            "trace ", "how does the existing", "how is ", "how does ",
-            "what does the code", "show me where",
-            "search the codebase", "look for ", "search for ",
-            "what files", "investigate", "explore the code",
-            "explain this code", "explain the code", "explain this file",
-        ]):
-            return "research"
-
-        # 6. Default: chat (general questions, explanations, conversation)
-        return "chat"
-
-    async def _detect_task_type_llm(self, task: str) -> str:
-        """LLM-based task classifier. Returns one of the 6 valid task types.
-
-        Sends a tiny zero-shot prompt to the active model with a short timeout.
-        Raises on timeout or unexpected output so the caller can fall back.
-        """
-        import asyncio
-        import re as _re
-        import yaml as _yaml
-
-        # Load classifier config (prompt + valid_types).
-        # _PROJECT_ROOT is the directory containing this package (the repo root).
-        from local_coding_agent import _PROJECT_ROOT
-        cfg_path = _PROJECT_ROOT / "config" / "task_classifier.yaml"
-        if not cfg_path.exists():
-            raise FileNotFoundError(f"task_classifier.yaml not found at {cfg_path}")
-
-        with open(cfg_path) as fh:
-            cfg = _yaml.safe_load(fh)
-
-        valid_types: List[str] = cfg["valid_types"]
-        timeout_s: float = float(cfg.get("timeout_seconds", 3))
-        prompt_template: str = cfg["prompt"]
-        prompt = prompt_template.format(task=task)
-
-        config = self.model_router.get_model("coding")
-        if not config:
-            raise RuntimeError("No model configured")
-
-        # Disable thinking for the classifier: it only needs one word back.
-        # A Qwen3 thinking trace for a one-word answer can run 10-30 minutes,
-        # burning the entire timeout budget before the actual classification
-        # arrives.  Thinking is still enabled for all real coding/planning calls.
-        raw = await self.model_router.generate(
-            prompt, config, timeout=timeout_s, enable_thinking=False
-        )
-
-        # Extract first word on first non-empty line
-        first_line = next((ln.strip() for ln in raw.splitlines() if ln.strip()), "")
-        candidate = _re.sub(r"[^a-z]", "", first_line.lower().split()[0]) if first_line else ""
-
-        if candidate not in valid_types:
-            raise ValueError(f"LLM returned unexpected type: {candidate!r}")
-
-        return candidate
-
-    # Strong develop signals that the LLM classifier sometimes mislabels as chat.
-    # If any of these match we skip the LLM call entirely and return "develop".
-    _DEFINITIVE_DEVELOP = re.compile(
-        r"""
-        \b(
-            fix\s+the\s+(code\s+)?errors?         # "fix the errors" / "fix the code errors"
-          | fix\s+(all\s+)?the\s+bugs?             # "fix the bugs"
-          | fix\s+(?:and\s+)?run                   # "fix and run"
-          | get\s+\S+\s+running                    # "get the game running"
-          | get\s+it\s+running                     # "get it running"
-          | debugging                              # bare "debugging"
-          | debug\s+(?:and|the|it|this)            # "debug the", "debug it"
-          | run\s+the\s+(app|game|server|project|code|build|application|program)
-          | npm\s+(run|install|start|build)
-          | (start|launch)\s+the\s+(app|server|game|bot|project)
-          | build\s+(the\s+)?(app|project|code|game|server|it)
-          | compile\s+the
-          | there\s+are\s+(still\s+)?errors?
-          | still\s+(not\s+)?(?:running|working|compiling|building)
-          | can.?t\s+(run|start|launch|compile|build)
-          | won.?t\s+(run|start|launch|compile|build)
-        )\b
-        """,
-        re.VERBOSE | re.IGNORECASE,
-    )
-
-    async def _detect_task_type(self, task: str) -> str:
-        """Return the most appropriate agent role for this task.
-
-        Runs a definitive-develop regex first (fast, no LLM call) to catch
-        common patterns the LLM mislabels.  If that matches, returns "develop"
-        immediately.  Otherwise tries the LLM classifier and falls back to
-        keyword matching on any failure.
-        """
-        if self._DEFINITIVE_DEVELOP.search(task):
-            self.logger.info("task_type_definitive", task_type="develop")
-            return "develop"
-
-        try:
-            result = await self._detect_task_type_llm(task)
-            self.logger.info("task_type_llm", task_type=result)
-            return result
-        except Exception as e:
-            self.logger.warning("task_type_llm_fallback", reason=str(e))
-            return self._detect_task_type_keyword(task)
-    
-    # Keyword → skill name mapping for pre/post phase detection
-    _PRE_TRIGGERS: dict[str, list[str]] = {
-        "test": ["tdd-enforcer"],
-        "security": ["security-auditor"],
-        "audit": ["security-auditor"],
-        "database": ["architect-decision-engine"],
-        "api": ["architect-decision-engine"],
-        "auth": ["architect-decision-engine"],
-        "architecture": ["architect-decision-engine"],
-        "adr": ["architect-decision-engine"],
-    }
-    _POST_TRIGGERS: dict[str, list[str]] = {
-        "compile": ["wiki-compile"],
-        "save": ["wiki-compile"],
-        "remember": ["wiki-compile"],
-        "wiki": ["wiki-compile"],
-        "handover": ["handover"],
-        "context bridge": ["handover"],
-    }
-
-    def _detect_skill_names(self, task: str, phase: str = "pre") -> List[str]:
-        """Return skill names triggered by task keywords for the given phase."""
-        task_lower = task.lower()
-        triggers = self._PRE_TRIGGERS if phase == "pre" else self._POST_TRIGGERS
-        seen: list[str] = []
-        for keyword, names in triggers.items():
-            if keyword in task_lower:
-                for name in names:
-                    if name not in seen:
-                        seen.append(name)
-        return seen
-
-    # Fallback handover template used when the skill file cannot be loaded.
-    _HANDOVER_FALLBACK = (
-        "Generate a concise Context Bridge document so a future AI session can "
-        "resume exactly where this one left off.\n\n"
-        "Output ONLY this structure:\n\n"
-        "### Current State\n"
-        "3-sentence summary of objectives, decisions, and work completed.\n\n"
-        "### Technical Details\n"
-        "Bulleted list of specific constraints, file paths, function names, "
-        "config values, and preferences established in this session.\n\n"
-        "### Next Steps\n"
-        "Prioritised list of what the next session should focus on.\n\n"
-        "### Opening Instruction\n"
-        "A single sentence the user can paste into a new chat to instantly "
-        "prime the next AI with this context.\n\n"
-        "Be concise but comprehensive — no context should be lost."
-    )
-
-    # ------------------------------------------------------------------ #
-    # Context-budget helpers                                               #
-    # ------------------------------------------------------------------ #
-
-    def _estimate_context_tokens(self, session_id: str, task: str) -> int:
-        """Rough token estimate for the next LLM call.
-
-        Measures the session history string plus a fixed overhead that accounts
-        for the system prompt (~1 500 tokens) and enriched context (~3 000 tokens).
-        Uses char/4 as the token estimator — precise enough for a threshold check.
-        """
-        history = self._build_context_from_events(session_id)
-        char_count = len(history) + len(task)
-        return char_count // 4 + 4_500  # overhead: system prompt + enriched context
-
-    def _check_context_budget(self, session_id: str, task: str) -> str:
-        """Return 'ok', 'warn' (≥75 %), or 'bridge' (≥82 %) based on token usage."""
-        config = self.model_router.get_model("coding")
-        if not config or not config.context_window:
-            return "ok"
-        estimated = self._estimate_context_tokens(session_id, task)
-        ratio = estimated / config.context_window
-        self.logger.debug(
-            "context_budget_check",
-            estimated_tokens=estimated,
-            context_window=config.context_window,
-            ratio=f"{ratio:.1%}",
-        )
-        if ratio >= 0.82:
-            return "bridge"
-        if ratio >= 0.75:
-            return "warn"
-        return "ok"
-
-    async def _run_handover(self, session_id: str, task: str) -> tuple:
-        """Generate a Context Bridge, create a new session pre-seeded with it.
-
-        Returns (bridge_text: str, new_session_id: str).
-        """
-        # Load the handover SKILL.md if available, else use fallback template.
-        skill = self.skill_manager.get_skill("handover")
-        instructions = (skill.content if skill else self._HANDOVER_FALLBACK).strip()
-
-        # Gather recent git context (best-effort).
-        git_summary = ""
-        try:
-            r = subprocess.run(
-                ["git", "log", "--oneline", "-10"],
-                cwd=str(self.workspace_path),
-                capture_output=True,
-                text=True,
-                timeout=5,
-            )
-            if r.returncode == 0:
-                git_summary = r.stdout.strip()
-        except Exception:
-            pass
-
-        history = self._build_context_from_events(session_id)
-        prompt = (
-            f"{instructions}\n\n"
-            f"## Session to summarise\n"
-            f"Session ID: {session_id}\n"
-            f"Next task (triggered this handover): {task}\n\n"
-            f"Recent git commits:\n{git_summary or '(unavailable)'}\n\n"
-            f"Conversation history:\n{history or '(no history yet)'}\n\n"
-            f"Generate the Context Bridge now."
-        )
-
-        config = self.model_router.get_model("coding")
-        bridge_text = await self.model_router.generate(prompt, config)
-
-        # Create the new session and pre-seed it with the bridge document.
-        new_session_id = f"session_{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S')}_bridge"
-        self.session_memory.get_or_create_session(new_session_id, self.workspace_path)
-        self.session_memory.save_message(
-            new_session_id,
-            "assistant",
-            f"[Context Bridge — resumed from session {session_id}]\n\n{bridge_text}",
-        )
-        self.logger.info(
-            "handover_complete",
-            old_session=session_id,
-            new_session=new_session_id,
-        )
-        return bridge_text, new_session_id
-
-    @staticmethod
-    def _build_environment_context() -> str:
-        """Return a compact block describing the runtime environment.
-
-        Injected at the top of every task context so agents never have to
-        probe the OS by running commands — they already know.
-        """
-        import platform as _platform
-        system = _platform.system()
-        release = _platform.release()
-
-        if system == "Windows":
-            shell_guide = (
-                "Shell: PowerShell / cmd.exe (Windows)\n"
-                "IMPORTANT — Windows command equivalents:\n"
-                "  dir          (not ls)\n"
-                "  type         (not cat)\n"
-                "  del          (not rm)\n"
-                "  copy         (not cp)\n"
-                "  move         (not mv)\n"
-                "  cls          (not clear)\n"
-                "  where        (not which)\n"
-                "  findstr      (not grep)\n"
-                "  $env:VAR     (not export VAR=)\n"
-                "Chain with: &&  (not ; or ||)\n"
-                "Paths use backslash or forward slash both work in npm/node/python."
-            )
-        elif system == "Darwin":
-            shell_guide = "Shell: zsh/bash (macOS)"
-        else:
-            shell_guide = "Shell: bash/sh (Linux)"
-
-        active_project = os.environ.get("PROJECT_DIR", "").strip()
-        project_line = (
-            f"Active project: {active_project} "
-            f"(workspace is already scoped — write files at workspace root, "
-            f"NOT inside a new subdirectory)\n"
-            if active_project
-            else ""
-        )
-
-        return (
-            f"\n\n## Runtime Environment\n"
-            f"OS: {system} {release}\n"
-            f"{shell_guide}\n"
-            f"{project_line}"
-        )
-
-    async def _build_enriched_context(self, task: str) -> str:
-        """Build prompt enrichment: wiki-query results + RAG chunks + skill instructions.
-
-        Replaces the four dead helper methods (_detect_skills, _get_skill_context,
-        _load_wiki_context, _load_rag_context) that were disconnected when
-        _run_general_agent() was removed.
-        """
-        parts: list[str] = []
-
-        # 0a. Runtime environment — OS, shell, command cheat-sheet.
-        #     Injected first so agents never have to probe the OS.
-        parts.append(self._build_environment_context())
-
-        # 0c. AGENTS.md — global coding agent instructions (injected once per task)
-        agents_md = Path("AGENTS.md")
-        if agents_md.exists():
-            try:
-                agents_content = agents_md.read_text(encoding="utf-8")
-                parts.append(f"\n\n## Global Agent Instructions (AGENTS.md)\n{agents_content}")
-            except Exception:
-                pass
-
-        # 0b. Workspace file listing — shallow snapshot so agents know what files exist
-        #     without having to run a shell command. Capped at 80 entries to stay concise.
-        try:
-            ws_root = Path(self.workspace_path)
-            if ws_root.exists():
-                ws_lines: list[str] = []
-                _IGNORE = {".git", "node_modules", "__pycache__", ".agent-wiki", "logs", "-p"}
-                for item in sorted(ws_root.rglob("*")):
-                    # Skip hidden/noisy directories
-                    if any(part in _IGNORE for part in item.parts):
-                        continue
-                    rel = item.relative_to(ws_root)
-                    prefix = "📁 " if item.is_dir() else "📄 "
-                    ws_lines.append(f"  {prefix}{rel}")
-                    if len(ws_lines) >= 80:
-                        ws_lines.append("  … (truncated)")
-                        break
-                if ws_lines:
-                    parts.append(
-                        f"\n\n## Workspace Files ({self.workspace_path})\n"
-                        + "\n".join(ws_lines)
-                    )
-        except Exception as _ws_err:
-            self.logger.warning("workspace_listing_failed", error=str(_ws_err))
-
-        # 1. Wiki query — check persistent knowledge before every task
-        wiki_ctx = await self.skill_executor.execute_pre("wiki-query", task)
-        if wiki_ctx:
-            parts.append(wiki_ctx)
-
-        # 2. RAG — semantic code search from vector store
-        try:
-            project_id = Path(self.workspace_path).name
-            rag_ctx = self.codebase_memory.get_relevant_context(task, project_id, max_chunks=3)
-            if rag_ctx:
-                parts.append(rag_ctx)
-        except Exception as e:
-            self.logger.warning("rag_context_failed", error=str(e))
-
-        # 3. Pre-execution skill instructions (tdd-enforcer, security-auditor, etc.)
-        for skill_name in self._detect_skill_names(task, "pre"):
-            skill_ctx = await self.skill_executor.execute_pre(skill_name, task)
-            if skill_ctx:
-                parts.append(skill_ctx)
-
-        return "\n".join(parts)
-
     def _create_session_executor(self, session_id: str) -> "EventEmittingExecutor":
         """Create an EventEmittingExecutor bound to this session."""
         return self._EventEmittingExecutor(
@@ -842,6 +378,7 @@ class AgentOrchestrator:
         on_phase: Optional[Callable[[str], None]] = None,
         job_id: Optional[str] = None,
         _direct: bool = False,
+        extra_context: str = "",
     ) -> dict:
         """Route a task to the appropriate agent.
 
@@ -880,14 +417,21 @@ class AgentOrchestrator:
 
         # --- Direct execution (all other types, or inner loop calls) ---
         session_executor = self._create_session_executor(session_id)
-        enriched_context = await self._build_enriched_context(task)
-        history = self._build_context_from_events(session_id)
+        enriched_context = await self.context_builder.build(task, agent_type=task_type)
+        # Session history is NOT injected for research/develop tasks inside
+        # the task loop — only the wiki+RAG enriched context is used.  This
+        # prevents cross-project session events (from a prior project switch)
+        # from bleeding into the current project's research output and wiki.
+        # Chat and other interactive types still get the full history so
+        # conversational continuity is preserved.
+        _include_history = task_type not in ("research", "develop", "test", "researcher")
+        history = self.context_builder.build_events_context(session_id) if _include_history else ""
         context = {
             "session_id": session_id,
-            "workspace_path": self.workspace_path,
+            "workspace_path": get_workspace(),
             "model_router": self.model_router,
             "tool_executor": session_executor,
-            "enriched_context": enriched_context + history,
+            "enriched_context": enriched_context + history + extra_context,
             "on_phase": on_phase,
         }
 
@@ -940,7 +484,7 @@ class AgentOrchestrator:
 
         # 1. Plan
         _emit("planning:tasks")
-        enriched_preview = await self._build_enriched_context(objective)
+        enriched_preview = await self.context_builder.build(objective)
         task_specs = await self.planner_agent.plan(
             objective,
             context=enriched_preview[:600],
@@ -970,12 +514,76 @@ class AgentOrchestrator:
         task_summaries: list[str] = []
         screenshot_path: Optional[str] = None
         task_num = 0
+        # Keyed by agent_type — holds outputs from prior tasks for injection
+        # into downstream tasks in the same loop.
+        _task_outputs: dict[str, list[str]] = {}
+        _verifier_rounds = 0
+        _prev_verifier_score = -1  # sentinel: no previous round yet
+        _final_verifier_score: int | None = None  # last score from any verifier round
+        # Cap is env-configurable; default 3. Minimum 1.
+        _MAX_VERIFIER_ROUNDS = max(1, int(os.getenv("VERIFIER_MAX_ROUNDS", "3")))
+        # Task types where verification is meaningful (skip chat, plan, mapper).
+        _VERIFIABLE_TYPES = {"develop", "research", "sdlc"}
 
         # 3. Execute loop
         while True:
             if job_id:
                 task_obj = self.task_store.get_next_pending(job_id)
                 if task_obj is None:
+                    # All tasks done — run verifier if applicable.
+                    if task_type in _VERIFIABLE_TYPES and _verifier_rounds < _MAX_VERIFIER_ROUNDS:
+                        combined_so_far = "\n\n---\n\n".join(all_responses)
+                        _emit(f"verifying:round-{_verifier_rounds + 1}")
+                        vresult = await self.verifier_coordinator.run_verification(
+                            objective, task_type, combined_so_far, all_files,
+                            tool_executor=self.tool_executor,
+                        )
+                        self.logger.info(
+                            "verifier_result",
+                            round=_verifier_rounds + 1,
+                            score=vresult.score,
+                            passed=vresult.passed,
+                            gaps=len(vresult.gaps),
+                        )
+                        _verifier_rounds += 1
+                        _final_verifier_score = vresult.score
+                        if vresult.passed:
+                            try:
+                                self.session_memory.store_episodic(
+                                    session_id, objective,
+                                    combined_so_far[:500], vresult.score, task_type,
+                                )
+                            except Exception:
+                                pass
+                        if not vresult.passed:
+                            # Stop on true stagnation: plateau (same score) or drop ≥ 2.
+                            # A 1-point fluctuation is within LLM judge variance — let it continue.
+                            if _prev_verifier_score >= 0:
+                                _drop = _prev_verifier_score - vresult.score
+                                if vresult.score == _prev_verifier_score or _drop >= 2:
+                                    reason = "plateau" if _drop == 0 else f"dropped {_drop} pts"
+                                    task_summaries.append(
+                                        f"🔍 **Verifier** stagnated at {vresult.score}/10 "
+                                        f"({reason} from {_prev_verifier_score}/10) — stopping"
+                                    )
+                                    break
+                            _prev_verifier_score = vresult.score
+                            fix_specs = self.verifier_coordinator.make_fix_specs(
+                                objective, task_type, vresult, _verifier_rounds,
+                                files_created=all_files,
+                            )
+                            for spec in fix_specs:
+                                new_fix = self.task_store.create_task(
+                                    job_id=job_id,
+                                    description=spec["description"],
+                                    agent_type=spec["agent_type"],
+                                )
+                                total = max(total, new_fix.sequence)
+                            task_summaries.append(
+                                f"🔍 **Verifier** (round {_verifier_rounds}/{_MAX_VERIFIER_ROUNDS}) "
+                                f"— score {vresult.score}/10, injecting {len(fix_specs)} fix task(s)"
+                            )
+                            continue  # loop back to pick up fix tasks
                     break
                 task_id = task_obj.task_id
                 task_num = task_obj.sequence
@@ -986,6 +594,42 @@ class AgentOrchestrator:
             else:
                 # No persistence — run specs in order
                 if task_num >= len(task_specs):
+                    if task_type in _VERIFIABLE_TYPES and _verifier_rounds < _MAX_VERIFIER_ROUNDS:
+                        combined_so_far = "\n\n---\n\n".join(all_responses)
+                        _emit(f"verifying:round-{_verifier_rounds + 1}")
+                        vresult = await self.verifier_coordinator.run_verification(
+                            objective, task_type, combined_so_far, all_files,
+                            tool_executor=self.tool_executor,
+                        )
+                        _verifier_rounds += 1
+                        _final_verifier_score = vresult.score
+                        if vresult.passed:
+                            try:
+                                self.session_memory.store_episodic(
+                                    session_id, objective,
+                                    combined_so_far[:500], vresult.score, task_type,
+                                )
+                            except Exception:
+                                pass
+                        if not vresult.passed:
+                            if _prev_verifier_score >= 0 and vresult.score <= _prev_verifier_score:
+                                task_summaries.append(
+                                    f"🔍 **Verifier** stagnated at {vresult.score}/10 "
+                                    f"(≤ previous {_prev_verifier_score}/10) — stopping"
+                                )
+                                break
+                            _prev_verifier_score = vresult.score
+                            fix_specs = self.verifier_coordinator.make_fix_specs(
+                                objective, task_type, vresult, _verifier_rounds,
+                                files_created=all_files,
+                            )
+                            task_specs.extend(fix_specs)
+                            total = len(task_specs)
+                            task_summaries.append(
+                                f"🔍 **Verifier** (round {_verifier_rounds}/{_MAX_VERIFIER_ROUNDS}) "
+                                f"— score {vresult.score}/10, injecting {len(fix_specs)} fix task(s)"
+                            )
+                            continue
                     break
                 spec = task_specs[task_num]
                 task_num += 1
@@ -1008,6 +652,22 @@ class AgentOrchestrator:
                 _emit(f"task:{task_num}/{total}:{_at}:{inner_label}")
 
             try:
+                # Inject prior research findings into downstream tasks.
+                # develop/test get recent snippets; documenter gets the full set
+                # so it has all research content to synthesize from.
+                _extra = ""
+                _research_outputs = _task_outputs.get("research", []) + _task_outputs.get("researcher", [])
+                if _research_outputs:
+                    _snippet_cap = self.context_builder.char_budget(fraction=0.015, cap=3_000)
+                    _doc_cap = self.context_builder.char_budget(fraction=0.08, cap=40_000)
+                    if agent_type in ("develop", "test"):
+                        snippets = [s[:_snippet_cap] for s in _research_outputs[-2:]]
+                        _extra = "\n\n## Prior research findings\n\n" + "\n\n---\n\n".join(snippets)
+                    elif agent_type == "documenter":
+                        _extra = "\n\n## Research findings to synthesize\n\n" + "\n\n---\n\n".join(
+                            s[:_doc_cap] for s in _research_outputs
+                        )
+
                 result = await self._run_specialized_agent(
                     description,
                     agent_type,
@@ -1015,6 +675,7 @@ class AgentOrchestrator:
                     on_phase=_wrapped_on_phase,
                     job_id=None,     # prevent re-entering the loop
                     _direct=True,    # go straight to agent
+                    extra_context=_extra,
                 )
 
                 # Surface any model-switch events that fired during this step.
@@ -1033,6 +694,17 @@ class AgentOrchestrator:
                     all_files.extend(new_files)
                     if result.get("screenshot_path"):
                         screenshot_path = result.get("screenshot_path")
+
+                    # Capture task output so later tasks in the loop can use it.
+                    _store_cap = self.context_builder.char_budget(fraction=0.05, cap=10_000)
+                    _task_outputs.setdefault(agent_type, []).append(response_text[:_store_cap])
+
+                    # Update code-dependency graph when developer changes files.
+                    if agent_type in ("develop", "developer") and new_files:
+                        try:
+                            self.memory_wiki.update_from_files(new_files)
+                        except Exception:
+                            pass
 
                     # Agent may append new tasks dynamically
                     new_task_specs = result.get("new_tasks", [])
@@ -1063,13 +735,15 @@ class AgentOrchestrator:
                     short = completion_summary or response_text[:80].replace("\n", " ").strip()
                     task_summaries.append(f"✅ **{description[:60]}** — {short}")
 
-                    # Persist subtask learnings to wiki so later tasks can reference them.
-                    try:
-                        await self.skill_executor.execute_post(
-                            "wiki-compile", description, result, self.model_router
-                        )
-                    except Exception as _we:
-                        self.logger.warning("subtask_wiki_compile_failed", task_num=task_num, error=str(_we))
+                    # Persist subtask learnings to wiki — skip for research tasks to
+                    # avoid N extra LLM calls in a research loop.
+                    if agent_type not in ("research", "researcher"):
+                        try:
+                            await self.skill_executor.execute_post(
+                                "wiki-compile", description, result, self.model_router
+                            )
+                        except Exception as _we:
+                            self.logger.warning("subtask_wiki_compile_failed", task_num=task_num, error=str(_we))
                 else:
                     error = result.get("error", "agent failed")
                     all_responses.append(
@@ -1144,39 +818,8 @@ class AgentOrchestrator:
             "screenshot_path": screenshot_path,
             "task_count": total,
             "job_summary": job_summary,
+            "verifier_score": _final_verifier_score,
         }
-
-    def _build_context_from_events(self, session_id: str) -> str:
-        """Build conversation context from paginated events.
-
-        Fetches the last 20 events and truncates large tool_result payloads
-        to avoid stuffing the full execution trace into the context window.
-        """
-        events = self.session_memory.get_events(session_id, offset=-20, limit=20)
-        if not events:
-            return ""
-
-        context_lines = ["\n\nRecent conversation:\n"]
-        for ev in events:
-            role = ev["role"]
-            content = ev["content"]
-
-            if role.startswith("event:"):
-                event_type = role[len("event:"):]
-                if event_type == "tool_result":
-                    # Cap large tool outputs so they don't flood the prompt
-                    content = content[:500] + ("…" if len(content) > 500 else "")
-                context_lines.append(f"[{event_type}] {content}")
-            elif role in ("user", "assistant"):
-                context_lines.append(f"{role.capitalize()}: {content[:500]}")
-
-        return "\n".join(context_lines)
-
-    def _build_context(self, session_id: str, include_history: bool = True) -> str:
-        """Build context string for streaming endpoint."""
-        if not include_history:
-            return ""
-        return self._build_context_from_events(session_id)
 
     async def run_task(
         self,
@@ -1236,12 +879,14 @@ class AgentOrchestrator:
         handover_triggered = False
         handover_bridge: Optional[str] = None
         original_session_id: Optional[str] = None
-        budget = self._check_context_budget(session_id, task)
+        budget = self.context_builder.check_budget(session_id, task)
         if budget == "bridge":
             _emit_phase("handover")
             self.logger.info("context_bridge_triggered", session_id=session_id)
             try:
-                bridge_text, new_session_id = await self._run_handover(session_id, task)
+                bridge_text, new_session_id = await self.context_builder.build_handover(
+                    session_id, task, self.workspace_path
+                )
                 original_session_id = session_id
                 session_id = new_session_id
                 handover_triggered = True
@@ -1258,11 +903,11 @@ class AgentOrchestrator:
         import asyncio as _asyncio
         if force_task_type:
             task_type = force_task_type
-            await self._build_enriched_context(task)   # warm cache only
+            await self.context_builder.build(task)   # warm cache only
         else:
             task_type, _ = await _asyncio.gather(
-                self._detect_task_type(task),
-                self._build_enriched_context(task),  # warm the RAG cache
+                self.task_router.detect(task),
+                self.context_builder.build(task),  # warm the RAG cache
             )
         # Re-build properly below (we discard the result here; context is
         # re-built inside _run_specialized_agent to pass it correctly).
@@ -1307,11 +952,13 @@ class AgentOrchestrator:
                 # Post-execution skills — wiki-compile always runs; others on keyword match.
                 post_skill_reports: list[str] = []
                 _always_post = ["wiki-compile"]
-                _keyword_post = [s for s in self._detect_skill_names(task, "post") if s not in _always_post]
+                _keyword_post = [s for s in self.task_router.detect_skills(task, "post") if s not in _always_post]
+                _wiki_verifier_score = result.get("verifier_score")
                 for skill_name in _always_post + _keyword_post:
                     try:
                         report = await self.skill_executor.execute_post(
-                            skill_name, task, result, self.model_router
+                            skill_name, task, result, self.model_router,
+                            verifier_score=_wiki_verifier_score,
                         )
                         if report.get("report"):
                             post_skill_reports.append(report["report"])
@@ -1462,7 +1109,7 @@ class AgentOrchestrator:
         if not config:
             raise ValueError("No coding model configured")
 
-        context = self._build_context(session_id, include_history)
+        context = self.context_builder.build_context(session_id, include_history)
         
         prompt = f"""You are a helpful coding assistant. Respond to the following request:
 
@@ -1485,3 +1132,84 @@ class AgentOrchestrator:
 
     def get_session_info(self, session_id: str) -> dict:
         return self.session_memory.get_session_summary(session_id)
+
+    def delete_project(self, project_name: str, dry_run: bool = False) -> dict:
+        """Remove all agent-managed data for a project from every storage layer.
+
+        Clears the Chroma vector index, SQLite jobs/tasks, SQLite sessions, and
+        the .agent-wiki directory.  The project source files are never touched.
+
+        Args:
+            project_name: Project subdirectory name (or absolute path — containment
+                          is enforced against WORKSPACE_PATH regardless).
+            dry_run:      When True, return a count preview without deleting.
+
+        Returns:
+            Summary dict with counts of what was (or would be) deleted.
+        """
+        import shutil
+
+        _project_name = project_name.strip()
+        if (
+            not _project_name
+            or not _PROJECT_NAME_RE.match(_project_name)
+            or _project_name in {".", ".."}
+            or Path(_project_name).name != _project_name
+        ):
+            raise ValueError(f"Invalid project_name {project_name!r}")
+        _ws_root = Path(self.workspace_path).resolve()
+        _project_dir = (_ws_root / _project_name).resolve()
+        if not _project_dir.is_relative_to(_ws_root):
+            raise ValueError(
+                f"project_name {project_name!r} is outside workspace root {_ws_root}"
+            )
+
+        _project_path_str = str(_project_dir)
+        _project_short_name = _project_dir.name
+
+        # --- Preview phase (always runs) ---
+        session_ids = self.session_memory.list_sessions_by_project(_project_path_str)
+        job_count = self.task_store.count_by_session_ids(session_ids)
+        chroma_chunks = self.codebase_memory.count_project_chunks(_project_short_name)
+
+        wiki_entries = 0
+        wiki_dir = (_project_dir / ".agent-wiki").resolve()
+        if not wiki_dir.is_relative_to(_ws_root):
+            raise ValueError(f"wiki_dir {wiki_dir!r} outside workspace root {_ws_root}")
+        wiki_index = (wiki_dir / "index.md").resolve()
+        if not wiki_index.is_relative_to(_ws_root):
+            raise ValueError(f"wiki_index {wiki_index!r} outside workspace root {_ws_root}")
+        if wiki_index.exists():
+            try:
+                lines = wiki_index.read_text(encoding="utf-8").splitlines()
+                wiki_entries = sum(
+                    1 for ln in lines
+                    if ln.startswith("|") and ".md" in ln and "Path" not in ln
+                )
+            except OSError:
+                pass
+
+        summary = {
+            "project_path": _project_path_str,
+            "project_name": _project_short_name,
+            "sessions": len(session_ids),
+            "jobs": job_count,
+            "chroma_chunks": chroma_chunks,
+            "wiki_entries": wiki_entries,
+            "dry_run": dry_run,
+        }
+
+        if dry_run:
+            return summary
+
+        # --- Delete phase ---
+        self.codebase_memory.clear_project(_project_short_name)
+        self.task_store.delete_by_session_ids(session_ids)
+        deleted_sessions = self.session_memory.delete_sessions_by_project(_project_path_str)
+
+        if wiki_dir.exists():
+            shutil.rmtree(wiki_dir)
+
+        summary["deleted_sessions"] = deleted_sessions
+        self.logger.info("project_deleted", **{k: v for k, v in summary.items() if isinstance(v, (str, int, bool, float))})
+        return summary

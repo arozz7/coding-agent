@@ -225,6 +225,12 @@ class AgentClient:
     async def set_project(self, name: str) -> dict:
         return await self._post("/workspace/project", {"name": name})
 
+    async def preview_delete_project(self, name: str) -> dict:
+        return await self._get(f"/projects/{name}/delete-preview")
+
+    async def delete_project(self, name: str) -> dict:
+        return await self._delete(f"/projects/{name}")
+
     async def get_session_history(self, session_id: str) -> dict:
         return await self._get(f"/sessions/{session_id}")
 
@@ -1059,13 +1065,16 @@ async def list_sessions(ctx: commands.Context):
 async def clear(ctx: commands.Context):
     """Clear your conversation history."""
     user_id = str(ctx.author.id)
-    session_id = bot.user_sessions.get(user_id, user_id)
-    try:
-        await bot.client.delete_session(session_id)
-        bot.user_jobs.pop(user_id, None)
-        await ctx.send("Conversation cleared.")
-    except Exception as exc:
-        await ctx.send(f"Could not clear session: {exc}")
+    session_id = bot.user_sessions.get(user_id)
+    if session_id:
+        try:
+            await bot.client.delete_session(session_id)
+        except Exception as exc:
+            await ctx.send(f"Could not clear session: {exc}")
+            return
+    bot.user_sessions.pop(user_id, None)
+    bot.user_jobs.pop(user_id, None)
+    await ctx.send("Conversation cleared.")
 
 
 @bot.command(name="session")
@@ -1098,11 +1107,13 @@ async def workspace(ctx: commands.Context):
 
 @bot.command(name="project")
 async def project_cmd(ctx: commands.Context, *, name: str = ""):
-    """Show or switch the active project.
+    """Show, switch, or delete a project.
 
-    !project              — show current project and workspace root
-    !project <name>       — switch to WORKSPACE_PATH/<name> (created if needed)
-    !project clear        — return to workspace root (for starting a new project)
+    !project                        — show current project and workspace root
+    !project <name>                 — switch to WORKSPACE_PATH/<name>
+    !project clear                  — return to workspace root
+    !project delete <name>          — preview what would be removed
+    !project delete <name> confirm  — permanently remove all agent data for project
     """
     name = name.strip()
 
@@ -1118,31 +1129,102 @@ async def project_cmd(ctx: commands.Context, *, name: str = ""):
                 f"**Active project:** `{project}`\n"
                 f"**Workspace root:** `{root}`\n"
                 f"**Effective path:** `{ws}`\n\n"
-                f"Use `!project <name>` to switch, `!project clear` to return to root."
+                f"Use `!project <name>` to switch, `!project clear` to return to root.\n"
+                f"Use `!project delete <name>` to preview project cleanup."
             )
         except Exception as exc:
             await ctx.send(f"Error fetching project info: {exc}")
         return
 
-    # Clear back to workspace root.
+    # Clear back to workspace root — also reset the session.
     if name.lower() == "clear":
+        user_id = str(ctx.author.id)
+        old_session = bot.user_sessions.get(user_id)
         try:
             data = await bot.client.set_project("")
+            if old_session:
+                try:
+                    await bot.client.delete_session(old_session)
+                except Exception:
+                    pass
+            bot.user_sessions.pop(user_id, None)
+            bot.user_jobs.pop(user_id, None)
             await ctx.send(
                 f"Cleared to workspace root: `{data.get('workspace')}`\n"
-                f"The agent will now create a new subdirectory for the next project."
+                f"Session cleared — ready for a new project."
             )
         except Exception as exc:
             await ctx.send(f"Could not clear project: {exc}")
         return
 
-    # Switch to named project.
+    # Delete subcommand — two-step: preview then confirm.
+    if name.lower().startswith("delete "):
+        rest = name[7:].strip()          # everything after "delete "
+        confirm = rest.endswith(" confirm")
+        project_name = rest[: -len(" confirm")].strip() if confirm else rest.strip()
+
+        if not project_name:
+            await ctx.send("Usage: `!project delete <name>` or `!project delete <name> confirm`")
+            return
+
+        if not confirm:
+            # Preview — show counts, prompt for confirmation.
+            try:
+                msg = await ctx.send(f"Checking data for project **{project_name}**…")
+                data = await bot.client.preview_delete_project(project_name)
+                await _safe_edit(
+                    msg,
+                    f"**Delete preview — `{project_name}`**\n"
+                    f"```\n"
+                    f"Sessions   : {data.get('sessions', 0)}\n"
+                    f"Jobs       : {data.get('jobs', 0)}\n"
+                    f"RAG chunks : {data.get('chroma_chunks', 0)}\n"
+                    f"Wiki entries: {data.get('wiki_entries', 0)}\n"
+                    f"```\n"
+                    f"Source files are **never** deleted.\n"
+                    f"To proceed: `!project delete {project_name} confirm`"
+                )
+            except Exception as exc:
+                await ctx.send(f"Preview failed: {exc}")
+            return
+
+        # Confirmed delete.
+        try:
+            msg = await ctx.send(f"Deleting agent data for **{project_name}**…")
+            data = await bot.client.delete_project(project_name)
+            await _safe_edit(
+                msg,
+                f"**Deleted — `{project_name}`**\n"
+                f"```\n"
+                f"Sessions removed : {data.get('deleted_sessions', 0)}\n"
+                f"Jobs removed     : {data.get('jobs', 0)}\n"
+                f"RAG chunks cleared: {data.get('chroma_chunks', 0)}\n"
+                f"Wiki entries     : {data.get('wiki_entries', 0)}\n"
+                f"```\n"
+                f"Source files untouched. Use `!project {project_name}` to reinitialise."
+            )
+        except Exception as exc:
+            await ctx.send(f"Delete failed: {exc}")
+        return
+
+    # Switch to named project — also reset the session so no prior-project
+    # history bleeds into the new project's context.
+    user_id = str(ctx.author.id)
+    old_session = bot.user_sessions.get(user_id)
     try:
         data = await bot.client.set_project(name)
+        # Clear old session (idempotent even if none existed).
+        if old_session:
+            try:
+                await bot.client.delete_session(old_session)
+            except Exception:
+                pass
+        bot.user_sessions.pop(user_id, None)
+        bot.user_jobs.pop(user_id, None)
         await ctx.send(
             f"Switched to project **{name}**\n"
             f"Workspace: `{data.get('workspace')}`\n"
-            f"Directory created if it did not exist. Ready for `!ask`."
+            f"Session cleared — fresh context for this project. Ready for `!ask`."
         )
     except Exception as exc:
         await ctx.send(f"Could not switch project: {exc}")
@@ -1334,6 +1416,98 @@ async def skills_cmd(ctx: commands.Context, action: str = "list"):
     await ctx.send("\n".join(lines))
 
 
+@bot.command(name="wiki")
+async def wiki_cmd(ctx: commands.Context, action: str = "status", *, args: str = ""):
+    """Interact with the agent wiki knowledge base.
+
+    !wiki                     — show wiki status (entry count, project breakdown)
+    !wiki status              — same as above
+    !wiki query <terms>       — search the wiki for matching entries
+    !wiki clean               — remove out-of-scope entries from the current wiki index
+    !wiki migrate <project>   — move <project>-tagged entries from root wiki to project wiki
+    """
+    action = action.lower().strip()
+
+    if action in ("status", ""):
+        try:
+            data = await bot.client._get("/wiki/status")
+        except Exception as exc:
+            await ctx.send(f"Error: {exc}")
+            return
+
+        total = data.get("total", 0)
+        current = data.get("current_project", "<root>")
+        by_cat = data.get("by_category", {})
+        by_proj = data.get("by_project", {})
+        last = data.get("last_entry", "—")
+        wiki_root = data.get("wiki_root", "")
+
+        cat_lines = "\n".join(f"  `{k}` — {v}" for k, v in sorted(by_cat.items())) or "  (empty)"
+        proj_lines = "\n".join(f"  `{k}` — {v} entries" for k, v in sorted(by_proj.items())) or "  (empty)"
+
+        await ctx.send(
+            f"**Wiki Status** — `{wiki_root}`\n"
+            f"Active project: **{current}**\n"
+            f"Total entries: **{total}**\n\n"
+            f"**By category:**\n{cat_lines}\n\n"
+            f"**By project:**\n{proj_lines}\n\n"
+            f"**Last compiled:** {last[:100]}"
+        )
+        return
+
+    if action == "query":
+        if not args:
+            await ctx.send("Usage: `!wiki query <term1> <term2> ...`")
+            return
+        terms = ",".join(args.split())
+        try:
+            data = await bot.client._get(f"/wiki/query?terms={terms}")
+        except Exception as exc:
+            await ctx.send(f"Error: {exc}")
+            return
+        result = data.get("result", "(no matches)")
+        # Truncate for Discord's 2000-char limit
+        if len(result) > 1800:
+            result = result[:1800] + "\n…(truncated)"
+        await ctx.send(f"**Wiki Query: `{args}`**\n\n{result}")
+        return
+
+    if action == "clean":
+        msg = await ctx.send("Cleaning out-of-scope entries from wiki index…")
+        try:
+            data = await bot.client._post("/wiki/clean", {})
+        except Exception as exc:
+            await msg.edit(content=f"Error: {exc}")
+            return
+        removed = data.get("removed", 0)
+        kept = data.get("kept", 0)
+        await msg.edit(
+            content=f"Wiki clean complete — removed **{removed}** out-of-scope entries, kept **{kept}**."
+        )
+        return
+
+    if action == "migrate":
+        project = args.strip()
+        if not project:
+            await ctx.send("Usage: `!wiki migrate <project-name>`")
+            return
+        msg = await ctx.send(f"Migrating entries tagged `{project}` to their project wiki…")
+        try:
+            data = await bot.client._post("/wiki/migrate", {"project": project})
+        except Exception as exc:
+            await msg.edit(content=f"Error: {exc}")
+            return
+        moved = data.get("moved", 0)
+        await msg.edit(
+            content=f"Migration complete — moved **{moved}** entries to `{project}/.agent-wiki`."
+        )
+        return
+
+    await ctx.send(
+        "Unknown wiki action. Available: `status`, `query <terms>`, `clean`, `migrate <project>`"
+    )
+
+
 @bot.command(name="restart", aliases=["reboot"])
 async def restart_services(ctx: commands.Context):
     """Restart both the API and bot via the supervisor (!reboot also works)."""
@@ -1386,7 +1560,9 @@ async def helpme(ctx: commands.Context):
         "`!workspace` — Show workspace path and top-level contents\n"
         "`!project` — Show active project\n"
         "`!project <name>` — Switch to (or create) a project subdirectory\n"
-        "`!project clear` — Return to workspace root to start a new project\n\n"
+        "`!project clear` — Return to workspace root to start a new project\n"
+        "`!project delete <name>` — Preview agent data that would be removed\n"
+        "`!project delete <name> confirm` — Permanently remove all agent data (source files untouched)\n\n"
         "**Models:**\n"
         "`!models` — List all configured models\n"
         "`!model` — Show active model\n"

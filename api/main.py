@@ -33,10 +33,35 @@ except ImportError:
 
 WORKSPACE_PATH = os.getenv("WORKSPACE_PATH", os.path.abspath("./workspace"))
 
+# Runtime project state — survives restarts via .state/active_project.
+# Priority: .state/active_project (runtime switch) > PROJECT_DIR env var (.env default).
+_STATE_DIR = Path(".state")
+_ACTIVE_PROJECT_FILE = _STATE_DIR / "active_project"
+
+def _load_persisted_project() -> "str | None":
+    """Return last runtime project ('' = root cleared), or None if never set."""
+    try:
+        if _ACTIVE_PROJECT_FILE.exists():
+            return _ACTIVE_PROJECT_FILE.read_text(encoding="utf-8").strip()
+    except Exception:
+        pass
+    return None
+
+def _save_persisted_project(name: str) -> None:
+    """Persist the active project name ('' = workspace root) across restarts."""
+    try:
+        _STATE_DIR.mkdir(exist_ok=True)
+        _ACTIVE_PROJECT_FILE.write_text(name, encoding="utf-8")
+    except Exception as _e:
+        logger.warning("persist_project_failed", error=str(_e))
+
 # Optional active-project subdirectory within the workspace root.
 # When set, the agent always operates inside WORKSPACE_PATH/PROJECT_DIR
 # instead of the bare workspace root.
 PROJECT_DIR = os.getenv("PROJECT_DIR", "").strip()
+# Runtime switch overrides the .env default ('' means explicitly cleared to root).
+_persisted = _load_persisted_project()
+_startup_project: str = _persisted if _persisted is not None else PROJECT_DIR
 
 # Security: Disallowed paths (critical system folders)
 DISALLOWED_PATHS = [
@@ -165,7 +190,8 @@ def _effective_workspace(base: str = WORKSPACE_PATH, project: str = PROJECT_DIR)
         return str(Path(base) / project)
     return base
 
-_current_workspace: str = _effective_workspace()
+# Use persisted runtime project if available; otherwise fall back to .env default.
+_current_workspace: str = _effective_workspace(project=_startup_project)
 # Ensure the effective workspace directory exists.
 Path(_current_workspace).mkdir(parents=True, exist_ok=True)
 # Publish the effective workspace in a dedicated env var that GitTool reads.
@@ -395,6 +421,11 @@ async def start_task_background(request: TaskRequest):
         _job_store.update(job_id, phase=label)
 
     async def _run():
+        # Snapshot the current effective workspace into the per-task ContextVar.
+        # This isolates concurrent jobs: a mid-run !project switch mutates the
+        # global env var but cannot redirect this job's in-flight file operations.
+        from agent.workspace_context import set_workspace, reset_workspace
+        _ws_token = set_workspace(os.getenv("AGENT_EFFECTIVE_WORKSPACE", ""))
         _job_store.update(job_id, status="running")
         try:
             result = await _orchestrator.run_task(
@@ -437,6 +468,8 @@ async def start_task_background(request: TaskRequest):
             logger.error("background_job_failed", job_id=job_id, error=str(e),
                          traceback=traceback.format_exc())
             _job_store.update(job_id, status="failed", error=str(e))
+        finally:
+            reset_workspace(_ws_token)
 
     asyncio.create_task(_run())
     return {"job_id": job_id, "session_id": session_id, "task_type": task_type}
@@ -585,9 +618,7 @@ async def delete_session(session_id: str):
     if not _orchestrator:
         raise HTTPException(status_code=503, detail="Agent not initialized")
 
-    deleted = _orchestrator.session_memory.delete_session(session_id)
-    if not deleted:
-        raise HTTPException(status_code=404, detail="Session not found")
+    _orchestrator.session_memory.delete_session(session_id)
     return {"success": True, "session_id": session_id}
 
 
@@ -797,6 +828,9 @@ async def set_project(request: dict):
     _safe_target.mkdir(parents=True, exist_ok=True)
     _current_workspace = str(_safe_target)
 
+    # Persist the project choice so it survives API restarts.
+    _save_persisted_project(raw_name)
+
     from local_coding_agent import create_agent
     _orchestrator = create_agent(_current_workspace, "config/models.yaml")
 
@@ -810,6 +844,68 @@ async def set_project(request: dict):
         "project": raw_name or None,
         "workspace": _current_workspace,
     }
+
+
+@app.get("/wiki/status")
+async def wiki_status():
+    """Return a summary of the active wiki: entry count, project breakdown, last entry."""
+    if not _orchestrator:
+        raise HTTPException(status_code=503, detail="Agent not initialized")
+    return _orchestrator.wiki_manager.status()
+
+
+@app.post("/wiki/clean", dependencies=[Depends(_require_api_key)])
+async def wiki_clean():
+    """Remove index entries that are out of scope for the current project.
+
+    At root: removes all project-tagged entries.
+    In a project: removes entries tagged for a different project.
+    Entry *files* are preserved — only the index row is stripped.
+    """
+    if not _orchestrator:
+        raise HTTPException(status_code=503, detail="Agent not initialized")
+    result = _orchestrator.wiki_manager.clean()
+    return {"success": True, **result}
+
+
+@app.post("/wiki/migrate", dependencies=[Depends(_require_api_key)])
+async def wiki_migrate(request: dict):
+    """Migrate entries tagged with a given project out of the current wiki.
+
+    Body: {"project": "<name>"}
+    Copies matching entries into the project's own .agent-wiki directory and
+    removes them from the source index.
+    """
+    if not _orchestrator:
+        raise HTTPException(status_code=503, detail="Agent not initialized")
+    project = (request.get("project") or "").strip()
+    if not project or not re.fullmatch(r"[A-Za-z0-9._\-]+", project):
+        raise HTTPException(status_code=400, detail="Invalid project name")
+    safe_project = os.path.basename(project)
+    if safe_project != project:
+        raise HTTPException(status_code=400, detail="Invalid project name")
+    workspace_root = Path(WORKSPACE_PATH).resolve()
+    target_path = (workspace_root / safe_project).resolve()
+    if not target_path.is_relative_to(workspace_root):
+        raise HTTPException(status_code=400, detail="Invalid project name")
+    target_path.mkdir(parents=True, exist_ok=True)
+    result = _orchestrator.wiki_manager.migrate_to(project, str(target_path))
+    return {"success": True, "project": project, **result}
+
+
+@app.get("/wiki/query")
+async def wiki_query(terms: str = ""):
+    """Query the wiki for matching entries (respects project scope).
+
+    Query param: ?terms=word1,word2
+    """
+    if not _orchestrator:
+        raise HTTPException(status_code=503, detail="Agent not initialized")
+    term_list = [t.strip() for t in terms.split(",") if t.strip()]
+    if not term_list:
+        raise HTTPException(status_code=400, detail="Provide at least one search term")
+    result = _orchestrator.wiki_manager.query(term_list)
+    return {"result": result or "(no matches)"}
 
 
 @app.post("/workspace")
@@ -842,6 +938,10 @@ async def set_workspace(request: dict):
         raise HTTPException(status_code=400, detail="Path is not a directory")
 
     _current_workspace = str(_safe)
+    # Persist so restarts land on the same workspace.
+    _project_rel = str(Path(_current_workspace).relative_to(workspace_root)) \
+        if Path(_current_workspace) != workspace_root else ""
+    _save_persisted_project(_project_rel)
     # Recreate orchestrator with new workspace
     from local_coding_agent import create_agent
     _orchestrator = create_agent(_current_workspace, "config/models.yaml")
@@ -1025,10 +1125,52 @@ async def search_codebase(q: str, limit: int = 5):
     
     try:
         project_id = Path(_current_workspace).name
-        results = _orchestrator.codebase_memory.search_files(q, n_results=limit)
+        results = _orchestrator.codebase_memory.search_files(q, n_results=limit, project_id=project_id)
         return {"query": q, "results": results}
     except Exception as e:
         logger.error("search_failed", error=str(e))
+        raise HTTPException(status_code=500, detail="Internal server error")
+
+
+_PROJECT_NAME_RE = re.compile(r'^[a-zA-Z0-9][a-zA-Z0-9_.-]*$')
+
+
+@app.get("/projects/{project_name}/delete-preview")
+async def preview_delete_project(project_name: str):
+    """Return a count of what would be removed by DELETE /projects/{project_name}.
+
+    No data is modified.
+    """
+    if not _orchestrator:
+        raise HTTPException(status_code=503, detail="Agent not initialized")
+    if not _PROJECT_NAME_RE.match(project_name):
+        raise HTTPException(status_code=400, detail="Invalid project name")
+    try:
+        return _orchestrator.delete_project(project_name, dry_run=True)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Project name escapes workspace root")
+    except Exception as e:
+        logger.error("preview_delete_failed", project=project_name, error=str(e))
+        raise HTTPException(status_code=500, detail="Internal server error")
+
+
+@app.delete("/projects/{project_name}")
+async def delete_project(project_name: str):
+    """Remove all agent-managed data for a project.
+
+    Deletes: Chroma vectors, jobs, agent_tasks, sessions, and .agent-wiki/.
+    Project source files are never touched.
+    """
+    if not _orchestrator:
+        raise HTTPException(status_code=503, detail="Agent not initialized")
+    if not _PROJECT_NAME_RE.match(project_name):
+        raise HTTPException(status_code=400, detail="Invalid project name")
+    try:
+        return _orchestrator.delete_project(project_name, dry_run=False)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Project name escapes workspace root")
+    except Exception as e:
+        logger.error("delete_project_failed", project=project_name, error=str(e))
         raise HTTPException(status_code=500, detail="Internal server error")
 
 

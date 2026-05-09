@@ -81,12 +81,13 @@ class SkillExecutor:
         task: str,
         result: dict[str, Any],
         model_router=None,
+        verifier_score: int | None = None,
     ) -> dict[str, Any]:
         """Run a post-task skill. Returns a report dict."""
         self.logger.info("skill_post_execute", skill=skill_name)
 
         if skill_name == "wiki-compile":
-            return await self._wiki_compile(task, result, model_router)
+            return await self._wiki_compile(task, result, model_router, verifier_score=verifier_score)
 
         if skill_name == "wiki-lint":
             return {"report": self.wiki.lint()}
@@ -138,9 +139,16 @@ class SkillExecutor:
             return ""
 
     async def _wiki_compile(
-        self, task: str, result: dict[str, Any], model_router=None
+        self, task: str, result: dict[str, Any], model_router=None,
+        verifier_score: int | None = None,
     ) -> dict[str, Any]:
         """Synthesize a wiki entry from task+result using the LLM, then write it."""
+        if verifier_score is not None and verifier_score < 7:
+            self.logger.info(
+                "wiki_compile_skipped_low_quality", verifier_score=verifier_score
+            )
+            return {"report": f"wiki-compile: skipped (verifier score {verifier_score}/10 < 7)"}
+
         response = result.get("response", "")
         if not response:
             return {"report": "wiki-compile: no response to compile."}
@@ -156,8 +164,14 @@ class SkillExecutor:
             )
             return {"report": f"wiki-compile: entry written to {rel_path} (no LLM synthesis)"}
 
+        project_scope = self.wiki.project_name or "workspace-root"
         synthesis_prompt = f"""You are a knowledge compiler for an agent wiki.
 Given the task and result below, write a concise wiki entry in markdown.
+
+IMPORTANT: This wiki belongs to project "{project_scope}".
+Only capture knowledge that is directly relevant to THIS project.
+Do NOT include details, names, or references from unrelated projects that may appear in the result text.
+If the result mixes multiple projects, only extract the portion relevant to "{project_scope}".
 
 Task: {task}
 
@@ -171,7 +185,7 @@ Write a wiki entry with:
 4. Confidence on the fourth line starting with "CONFIDENCE: " (high, medium, or speculative)
 5. Then the body: ## Summary (2-3 sentences), ## Key Details (bullet points), ## Connections (wikilinks if any)
 
-Be concise. The entry should be useful for future tasks, not a task log."""
+Be concise. The entry should be useful for future tasks on project "{project_scope}", not a task log."""
 
         try:
             config = model_router.get_model("coding")
@@ -202,6 +216,9 @@ Be concise. The entry should be useful for future tasks, not a task log."""
                     body_start = i + 1
 
             body = "\n".join(lines[body_start:]).strip()
+            # Verifier-passed outputs are always high-confidence regardless of LLM opinion.
+            if verifier_score is not None and verifier_score >= 7:
+                confidence = "high"
             rel_path = self.wiki.compile(
                 title=title,
                 content=body,

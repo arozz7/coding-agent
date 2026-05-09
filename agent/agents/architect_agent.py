@@ -1,5 +1,8 @@
+import re as _re
 from typing import Dict, Any, List, Optional
 from agent.agents.base_agent import AgentRole
+
+_SAFE_PATH_RE = _re.compile(r"[^A-Za-z0-9_./ -]")
 
 
 class ArchitectRole(AgentRole):
@@ -29,11 +32,17 @@ Guidelines:
 - Focus on clean architecture, SOLID principles, and data modeling
 - Be concise in your responses"""
 
+    def _sanitize_path(self, path: str) -> str:
+        """Strip characters that don't belong in a safe relative file path."""
+        sanitized = _SAFE_PATH_RE.sub("", path).strip()
+        # Collapse multiple separators and reject traversal attempts
+        parts = [p for p in sanitized.replace("\\", "/").split("/") if p and p != ".."]
+        return "/".join(parts)
+
     def _extract_file_writes(self, response: str) -> List[tuple]:
-        import re
         pattern = r'FILE:\s*(.+?)\n```markdown\n(.*?)```'
-        matches = re.findall(pattern, response, re.DOTALL)
-        return [(path.strip(), content.strip()) for path, content in matches]
+        matches = _re.findall(pattern, response, _re.DOTALL)
+        return [(self._sanitize_path(path), content.strip()) for path, content in matches]
     
     async def execute(self, context: Dict[str, Any]) -> Dict[str, Any]:
         task = context.get("task", "")

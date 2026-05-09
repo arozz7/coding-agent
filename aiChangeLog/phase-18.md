@@ -224,3 +224,65 @@ This phase hardened the runtime reliability of the coding agent across four area
 - [ ] Unload model in LM Studio mid-task — logs show `model_not_ready_waiting`; retries 3× before failing
 - [ ] Confirm no `UnicodeDecodeError` in logs when `npm` commands run
 - [ ] `!models` — shows configured models with 🟢/⚪ state, plus LM Studio discovery section
+
+---
+
+## Deep Research, Verifier Agent, Project Lifecycle, Cross-Project RAG Isolation
+
+### `agent/agents/research_agent.py`
+- `_MAX_QUESTIONS` 5 → 8, `_MAX_FOLLOWUPS` 2 → 4, `_WEB_CONTENT_BUDGET` 14k → 28k.
+- Added `_MAX_COVERAGE_PASS = 3`: up to 3 additional search rounds after gap analysis to ensure no topic is missed.
+- Broadened `_SEARCH_TRIGGERS` to include research-intent phrases: `research on/about/into`, `deep research`, `in-depth`, `comprehensive`, `investigate`, `build.*agent`, `best practices`, `compare`, `evaluate`, `survey`, `landscape`, etc.
+- Added `_FILE_WRITE_RE` regex detecting phrases like "capture to markdown files", "save as markdown", "logically into files", etc.
+- Added `_check_coverage()` method: strict LLM pass that identifies absent (not just thin) topic coverage and returns additional search queries.
+- Added `_write_research_files()` method: splits synthesis by `## Section` headings, writes each as a separate markdown file under `research-output/`, and writes an `index.md` catalog.
+- Updated `_synthesize()`: accepts `wants_files` flag; when True, instructs LLM to structure response as level-2 sections for file splitting.
+- Updated `execute()`: detects `wants_files`; calls `_write_research_files()` post-synthesis on both fast-path and iterative-path; emits `researching:writing-files` phase.
+- System prompt updated: removed blanket "Do not create files" instruction; now says "structure output with ## headings per topic" when files requested.
+
+### `agent/agents/verifier_agent.py` (new)
+- `PASS_THRESHOLD = 7` (0-10 scale).
+- `VerifierResult` dataclass: `score`, `passed`, `gaps: List[str]`, `feedback`, `task_type`; `.to_dict()`.
+- `VerifierAgent.verify_research()`: four-dimension rubric — Coverage (0-4), Depth (0-3), Format compliance (0-2), Actionability (0-1).
+- `VerifierAgent.verify_code()`: four-dimension rubric — Requirement fulfilment (0-4), Completeness (0-3), Code correctness (0-2), Test results (0-1).
+- `_run_tests()`: when `tool_executor` provided, runs `python -m pytest --tb=short -q 2>&1 | tail -20`; gracefully falls back on exception.
+- `_call_llm()`: extracts JSON from LLM response via regex; returns `{}` on parse failure.
+- `_parse_result()`: clamps score 0-10; defaults score=5 on empty raw.
+
+### `agent/orchestrator.py`
+- Imports and instantiates `VerifierAgent` as `self.verifier_agent`.
+- Added `_run_verification()`: dispatches to `verify_research` or `verify_code` based on `task_type`; returns a safe-pass default on unexpected exceptions.
+- `_run_task_loop()`: after all tasks drain (`get_next_pending` returns None), runs verifier if `task_type in {"develop", "research", "sdlc"}` and `_verifier_rounds < 2`. On fail, injects a `[Verifier fix round N]` task with gap+feedback text; appends `🔍 **Verifier**` summary line; continues loop. Works for both job-id and no-persistence paths.
+
+### `agent/memory/codebase_memory.py`
+- `search_files()` accepts `project_id: Optional[str]`; adds `where={"project_id": project_id}` to Chroma query when provided — eliminates cross-project RAG contamination.
+- `get_relevant_context()` passes `project_id` through to `search_files()`.
+- Added `count_project_chunks(project_id)`.
+
+### `agent/memory/session_memory.py`
+- Added `list_sessions_by_project(project_path)` with path normalization.
+- Added `delete_sessions_by_project(project_path)` returning deleted count.
+
+### `api/task_store.py`
+- Added `count_by_session_ids(session_ids)`.
+- Added `delete_by_session_ids(session_ids)` returning deleted job count.
+
+### `api/main.py`
+- `_resolve_project_path()` helper with `^[a-zA-Z0-9][a-zA-Z0-9_.-]*$` validation and `is_relative_to` containment guard.
+- `GET /projects/{project_name}/delete-preview` — dry-run count of all artifacts to be removed.
+- `DELETE /projects/{project_name}` — deletes Chroma chunks, sessions/jobs/tasks, and `.agent-wiki/`.
+- `/search` passes `project_id` to `search_files()`.
+
+### `api/discord_bot.py`
+- Added `!project delete <name>` (preview) and `!project delete <name> confirm` (two-step destructive delete).
+- Workspace containment guard: project must be inside `WORKSPACE_PATH`; rejects anything outside.
+- Updated `!helpme`.
+
+### `agent/workspace_context.py` (new)
+- `get_workspace()`, `set_workspace(path) → Token`, `reset_workspace(token)` — ContextVar-based workspace isolation per asyncio task.
+
+### `tests/unit/test_verifier_agent.py` (new)
+- 15 tests across `TestVerifierResult`, `TestVerifierAgentResearch`, `TestVerifierAgentCode`; all mocked; 100% passing.
+
+### `tests/unit/test_project_delete.py` (new)
+- 15 tests covering `SessionMemory` project list/delete, `TaskStore` bulk delete by session IDs, and `Orchestrator.delete_project()` containment guard.

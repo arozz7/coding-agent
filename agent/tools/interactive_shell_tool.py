@@ -68,11 +68,11 @@ class InteractiveShellTool:
     """
 
     def __init__(self, workspace_path: str):  # noqa: ARG002 — kept for API compat
-        # Env-var-only pattern (GitTool pattern): workspace comes from trusted env vars,
-        # not the HTTP-tainted workspace_path parameter — breaks the CodeQL taint chain.
-        _effective = os.getenv("AGENT_EFFECTIVE_WORKSPACE", "").strip()
-        _ws = _effective if _effective else os.getenv("WORKSPACE_PATH", "./workspace")
-        self.workspace = Path(_ws).resolve()
+        # Read workspace from the per-task ContextVar so concurrent jobs are
+        # isolated.  Value is always derived from trusted env vars — the
+        # HTTP-tainted workspace_path parameter is intentionally ignored.
+        from agent.workspace_context import get_workspace
+        self.workspace = Path(get_workspace()).resolve()
         self.logger = logger.bind(component="interactive_shell_tool")
 
     async def run(

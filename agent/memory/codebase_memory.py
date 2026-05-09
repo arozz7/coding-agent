@@ -222,13 +222,16 @@ class CodebaseMemory:
         )
 
     def search_files(
-        self, query: str, n_results: int = 5
+        self, query: str, n_results: int = 5, project_id: Optional[str] = None
     ) -> List[dict]:
-        results = self.files_collection.query(
-            query_texts=[query],
-            n_results=n_results,
-            include=["metadatas", "distances"],
-        )
+        query_kwargs: dict = {
+            "query_texts": [query],
+            "n_results": n_results,
+            "include": ["metadatas", "distances"],
+        }
+        if project_id:
+            query_kwargs["where"] = {"project_id": project_id}
+        results = self.files_collection.query(**query_kwargs)
 
         if not results["documents"]:
             return []
@@ -279,6 +282,17 @@ class CodebaseMemory:
             )
 
         return formatted
+
+    def count_project_chunks(self, project_id: str) -> int:
+        """Return the number of file chunks indexed for *project_id*."""
+        try:
+            result = self.files_collection.get(
+                where={"project_id": project_id},
+                include=[],
+            )
+            return len(result["ids"])
+        except Exception:
+            return 0
 
     def clear_project(self, project_id: str) -> None:
         try:
@@ -343,7 +357,7 @@ class CodebaseMemory:
         Returns:
             Formatted context string for agent prompts
         """
-        results = self.search_files(task, n_results=max_chunks)
+        results = self.search_files(task, n_results=max_chunks, project_id=project_id)
         
         if not results:
             return ""

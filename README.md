@@ -28,8 +28,14 @@ An autonomous coding agent with LLM integration, multi-agent orchestration, SDLC
 - **CRLF & BOM Preservation** — Detects and preserves original line endings and Byte Order Marks during file writes, preventing silent file corruption in Windows or legacy environments
 - **Workspace Scoping** — `PROJECT_DIR` env var focuses all file operations on an active project subdirectory; no path double-nesting
 - **Security Layer** — Prompt injection detection blocks known jailbreak patterns before input reaches any LLM prompt; shell commands that reference absolute paths outside the workspace are rejected; optional `AGENT_API_KEY` header auth on all mutating API endpoints; SQLite session store uses WAL mode + `threading.RLock` for concurrent-access safety
-- **Agent Wiki Memory** — `.agent-wiki/` knowledge base compiled per task; later subtasks query earlier ones; index deduplication; `!skills` to inspect
-- **RAG Memory** — Codebase indexed in ChromaDB; retrieved context injected into every task
+- **Agent Wiki Memory** — Per-project `.agent-wiki/` knowledge base: each project subdirectory owns its wiki; entries are tagged with the active project so queries never surface stale context from other projects; `!wiki status/query/clean/migrate` commands for full interactive control
+- **RAG Memory** — Codebase indexed in ChromaDB; retrieved context injected into every task. Searches are project-scoped — Chroma queries include a `project_id` filter, eliminating cross-project content contamination.
+- **Write-path Quality Gate** — Wiki-compile (post-task knowledge extraction) only runs when the verifier scores the output ≥ 7/10. Below-threshold outputs are silently skipped, keeping the wiki free of incomplete or low-quality entries.
+- **Code-Graph Context (MemoryWiki)** — For developer, reviewer, and tester tasks, the orchestrator builds a live AST-based dependency graph from workspace Python files and injects matching nodes (functions, classes, import chains) as context before each task.
+- **Episodic Memory** — High-scoring past task results (verifier score ≥ 7) are persisted in SQLite. Before each task the orchestrator retrieves keyword-matched similar work and injects it as context, enabling the agent to reuse proven approaches across sessions.
+- **Verifier / Critic Agent** — After each develop or research job, a dedicated `VerifierAgent` scores the output 0–10 against the original objective. Scores below 7 trigger a targeted fix task and re-run (max 2 rounds). Research rubric checks coverage, depth, format compliance, and actionability; code rubric checks requirement fulfilment, completeness, correctness, and test results (runs pytest when available).
+- **Deep Research Mode** — Research agent decomposes into up to 8 sub-questions, runs up to 4 follow-up gap-fill passes, and performs up to 3 coverage-check rounds to ensure no topic is missed. Content budget is 28 k chars. When "capture to markdown files" is requested, the synthesis is split by section into individual `.md` files under `research-output/`.
+- **Project Lifecycle Management** — Full project delete via API (`DELETE /projects/{name}`) and Discord (`!project delete <name> confirm`). Dry-run preview shows artifact counts before deletion. Removes Chroma chunks, SQLite sessions/jobs/tasks, and `.agent-wiki/`. Workspace containment guard prevents deleting outside `WORKSPACE_PATH`.
 - **Shell PATH Auto-Discovery** — Scans 15+ common install dirs (nvm, volta, Homebrew, Cargo…) so npm/node/git are found even when the API starts with a minimal PATH
 
 ## Documentation
@@ -140,6 +146,9 @@ python -m api.discord_bot
 | `!clear` | Clear session history |
 | `!workspace` | Show workspace path and active project |
 | `!project [name]` | Get or set the active project directory |
+| `!project delete <name>` | Preview what would be deleted for a project (dry run) |
+| `!project delete <name> confirm` | Permanently delete all project data (Chroma, sessions, jobs, wiki) |
+| `!wiki [status\|query\|clean\|migrate]` | Inspect, search, clean, or migrate the active wiki knowledge base |
 
 ### Model Management
 
@@ -199,7 +208,7 @@ Logan [APP]: Configured Models · active: qwen3.5-35b-a3b
 | Type | Triggered by | What it does |
 |------|-------------|--------------|
 | `develop` | implement, fix, run, build, debug, npm, compile, execute | Writes files, runs shell commands, auto-fixes errors (up to 10 iterations) |
-| `research` | search for, find where, how does, investigate | **Iterative research**: decomposes query → parallel web searches → gap analysis → synthesis. Fast-path for local-only tasks. Full report via `!result` |
+| `research` | search for, find where, how does, investigate, deep research, comprehensive | **Deep iterative research**: decomposes into 8 sub-questions → parallel web searches → gap analysis (4 follow-ups) → 3 coverage rounds → synthesis. Writes section files to `research-output/` when requested. Fast-path for local-only tasks. Full report via `!result` |
 | `sdlc` | build me a complete, end-to-end | Full plan→build→test→debug→run→verify pipeline |
 | `plan` | plan first, show me a plan, before we build | Architecture plan before any code is written |
 | `test` | write tests, run tests, pytest | Writes and runs test suites |
@@ -260,6 +269,12 @@ Mutating endpoints (`POST /task`, `POST /task/start`, `POST /task/stream`, `POST
 | `GET` | `/workspace` | Current workspace path and project |
 | `GET` | `/workspace/file?path=` | Read a workspace file |
 | `POST` | `/workspace/project` | Set active project `{"project": "name"}` |
+| `GET` | `/wiki/status` | Wiki summary: entry count, breakdown by category and project |
+| `GET` | `/wiki/query?terms=` | Search wiki (respects active project scope) |
+| `POST` | `/wiki/clean` | Remove out-of-scope index entries from the active wiki |
+| `POST` | `/wiki/migrate` | Move entries tagged for a project into that project's wiki `{"project": "name"}` |
+| `GET` | `/projects/{name}/delete-preview` | Dry-run count of artifacts to be removed |
+| `DELETE` | `/projects/{name}` | Delete all project data (Chroma, sessions, jobs, wiki) |
 | `GET` | `/sessions` | List sessions |
 | `DELETE` | `/sessions/{id}` | Delete a session |
 | `POST` | `/restart` | Signal supervisor to restart both services |
@@ -279,19 +294,27 @@ coding-agent/
 │   ├── agents/
 │   │   ├── developer_agent.py     # Write files, run commands, fix loop (10 iter)
 │   │   ├── planner_agent.py       # Decompose objectives into task lists
-│   │   ├── research_agent.py      # Web search, file reading, synthesis
+│   │   ├── research_agent.py      # Web search, file reading, synthesis, file output
+│   │   ├── verifier_agent.py      # Critic: scores output 0-10, injects fix tasks on fail
 │   │   ├── tester_agent.py        # Test generation and execution
 │   │   ├── reviewer_agent.py      # Code review and security audit
 │   │   ├── architect_agent.py     # System design and ADRs
 │   │   ├── plan_agent.py          # Implementation planning
 │   │   └── chat_agent.py          # Conversational responses
+│   ├── orchestration/
+│   │   ├── __init__.py            # Re-exports ContextBuilder, TaskRouter, VerifierCoordinator
+│   │   ├── context_builder.py     # Enriched prompt context: wiki-query, RAG, env, code-graph, episodic memory
+│   │   ├── task_router.py         # Task-type classification (keyword fast-path + LLM fallback)
+│   │   └── verifier_coordinator.py # Runs verifier rubrics, builds fix-task specs
 │   ├── memory/
-│   │   ├── session_memory.py      # SQLite conversation history
-│   │   └── codebase_memory.py     # ChromaDB vector store (RAG)
+│   │   ├── session_memory.py      # SQLite conversation history + episodic memory table
+│   │   ├── codebase_memory.py     # ChromaDB vector store (RAG)
+│   │   └── memory_wiki.py         # In-memory AST code-dependency graph (MemoryWiki)
 │   ├── skills/
 │   │   ├── skill_executor.py      # Pre/post skill execution (wiki-query, wiki-compile)
 │   │   ├── skill_loader.py        # Lazy skill content loading
 │   │   └── wiki_manager.py        # .agent-wiki/ read/write, index upsert, lint
+│   ├── workspace_context.py           # ContextVar-based per-task workspace isolation
 │   ├── security/
 │   │   ├── paths.py                   # resolve_within() — canonical path-containment validator (CodeQL-safe)
 │   │   └── prompt_guard.py            # guard_task() — strips control chars, detects 12 injection patterns
@@ -321,10 +344,10 @@ coding-agent/
 ├── config/
 │   ├── models.yaml                # Model configuration (local + remote + defaults)
 │   └── task_classifier.yaml      # LLM classifier prompt for task type detection
-├── .agent-wiki/                   # Per-session knowledge base (auto-generated)
-│   ├── index.md                   # Entry catalog
-│   ├── log.md                     # Compilation log
-│   └── <category>/<slug>.md       # Individual knowledge entries
+├── workspace/
+│   ├── .agent-wiki/               # Workspace-level wiki (cross-project knowledge, no project tag)
+│   └── <project-name>/
+│       └── .agent-wiki/           # Per-project wiki (entries tagged project:<name>)
 ├── .state/                        # Runtime state (supervisor heartbeat, restart flag)
 ├── logs/                          # Timestamped child-process logs (auto-generated)
 ├── data/                          # SQLite databases (jobs, tasks, sessions)

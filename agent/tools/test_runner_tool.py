@@ -16,15 +16,11 @@ class TestRunnerError(Exception):
 
 class PytestTool:
     def __init__(self, project_root: str):  # noqa: ARG002 — kept for API compat
-        # Read workspace from trusted env vars, never from the caller-supplied arg.
-        # This is the GitTool pattern: the HTTP-tainted parameter is intentionally
-        # ignored so it never flows into any path operation.
-        effective = os.getenv("AGENT_EFFECTIVE_WORKSPACE", "").strip()
-        if effective:
-            _ws = effective
-        else:
-            _ws = os.getenv("WORKSPACE_PATH", "./workspace")
-        self.project_root = Path(_ws).resolve()
+        # Read workspace from the per-task ContextVar so concurrent jobs are
+        # isolated.  Value is always derived from trusted env vars — the
+        # HTTP-tainted project_root parameter is intentionally ignored.
+        from agent.workspace_context import get_workspace
+        self.project_root = Path(get_workspace()).resolve()
         self.logger = logger.bind(component="pytest_tool")
 
 

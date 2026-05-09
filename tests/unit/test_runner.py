@@ -9,19 +9,29 @@ from unittest.mock import Mock, patch
 class TestPytestTool:
     def test_initialization(self):
         from agent.tools import PytestTool
+        from agent.workspace_context import set_workspace, reset_workspace
 
         with tempfile.TemporaryDirectory() as tmpdir:
-            tool = PytestTool(tmpdir)
-            assert tool.project_root == Path(tmpdir).resolve()
+            token = set_workspace(tmpdir)
+            try:
+                tool = PytestTool(tmpdir)
+                assert tool.project_root == Path(tmpdir).resolve()
+            finally:
+                reset_workspace(token)
 
     def test_run_default_path(self):
         from agent.tools import PytestTool
+        from agent.workspace_context import set_workspace, reset_workspace
 
         with tempfile.TemporaryDirectory() as tmpdir:
-            tool = PytestTool(tmpdir)
-            result = tool.run(path="tests/unit", verbose=True)
-            output = result.get("output", "") + result.get("errors_output", "")
-            assert "passed" in output or "failed" in output or result["success"] == False
+            token = set_workspace(tmpdir)
+            try:
+                tool = PytestTool(tmpdir)
+                result = tool.run(path="tests/unit", verbose=True)
+                output = result.get("output", "") + result.get("errors_output", "")
+                assert "passed" in output or "failed" in output or result["success"] == False
+            finally:
+                reset_workspace(token)
 
     def test_run_specific_file(self):
         from agent.tools import PytestTool

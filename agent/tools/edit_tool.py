@@ -206,16 +206,12 @@ class EditTool:
         """Initialise the editor with the configured workspace root.
 
         The *allowed_base_path* parameter is accepted for backward-compatibility
-        but is intentionally ignored — the actual workspace is read from the
-        trusted AGENT_EFFECTIVE_WORKSPACE / WORKSPACE_PATH environment variables
-        so that no HTTP-tainted value ever flows into a path operation (GitTool
-        pattern, CodeQL py/path-injection safe).
+        but is intentionally ignored.  The actual workspace is read from the
+        per-task ContextVar so concurrent jobs stay isolated — value is always
+        derived from trusted env vars, never from HTTP input.
         """
-        effective = os.getenv("AGENT_EFFECTIVE_WORKSPACE", "").strip()
-        if effective:
-            _ws = effective
-        else:
-            _ws = os.getenv("WORKSPACE_PATH", "./workspace")
+        from agent.workspace_context import get_workspace
+        _ws = get_workspace()
         _resolved = Path(_ws).resolve()
         if not os.path.isdir(str(_resolved)):
             raise EditError(f"Workspace root is not a directory: {_ws}")

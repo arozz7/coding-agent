@@ -180,6 +180,48 @@ class TaskStore:
             self._conn.commit()
         return cursor.rowcount
 
+    def count_by_session_ids(self, session_ids: List[str]) -> int:
+        """Return the number of jobs that belong to any of *session_ids*."""
+        if not session_ids:
+            return 0
+        placeholders = ",".join("?" * len(session_ids))
+        with self._lock:
+            row = self._conn.execute(
+                f"SELECT COUNT(*) FROM jobs WHERE session_id IN ({placeholders})",
+                session_ids,
+            ).fetchone()
+        return row[0] if row else 0
+
+    def delete_by_session_ids(self, session_ids: List[str]) -> int:
+        """Delete all jobs and their agent_tasks for *session_ids*.
+
+        Returns the number of jobs deleted.
+        """
+        if not session_ids:
+            return 0
+        placeholders = ",".join("?" * len(session_ids))
+        with self._lock:
+            job_ids = [
+                row[0]
+                for row in self._conn.execute(
+                    f"SELECT job_id FROM jobs WHERE session_id IN ({placeholders})",
+                    session_ids,
+                ).fetchall()
+            ]
+            if job_ids:
+                task_ph = ",".join("?" * len(job_ids))
+                self._conn.execute(
+                    f"DELETE FROM agent_tasks WHERE job_id IN ({task_ph})",
+                    job_ids,
+                )
+            cursor = self._conn.execute(
+                f"DELETE FROM jobs WHERE session_id IN ({placeholders})",
+                session_ids,
+            )
+            self._conn.commit()
+        logger.info("jobs_deleted_by_sessions", count=cursor.rowcount)
+        return cursor.rowcount
+
     # ------------------------------------------------------------------
     # Read operations
     # ------------------------------------------------------------------
