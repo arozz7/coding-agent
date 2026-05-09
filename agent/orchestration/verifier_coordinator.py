@@ -6,9 +6,13 @@ Owns:
 """
 from __future__ import annotations
 
+import json
 import os
+import re
+import subprocess
+from dataclasses import dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING, Callable, Coroutine, Optional
 
 import structlog
 
@@ -17,6 +21,15 @@ from agent.orchestration.context_builder import char_budget
 if TYPE_CHECKING:
     from agent.agents.verifier_agent import VerifierAgent, VerifierResult
     from llm import ModelRouter
+
+
+@dataclass
+class CriterionResult:
+    """Result of evaluating a single completion criterion."""
+
+    criterion: str
+    passed: bool
+    detail: str = ""  # what was checked or why it failed
 
 logger = structlog.get_logger()
 
@@ -81,6 +94,130 @@ class VerifierCoordinator:
             return VerifierResult(score=7, passed=True, gaps=[], feedback="(verification error)")
 
     # ------------------------------------------------------------------
+    # Criterion evaluation
+    # ------------------------------------------------------------------
+
+    async def evaluate_criteria(
+        self,
+        criteria: list[str],
+        ws: Path,
+        shell_fn: Callable[[str], Coroutine],
+        combined_response: str = "",
+    ) -> list[CriterionResult]:
+        """Evaluate each criterion and return a CriterionResult per item.
+
+        Auto-check patterns (no LLM call):
+          "command exits 0: <cmd>"     — runs cmd; passes if exit code 0
+          "file exists: <path>"        — passes if workspace-relative path exists
+          "file contains: <path>:<sub>" — passes if file text contains substring
+
+        Everything else falls back to an LLM pass/fail call.
+        """
+        results: list[CriterionResult] = []
+        for criterion in criteria:
+            result = await self._eval_one(criterion, ws, shell_fn, combined_response)
+            results.append(result)
+        self.logger.info(
+            "criteria_evaluated",
+            total=len(results),
+            passed=sum(1 for r in results if r.passed),
+        )
+        return results
+
+    async def _eval_one(
+        self,
+        criterion: str,
+        ws: Path,
+        shell_fn: Callable[[str], Coroutine],
+        combined_response: str,
+    ) -> CriterionResult:
+        lower = criterion.lower()
+
+        # --- auto-check: command exits 0 ---
+        if lower.startswith("command exits 0:"):
+            cmd = criterion[len("command exits 0:"):].strip()
+            # Guard against long-running server commands
+            _BLOCKING = ("npm start", "flask run", "uvicorn", "gunicorn", "python -m http.server", "serve")
+            if any(b in cmd.lower() for b in _BLOCKING):
+                return CriterionResult(criterion=criterion, passed=True, detail="(server command skipped)")
+            try:
+                out = await shell_fn(f"{cmd}; echo __EXIT__$?")
+                m = re.search(r"__EXIT__(\d+)", out or "")
+                if m and m.group(1) == "0":
+                    return CriterionResult(criterion=criterion, passed=True, detail=f"exit 0: {cmd}")
+                return CriterionResult(criterion=criterion, passed=False, detail=f"non-zero exit: {cmd}\n{(out or '')[:400]}")
+            except Exception as exc:
+                return CriterionResult(criterion=criterion, passed=False, detail=f"shell error: {exc}")
+
+        # --- auto-check: file exists ---
+        if lower.startswith("file exists:"):
+            rel = criterion[len("file exists:"):].strip()
+            target = (ws / rel).resolve()
+            ok = target.exists()
+            return CriterionResult(criterion=criterion, passed=ok, detail=f"{'found' if ok else 'missing'}: {rel}")
+
+        # --- auto-check: file contains ---
+        if lower.startswith("file contains:"):
+            payload = criterion[len("file contains:"):].strip()
+            if ":" in payload:
+                rel, substring = payload.split(":", 1)
+            else:
+                return CriterionResult(criterion=criterion, passed=False, detail="malformed — expected path:substring")
+            try:
+                content = (ws / rel.strip()).read_text(encoding="utf-8", errors="ignore")
+                ok = substring.strip() in content
+                return CriterionResult(criterion=criterion, passed=ok, detail=f"{'found' if ok else 'not found'}: '{substring[:60]}' in {rel}")
+            except Exception as exc:
+                return CriterionResult(criterion=criterion, passed=False, detail=f"read error: {exc}")
+
+        # --- LLM fallback ---
+        return await self._llm_eval_criterion(criterion, combined_response)
+
+    async def _llm_eval_criterion(self, criterion: str, combined_response: str) -> CriterionResult:
+        """Use the LLM to evaluate a behavioral/visual criterion."""
+        try:
+            model = self.model_router.get_model("coding")
+            system = "You are a strict pass/fail evaluator. Answer only with valid JSON."
+            excerpt = combined_response[:2000] if combined_response else "(no response available)"
+            prompt = (
+                f"Criterion: {criterion}\n\n"
+                f"Agent output (excerpt):\n{excerpt}\n\n"
+                'Does the agent output satisfy this criterion? Return ONLY: {"passed": true} or {"passed": false, "detail": "<why not>"}'
+            )
+            raw = await self.model_router.generate(prompt, model, system_prompt=system, enable_thinking=False)
+            m = re.search(r"\{[\s\S]*\}", raw or "")
+            if m:
+                obj = json.loads(m.group())
+                passed = bool(obj.get("passed", False))
+                detail = str(obj.get("detail", ""))
+                return CriterionResult(criterion=criterion, passed=passed, detail=detail)
+        except Exception as exc:
+            self.logger.warning("llm_criterion_eval_failed", error=str(exc))
+        return CriterionResult(criterion=criterion, passed=False, detail="(evaluation error)")
+
+    def make_targeted_fix_spec(
+        self,
+        failing: "CriterionResult",
+        objective: str,
+        round_num: int,
+        test_out: str = "",
+    ) -> dict:
+        """Return a single fix task spec targeted at one failing criterion."""
+        phase, instruction = self._detect_fix_phase(test_out, failing.detail, round_num)
+        detail_block = f"\n\nWhy it failed: {failing.detail}" if failing.detail else ""
+        test_block = f"\n\nVerifier output:\n```\n{test_out[:600]}\n```" if test_out else ""
+        return {
+            "description": (
+                f"[Criterion fix — round {round_num}] {instruction}\n"
+                f"Original objective: {objective[:100]}\n"
+                f"Failing criterion: {failing.criterion}"
+                f"{detail_block}"
+                f"{test_block}"
+            ),
+            "agent_type": "develop",
+        }
+
+    # ------------------------------------------------------------------
     # Fix-spec generation
     # ------------------------------------------------------------------
 
@@ -91,6 +228,8 @@ class VerifierCoordinator:
         vresult: "VerifierResult",
         round_num: int,
         files_created: list | None = None,
+        files_changed_this_round: list | None = None,
+        prev_score: int = -1,
     ) -> list[dict]:
         """Return the fix task spec(s) to inject after a failed verification round.
 
@@ -146,10 +285,125 @@ class VerifierCoordinator:
 
         fix_type = "develop" if task_type != "research" else "research"
         gaps_text = "; ".join(gaps[:3])
+        test_out = getattr(vresult, "test_output", "")
+
+        # --- Dynamic phase detection from test output signals ---
+        fix_phase, phase_instruction = self._detect_fix_phase(test_out, gaps_text, round_num)
+
+        # --- Regression feedback ---
+        regression_section = ""
+        if prev_score >= 0 and vresult.score < prev_score and files_changed_this_round:
+            changed_list = ", ".join(files_changed_this_round[:8])
+            regression_section = (
+                f"\n\n⚠️ REGRESSION: Your last fix REDUCED the score from "
+                f"{prev_score}/10 to {vresult.score}/10. "
+                f"The files modified were: {changed_list}. "
+                f"Avoid re-modifying those files unless the gaps below directly call them out. "
+                f"Try a different approach."
+            )
+
+        # --- Test output section ---
+        test_section = ""
+        if test_out:
+            test_section = f"\n\nVerifier test output:\n```\n{test_out[:800]}\n```"
+
+        # --- File chunking directive when truncation detected ---
+        chunking_section = ""
+        combined_signals = (test_out + " " + gaps_text).lower()
+        if "[truncated]" in combined_signals or "truncat" in combined_signals:
+            chunking_section = (
+                "\n\n⚠️ FILE TRUNCATION DETECTED: One or more files were cut off during generation. "
+                "NEVER write large implementations as a single monolithic file. "
+                "Rules:\n"
+                "  • Each file must be under ~150 lines\n"
+                "  • Extract logic into small focused modules\n"
+                "  • Use imports/includes to compose them\n"
+                "  • E.g. split: logic → separate module, styles → separate file, "
+                "entry → thin wrapper that imports the rest"
+            )
+
+        # --- Changed files section ---
+        changed_section = ""
+        if files_changed_this_round and not regression_section:
+            changed_section = (
+                f"\n\nFiles changed in last fix round: {', '.join(files_changed_this_round[:10])}"
+            )
+
         return [{
             "description": (
-                f"[Fix round {round_num}] Original objective: {objective[:120]}. "
+                f"[Fix round {round_num} — {fix_phase}] {phase_instruction}\n"
+                f"Original objective: {objective[:100]}.\n"
                 f"Gaps to address: {gaps_text}"
+                f"{regression_section}"
+                f"{test_section}"
+                f"{chunking_section}"
+                f"{changed_section}"
             ),
             "agent_type": fix_type,
         }]
+
+    # ------------------------------------------------------------------
+    # Phase detection
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _detect_fix_phase(test_out: str, gaps_text: str, round_num: int) -> tuple[str, str]:
+        """Return (phase_label, phase_instruction) based on test output signals.
+
+        Signal-based detection is the primary path; round_num is a tiebreaker
+        only when no signal is present.
+        """
+        combined = (test_out + " " + gaps_text).lower()
+
+        if "[truncated]" in combined or ("truncat" in combined and "incomplete" in combined):
+            return "file-incomplete", (
+                "One or more files appear TRUNCATED (cut off during generation). "
+                "Do NOT rewrite them as single large blocks. "
+                "Split into small focused modules (<150 lines each) and use imports/includes to compose them."
+            )
+
+        _SYNTAX_SIGNALS = (
+            "syntaxerror", "parse error", "error ts", "cargo check", "--check",
+            "syntax error", "unexpected token", "invalid syntax", "expected expression",
+        )
+        if any(sig in combined for sig in _SYNTAX_SIGNALS):
+            return "syntax", (
+                "PRIORITY: Fix ALL syntax errors first — they block every other fix. "
+                "Run the appropriate syntax checker (node --check, cargo check, python -m py_compile, etc.) "
+                "on every source file and fix every error."
+            )
+
+        _RUNTIME_SIGNALS = (
+            "error:", "traceback", "panic", "exception", "importerror",
+            "modulenotfounderror", "referenceerror", "typeerror", "cannot find module",
+            "nameerror", "attributeerror", "is not defined",
+        )
+        if any(sig in combined for sig in _RUNTIME_SIGNALS):
+            return "runtime", (
+                "Syntax is clean. Fix runtime errors: undefined references, missing imports, "
+                "wrong module paths, misconfigured entry points. "
+                "The application must start without crashing."
+            )
+
+        _TEST_FAILURE_SIGNALS = ("failed", "assertionerror", "assertion failed", "fail:", "tests failed")
+        if any(sig in combined for sig in _TEST_FAILURE_SIGNALS):
+            return "test-failures", (
+                "Runtime is stable. Fix the failing tests. "
+                "Read each failure message and fix the root cause in the implementation."
+            )
+
+        # Fallback: use round number as tiebreaker
+        if round_num <= 1:
+            return "syntax", (
+                "PRIORITY: Run syntax checks on every source file. "
+                "Fix ALL syntax errors before touching anything else."
+            )
+        if round_num == 2:
+            return "runtime", (
+                "Syntax is clean. Run the application and capture the full output. "
+                "Fix undefined references, missing imports, and wrong module paths."
+            )
+        return "functionality", (
+            "Runtime is clean. Make the application do what the objective requires. "
+            "Implement missing features, fix logic errors, ensure visible output."
+        )

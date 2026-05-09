@@ -14,6 +14,7 @@ Falls back to a single-task plan if the LLM fails or returns invalid JSON.
 
 import json
 import re
+from dataclasses import dataclass, field
 from typing import Dict, List, Optional
 
 import structlog
@@ -34,6 +35,28 @@ _RESEARCH_SAFE_TYPES = frozenset({"research", "documenter", "chat"})
 
 # Matches a JSON array in the LLM response even if wrapped in prose/markdown
 _JSON_ARRAY_RE = re.compile(r'\[[\s\S]*?\]', re.DOTALL)
+
+# Matches the first JSON object in LLM output (for criteria extraction)
+_JSON_OBJ_RE = re.compile(r'\{[\s\S]*\}', re.DOTALL)
+
+
+@dataclass
+class PlanResult:
+    """Output of plan_with_criteria(): tasks + testable completion criteria."""
+
+    tasks: List[Dict[str, str]]
+    completion_criteria: List[str] = field(default_factory=list)
+
+    # Backward compat: allow iteration/indexing so callers that treat the
+    # result as a plain list continue to work without modification.
+    def __iter__(self):
+        return iter(self.tasks)
+
+    def __len__(self):
+        return len(self.tasks)
+
+    def __getitem__(self, idx):
+        return self.tasks[idx]
 
 
 class PlannerAgent:
@@ -111,6 +134,31 @@ class PlannerAgent:
 
         return self._fallback_plan(objective, task_type)
 
+    async def plan_with_criteria(
+        self,
+        objective: str,
+        context: str = "",
+        task_type: str = "develop",
+    ) -> PlanResult:
+        """Plan tasks AND generate testable completion criteria.
+
+        Makes two LLM calls:
+          1. Same as plan() — returns the task list.
+          2. A focused follow-up that asks for 3-5 testable criteria based on
+             the tasks and any tech-stack context already in `context`.
+
+        Falls back gracefully — if the criteria call fails the tasks are still
+        returned with an empty criteria list.
+        """
+        tasks = await self.plan(objective, context=context, task_type=task_type)
+
+        # Skip criteria for non-develop workflows (research is verified differently)
+        if task_type not in ("develop", "sdlc"):
+            return PlanResult(tasks=tasks, completion_criteria=[])
+
+        criteria = await self._generate_criteria(objective, tasks, context)
+        return PlanResult(tasks=tasks, completion_criteria=criteria)
+
     # ------------------------------------------------------------------
     # Internal helpers
     # ------------------------------------------------------------------
@@ -184,3 +232,57 @@ class PlannerAgent:
         """Minimal fallback when LLM planning fails."""
         agent = "research" if task_type == "research" else "develop"
         return [{"description": objective, "agent_type": agent}]
+
+    async def _generate_criteria(
+        self,
+        objective: str,
+        tasks: List[Dict[str, str]],
+        context: str,
+    ) -> List[str]:
+        """Return 3-5 testable completion criteria for the objective.
+
+        Each criterion is a short, concrete, checkable statement.  Three
+        auto-checkable patterns are preferred when applicable:
+          - "command exits 0: <shell command>"
+          - "file exists: <relative path>"
+          - "file contains: <path>:<substring>"
+        Anything not auto-checkable uses plain English (LLM-evaluated).
+        """
+        model = self.model_router.get_model("coding")
+        if not model:
+            return []
+
+        task_summary = "\n".join(
+            f"  {i + 1}. [{t.get('agent_type')}] {t['description'][:80]}"
+            for i, t in enumerate(tasks[:8])
+        )
+        system = (
+            "You are a strict QA engineer. Generate exactly 3-5 TESTABLE completion "
+            "criteria for the objective. Be concrete and verifiable — a CI system "
+            "should be able to check each one automatically or a reviewer should be "
+            "able to tick it off in under 10 seconds.\n\n"
+            "Prefer these auto-checkable formats when applicable:\n"
+            '  "command exits 0: <shell command>"  — runs the command, expects exit 0\n'
+            '  "file exists: <relative path>"      — checks path is present\n'
+            '  "file contains: <path>:<substring>" — checks file includes the text\n'
+            "For behavioral/visual criteria use plain English.\n\n"
+            'Return ONLY valid JSON: {"criteria": ["<criterion 1>", ...]}'
+        )
+        prompt = (
+            f"Objective: {objective}\n\n"
+            f"Planned tasks:\n{task_summary}\n\n"
+            f"{f'Tech context: {context[:300]}' if context else ''}\n\n"
+            "Generate 3-5 testable completion criteria."
+        )
+        try:
+            raw = await self.model_router.generate(prompt, model, system_prompt=system, enable_thinking=False)
+            m = _JSON_OBJ_RE.search(raw or "")
+            if not m:
+                return []
+            obj = json.loads(m.group())
+            criteria = [str(c).strip() for c in obj.get("criteria", []) if c]
+            self.logger.info("criteria_generated", count=len(criteria), objective=objective[:60])
+            return criteria[:5]
+        except Exception as exc:
+            self.logger.warning("criteria_generation_failed", error=str(exc))
+            return []

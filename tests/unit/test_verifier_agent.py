@@ -1,5 +1,7 @@
 """Unit tests for VerifierAgent — all LLM calls are mocked."""
 import pytest
+import tempfile
+from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
 
 from agent.agents.verifier_agent import VerifierAgent, VerifierResult, PASS_THRESHOLD
@@ -21,7 +23,7 @@ class TestVerifierResult:
     def test_to_dict_has_all_fields(self):
         r = VerifierResult(score=8, passed=True, gaps=["g1"], feedback="ok", task_type="research")
         d = r.to_dict()
-        assert set(d.keys()) == {"score", "passed", "gaps", "feedback", "task_type"}
+        assert set(d.keys()) == {"score", "passed", "gaps", "feedback", "task_type", "test_output"}
         assert d["score"] == 8
         assert d["gaps"] == ["g1"]
 
@@ -183,3 +185,74 @@ class TestVerifierAgentCode:
         result = await agent.verify_code("obj", "resp", [], tool_executor=tool_executor)
         # Should not raise — falls back gracefully
         assert result.score == 7
+
+
+# ---------------------------------------------------------------------------
+# Truncation detection
+# ---------------------------------------------------------------------------
+
+class TestDetectTruncatedFiles:
+    def _agent(self) -> VerifierAgent:
+        router = MagicMock()
+        return VerifierAgent(model_router=router)
+
+    def _write(self, ws: Path, rel: str, content: str) -> None:
+        p = ws / rel
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text(content, encoding="utf-8")
+
+    def test_js_truncated_on_open_brace(self):
+        agent = self._agent()
+        with tempfile.TemporaryDirectory() as d:
+            ws = Path(d)
+            self._write(ws, "src/app.js", "function hello() {\n  console.log('hi');\nfunction broken() {")
+            truncated = agent._detect_truncated_files(ws)
+            assert "src/app.js" in truncated
+
+    def test_js_complete_not_flagged(self):
+        agent = self._agent()
+        with tempfile.TemporaryDirectory() as d:
+            ws = Path(d)
+            self._write(ws, "src/app.js", "function hello() {\n  return 1;\n}\n")
+            truncated = agent._detect_truncated_files(ws)
+            assert truncated == []
+
+    def test_html_truncated_missing_closing_tag(self):
+        agent = self._agent()
+        with tempfile.TemporaryDirectory() as d:
+            ws = Path(d)
+            self._write(ws, "public/index.html", "<html>\n<body>\n<p>Hello</p>\n")
+            truncated = agent._detect_truncated_files(ws)
+            assert "public/index.html" in truncated
+
+    def test_html_complete_not_flagged(self):
+        agent = self._agent()
+        with tempfile.TemporaryDirectory() as d:
+            ws = Path(d)
+            self._write(ws, "index.html", "<html>\n<body>\n<p>Hello</p>\n</body>\n</html>\n")
+            truncated = agent._detect_truncated_files(ws)
+            assert truncated == []
+
+    def test_python_truncated_on_def_header(self):
+        agent = self._agent()
+        with tempfile.TemporaryDirectory() as d:
+            ws = Path(d)
+            self._write(ws, "app.py", "class Foo:\n    def bar(self):\n        pass\n\ndef incomplete_func:")
+            truncated = agent._detect_truncated_files(ws)
+            assert "app.py" in truncated
+
+    def test_node_modules_ignored(self):
+        agent = self._agent()
+        with tempfile.TemporaryDirectory() as d:
+            ws = Path(d)
+            self._write(ws, "node_modules/pkg/index.js", "function x() {")
+            truncated = agent._detect_truncated_files(ws)
+            assert truncated == []
+
+    def test_json_truncated_without_closing_brace(self):
+        agent = self._agent()
+        with tempfile.TemporaryDirectory() as d:
+            ws = Path(d)
+            self._write(ws, "config.json", '{\n  "name": "test",\n  "version": "1.0"')
+            truncated = agent._detect_truncated_files(ws)
+            assert "config.json" in truncated

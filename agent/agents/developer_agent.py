@@ -53,6 +53,18 @@ _REPLACE_BLOCK_RE = re.compile(
 
 MAX_FIX_ITERATIONS = int(os.getenv("MAX_FIX_ITERATIONS", "50"))
 
+# SKILL: block — agent-proposed reusable fix recipe (saved to .agent-wiki/skills/)
+_SKILL_BLOCK_RE = re.compile(
+    r"SKILL:\s*(?P<title>[^\n]+)\n(?P<body>.*?)(?=\nSKILL:|\nFILE:|\nEDIT:|\nREPLACE:|\Z)",
+    re.DOTALL,
+)
+
+# SCRIPT: block — agent-created helper script (saved to scripts/)
+_SCRIPT_BLOCK_RE = re.compile(
+    r"SCRIPT:\s*(?P<name>\S+)\n```(?:\w+)?\n(?P<content>.*?)```",
+    re.DOTALL,
+)
+
 
 def _format_file_with_lines(content: str, path: str, max_chars: int = 3000) -> str:
     """Return a numbered-line view of *content* suitable for anchor-and-patch prompts."""
@@ -788,6 +800,30 @@ Summary: <one sentence>
                     f = f.strip()
                     if f and f not in files_created:
                         files_created.append(f)
+
+        # Persist any SKILL: blocks the LLM emitted as reusable fix recipes
+        if _SKILL_BLOCK_RE.search(response):
+            try:
+                from agent.skills.skill_writer import SkillWriter
+                _ws = os.getenv("WORKSPACE_PATH", ".")
+                _sw = SkillWriter(_ws)
+                saved = _sw.parse_and_write_skill_blocks(response, agent_type="developer")
+                if saved:
+                    self.logger.info("skill_blocks_saved", count=len(saved))
+            except Exception:
+                pass
+
+        # Persist any SCRIPT: blocks as reusable helper scripts in scripts/
+        for m in _SCRIPT_BLOCK_RE.finditer(response):
+            script_name = m.group("name").strip()
+            script_content = m.group("content").strip()
+            if script_name and script_content:
+                try:
+                    from agent.tools.project_scripts import ProjectScriptsTool
+                    _ws = os.getenv("WORKSPACE_PATH", ".")
+                    ProjectScriptsTool(_ws).save_script(script_name, script_content)
+                except Exception:
+                    pass
 
         return {
             "success": True,
