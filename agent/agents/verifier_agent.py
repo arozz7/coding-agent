@@ -11,7 +11,8 @@ a list of specific gaps, and a free-text feedback string.
 import json
 import re
 from dataclasses import dataclass, field
-from typing import List, Optional
+from pathlib import Path
+from typing import Callable, Coroutine, List, Optional
 import structlog
 
 PASS_THRESHOLD = 7
@@ -26,6 +27,7 @@ class VerifierResult:
     gaps: List[str] = field(default_factory=list)
     feedback: str = ""
     task_type: str = ""
+    test_output: str = ""  # raw output from _run_tests(), passed to fix task descriptions
 
     def to_dict(self) -> dict:
         return {
@@ -34,6 +36,7 @@ class VerifierResult:
             "gaps": self.gaps,
             "feedback": self.feedback,
             "task_type": self.task_type,
+            "test_output": self.test_output,
         }
 
 
@@ -141,13 +144,15 @@ class VerifierAgent:
             f"Agent response (excerpt):\n{response[:3000]}\n\n"
             f"Files created: {files_created if files_created else ['(none)']}\n\n"
             f"Test execution output:\n{test_output}\n\n"
+            "Note: 'Test results' scores 0 if any source files are truncated/incomplete "
+            "(e.g. missing </html>, file ending mid-function, or unbalanced braces).\n\n"
             "Evaluate on these three dimensions and return ONLY valid JSON:\n\n"
             "1. Requirement fulfilment (0-5): Does the implementation address EVERYTHING "
             "requested in the objective?\n"
             "2. Completeness (0-3): Are edge cases, error handling, and all requested "
             "files/features present?\n"
             "3. Test results (0-2): 2 if tests pass; 1 if no tests were requested; "
-            "0 if tests exist and are failing.\n\n"
+            "0 if tests exist and are failing or if a web game cannot be served.\n\n"
             'Return: {"score": <sum 0-10>, '
             '"gaps": ["<specific missing requirement or defect>", ...], '
             '"feedback": "<one concise sentence>"}\n\n'
@@ -170,6 +175,7 @@ class VerifierAgent:
             gaps=gaps,
             feedback=report,
             task_type="code",
+            test_output=test_output,
         )
 
     # ------------------------------------------------------------------
@@ -179,16 +185,174 @@ class VerifierAgent:
     async def _run_tests(self, tool_executor) -> str:
         if not tool_executor:
             return "(no tool executor — tests not run)"
+
+        async def _sh(cmd: str) -> str:
+            try:
+                out = await tool_executor.execute("shell", {"command": cmd})
+                return str(out) if out else ""
+            except Exception:
+                return ""
+
         try:
-            out = await tool_executor.execute(
-                "shell",
-                {"command": "python -m pytest --tb=short -q 2>&1 | tail -20"},
-            )
-            if out and not str(out).startswith("Error"):
-                return str(out)
+            ws = Path(getattr(tool_executor, "workspace_path", "."))
+            parts: list[str] = []
+
+            if (ws / "package.json").exists():
+                parts.append(await self._run_nodejs_checks(ws, _sh))
+            elif (ws / "Cargo.toml").exists():
+                out = await _sh("cargo test 2>&1 | tail -30")
+                parts.append(out if out and not out.startswith("Error") else "(cargo test unavailable)")
+            else:
+                out = await _sh("python -m pytest --tb=short -q 2>&1 | tail -20")
+                parts.append(out if out and not out.startswith("Error") else "(test execution unavailable)")
+
+            # General truncation check — language-agnostic, runs for all project types
+            truncated = self._detect_truncated_files(ws)
+            if truncated:
+                parts.append(
+                    "[truncated] FAIL: the following files appear incomplete (cut off mid-content):\n"
+                    + "\n".join(f"  {f}" for f in truncated)
+                    + "\nSplit large files into smaller focused modules to avoid generation cutoff."
+                )
+
+            return "\n\n".join(p for p in parts if p)
         except Exception as exc:
             self.logger.warning("verifier_test_run_failed", error=str(exc))
-        return "(test execution unavailable)"
+            return "(test execution unavailable)"
+
+    def _detect_truncated_files(self, ws: Path) -> list[str]:
+        """Return relative paths of files that appear truncated using a tail heuristic."""
+        _OPEN_ENDINGS = ("{", "(", ",")
+        _BRACE_LANG_EXTS = {
+            ".js", ".mjs", ".cjs", ".ts", ".tsx",
+            ".rs", ".go", ".c", ".cpp", ".java", ".cs", ".swift",
+        }
+        _CHECKED_EXTS = _BRACE_LANG_EXTS | {".py", ".html", ".json"}
+        _IGNORE_DIRS = {"node_modules", ".git", "__pycache__", ".agent-wiki", "logs"}
+
+        def _is_truncated(path: Path) -> bool:
+            try:
+                lines = path.read_text(encoding="utf-8", errors="ignore").splitlines()
+                non_blank = [ln.rstrip() for ln in lines if ln.strip()]
+                if len(non_blank) < 3:
+                    return False
+                last = non_blank[-1]
+                suffix = path.suffix.lower()
+                if suffix == ".html":
+                    return "</html>" not in " ".join(non_blank).lower()
+                if suffix in _BRACE_LANG_EXTS:
+                    return last.endswith(_OPEN_ENDINGS)
+                if suffix == ".py":
+                    last_code = next(
+                        (ln for ln in reversed(non_blank) if not ln.lstrip().startswith("#")),
+                        "",
+                    )
+                    return last_code.endswith(":") and bool(
+                        re.match(
+                            r"\s*(def |class |if |elif |else:|for |while |with |try:|except|finally:)",
+                            last_code,
+                        )
+                    )
+                if suffix == ".json":
+                    joined = "".join(non_blank).strip()
+                    return not (joined.endswith("}") or joined.endswith("]"))
+            except Exception:
+                pass
+            return False
+
+        truncated: list[str] = []
+        for path in sorted(ws.rglob("*")):
+            if any(part in _IGNORE_DIRS for part in path.parts):
+                continue
+            if path.is_file() and path.suffix.lower() in _CHECKED_EXTS and _is_truncated(path):
+                truncated.append(path.relative_to(ws).as_posix())
+            if len(truncated) >= 10:
+                break
+        return truncated
+
+    async def _run_nodejs_checks(
+        self,
+        ws: Path,
+        _sh: Callable[[str], Coroutine],
+    ) -> str:
+        """Syntax-check all JS source files and run npm test if configured."""
+        parts: list[str] = []
+
+        # Parse package.json directly (avoids shell quoting issues)
+        entry = "src/index.js"
+        has_real_tests = False
+        try:
+            pkg = json.loads((ws / "package.json").read_text(encoding="utf-8", errors="ignore"))
+            start_cmd = pkg.get("scripts", {}).get("start", "")
+            m = re.search(r"node\s+(\S+\.(?:js|mjs|cjs))", start_cmd)
+            if m:
+                entry = m.group(1)
+            elif pkg.get("main"):
+                entry = str(pkg["main"])
+            test_script = pkg.get("scripts", {}).get("test", "")
+            has_real_tests = bool(test_script) and "no test specified" not in test_script.lower()
+        except Exception:
+            pass
+
+        # Collect JS files from src/ using Python (cross-platform, no quoting issues)
+        js_files: list[str] = []
+        src_dir = ws / "src"
+        if src_dir.is_dir():
+            for f in sorted(src_dir.rglob("*")):
+                if f.suffix in (".js", ".mjs", ".cjs") and "node_modules" not in f.parts:
+                    js_files.append(f.relative_to(ws).as_posix())
+        js_files = js_files[:15]
+
+        # Syntax-check each file with node --check
+        syntax_errors: list[str] = []
+        for rel_path in js_files or [entry]:
+            check = await _sh(f'node --check "{rel_path}" 2>&1')
+            first_line = check.strip().splitlines()[0] if check.strip() else ""
+            if first_line and ("SyntaxError" in check or "Error" in first_line):
+                syntax_errors.append(f"  {rel_path}: {first_line[:160]}")
+
+        if syntax_errors:
+            parts.append("[syntax check] ERRORS:\n" + "\n".join(syntax_errors))
+        elif js_files:
+            parts.append(f"[syntax check] {len(js_files)} source files: OK")
+        else:
+            parts.append(f"[syntax check] {entry}: could not locate source files")
+
+        # npm test — only if a real test script is configured
+        if has_real_tests:
+            test_out = await _sh("npm test 2>&1 | tail -30")
+            parts.append(f"[npm test]\n{test_out}")
+
+        # Web-game check — validate public/index.html completeness and serve setup
+        public_html = ws / "public" / "index.html"
+        if public_html.exists():
+            try:
+                html_content = public_html.read_text(encoding="utf-8", errors="ignore")
+                if "</html>" not in html_content.lower():
+                    parts.append(
+                        "[web-game] FAIL: public/index.html is truncated (missing </html>) — "
+                        "the file was not fully written"
+                    )
+                else:
+                    parts.append("[web-game] public/index.html exists and is complete")
+                # Check for a serve/start script that can actually host the game
+                try:
+                    scripts = pkg.get("scripts", {})
+                    has_serve = any(
+                        "serve" in v or "http-server" in v or "live-server" in v
+                        for v in scripts.values()
+                    )
+                except Exception:
+                    has_serve = False
+                if not has_serve:
+                    parts.append(
+                        "[web-game] WARNING: no serve script in package.json — "
+                        "add `\"serve\": \"npx serve public\"` so the game can be hosted and tested"
+                    )
+            except Exception:
+                parts.append("[web-game] public/index.html exists but could not be read")
+
+        return "\n\n".join(parts)
 
     async def _call_llm(self, system: str, prompt: str) -> dict:
         try:

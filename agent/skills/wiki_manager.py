@@ -27,7 +27,7 @@ import structlog
 
 logger = structlog.get_logger()
 
-CATEGORIES = ("tech-patterns", "bugs", "decisions", "api-usage", "synthesis")
+CATEGORIES = ("tech-patterns", "bugs", "decisions", "api-usage", "synthesis", "skills")
 
 _PROJECT_TAG_RE = re.compile(r"\bproject:[a-z0-9_.-]+\b", re.IGNORECASE)
 
@@ -71,6 +71,11 @@ class WikiManager:
         self.wiki_root.mkdir(parents=True, exist_ok=True)
         for cat in CATEGORIES:
             (self.wiki_root / cat).mkdir(exist_ok=True)
+        # Three-tier skills hierarchy: global / project / agents/<type>
+        skills_root = self.wiki_root / "skills"
+        skills_root.mkdir(exist_ok=True)
+        for sub in ("global", "project", "agents"):
+            (skills_root / sub).mkdir(exist_ok=True)
 
     # ------------------------------------------------------------------
     # Query (pre-task context injection)
@@ -191,6 +196,92 @@ class WikiManager:
 
         self.logger.info("wiki_entry_written", path=str(entry_path), category=category)
         return rel_path
+
+    # ------------------------------------------------------------------
+    # Skills (query, usage tracking)
+    # ------------------------------------------------------------------
+
+    def query_skills(
+        self,
+        terms: List[str],
+        agent_type: str = "",
+        max_entries: int = 3,
+    ) -> str:
+        """Return skill entries matching terms, filtered by agent_type scope.
+
+        Searches:
+          skills/global/         — always included
+          skills/project/        — included when project_name is set
+          skills/agents/<type>/  — included when agent_type is provided
+        Results ranked by use_count descending (proven skills first).
+        """
+        skill_dirs: list[Path] = [self.wiki_root / "skills" / "global"]
+        if self.project_name:
+            skill_dirs.append(self.wiki_root / "skills" / "project")
+        if agent_type:
+            skill_dirs.append(self.wiki_root / "skills" / "agents" / agent_type)
+
+        terms_lower = [t.lower() for t in terms if len(t) > 2]
+        matched: list[tuple[int, Path]] = []
+
+        for skill_dir in skill_dirs:
+            if not skill_dir.exists():
+                continue
+            for skill_file in skill_dir.glob("*.md"):
+                try:
+                    content = skill_file.read_text(encoding="utf-8", errors="ignore")
+                    if not terms_lower or any(t in content.lower() for t in terms_lower):
+                        use_count = 0
+                        m = re.search(r"use_count:\s*(\d+)", content)
+                        if m:
+                            use_count = int(m.group(1))
+                        matched.append((use_count, skill_file))
+                except OSError:
+                    pass
+
+        if not matched:
+            return ""
+
+        matched.sort(key=lambda x: x[0], reverse=True)
+        parts = ["**Relevant skills:**"]
+        for _, skill_file in matched[:max_entries]:
+            try:
+                content = skill_file.read_text(encoding="utf-8", errors="ignore")
+                if content.startswith("---"):
+                    end = content.find("---", 3)
+                    content = content[end + 3:].strip() if end > 0 else content
+                parts.append(f"\n### Skill: {skill_file.stem}\n{content[:500]}")
+            except OSError:
+                pass
+
+        return "\n".join(parts) if len(parts) > 1 else ""
+
+    def record_skill_use(self, slug: str, success: bool) -> None:
+        """Increment use_count and update success_rate for a skill by slug."""
+        import datetime as _dt
+        for skill_file in (self.wiki_root / "skills").rglob(f"{slug}.md"):
+            try:
+                content = skill_file.read_text(encoding="utf-8", errors="ignore")
+                use_count = 0
+                success_rate = 1.0
+                m_count = re.search(r"(use_count:\s*)(\d+)", content)
+                m_rate = re.search(r"(success_rate:\s*)([\d.]+)", content)
+                if m_count:
+                    use_count = int(m_count.group(2))
+                if m_rate:
+                    success_rate = float(m_rate.group(2))
+                new_count = use_count + 1
+                new_rate = round(
+                    ((success_rate * use_count) + (1.0 if success else 0.0)) / new_count, 3
+                )
+                today = _dt.date.today().isoformat()
+                content = re.sub(r"use_count:\s*\d+", f"use_count: {new_count}", content)
+                content = re.sub(r"success_rate:\s*[\d.]+", f"success_rate: {new_rate}", content)
+                content = re.sub(r"last_used:\s*[\d-]+", f"last_used: {today}", content)
+                skill_file.write_text(content, encoding="utf-8")
+            except Exception:
+                pass
+            return  # stop after first match
 
     # ------------------------------------------------------------------
     # Status (wiki summary)

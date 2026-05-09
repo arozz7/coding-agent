@@ -258,6 +258,74 @@ class ContextBuilder:
     # Main enriched context builder
     # ------------------------------------------------------------------
 
+    async def build_planning_context(self, objective: str) -> str:
+        """Compact strategic context for the planner (~2000 chars max).
+
+        Includes tech-stack fingerprint, workspace snapshot, top-2 episodic
+        memories, and known pitfalls from the agent wiki.  Does NOT call
+        build() internally — kept intentionally lightweight.
+        """
+        parts: list[str] = []
+
+        # 1. Tech-stack fingerprint + workspace snapshot
+        try:
+            _ws_now = get_workspace()
+            ws_root = Path(_ws_now)
+            _STACK_FILES = {
+                "package.json":    "Node.js/JavaScript",
+                "Cargo.toml":      "Rust",
+                "requirements.txt": "Python",
+                "pyproject.toml":  "Python",
+                "go.mod":          "Go",
+                "pom.xml":         "Java/Maven",
+                "build.gradle":    "Java/Gradle",
+                "composer.json":   "PHP",
+                "Gemfile":         "Ruby",
+            }
+            detected = [label for fname, label in _STACK_FILES.items() if (ws_root / fname).exists()]
+            _IGNORE_TOP = {"node_modules", "__pycache__", "logs", ".git", ".agent-wiki"}
+            top_items = [
+                item.name for item in sorted(ws_root.iterdir())
+                if not item.name.startswith(".") and item.name not in _IGNORE_TOP
+            ][:12]
+            stack_line = f"Tech stack: {', '.join(detected) or 'unknown'}"
+            ws_line = f"Workspace: {', '.join(top_items) or '(empty)'}"
+            parts.append(f"## Project Context\n{stack_line}\n{ws_line}")
+        except Exception:
+            pass
+
+        # 2. Episodic memory — top 2 similar past tasks (score >= 6)
+        try:
+            past = self.session_memory.get_similar_tasks(objective, limit=2, min_score=6)
+            if past:
+                lines = ["## Similar past work"]
+                for p in past:
+                    lines.append(
+                        f"- [{p.get('task_type') or 'task'}, {p['score']}/10] "
+                        f"{p['task_text'][:60]}: {p['result_summary'][:120]}"
+                    )
+                parts.append("\n".join(lines))
+        except Exception:
+            pass
+
+        # 3. Known pitfalls from agent wiki (top 3 skill matches)
+        try:
+            from agent.skills.wiki_manager import WikiManager
+            _ws_path = get_workspace()
+            if _ws_path:
+                _skill_wiki = WikiManager(_ws_path, project_name=Path(_ws_path).name)
+                _stop = {"the", "a", "an", "and", "or", "in", "on", "to", "for", "is"}
+                _terms = [
+                    w for w in objective.lower().split() if w not in _stop and len(w) > 3
+                ][:6]
+                pitfalls = _skill_wiki.query_skills(_terms, agent_type="develop")
+                if pitfalls:
+                    parts.append(f"## Known pitfalls\n{pitfalls[:600]}")
+        except Exception:
+            pass
+
+        return "\n\n".join(parts)[:2000]
+
     async def build(self, task: str, agent_type: str = "") -> str:
         """Build prompt enrichment: wiki-query + RAG + environment + skill instructions.
 
@@ -351,5 +419,22 @@ class ContextBuilder:
                 parts.append("\n".join(lines)[:_ep_cap])
         except Exception as _ep_err:
             self.logger.debug("episodic_query_failed", error=str(_ep_err))
+
+        # 6. Agent-wiki skills — load matching fix recipes scoped to this agent type
+        try:
+            from agent.skills.wiki_manager import WikiManager
+            _ws_path = get_workspace()
+            if _ws_path:
+                _skill_wiki = WikiManager(_ws_path, project_name=Path(_ws_path).name)
+                _stop = {"the", "a", "an", "and", "or", "in", "on", "to", "for", "is", "was"}
+                _skill_terms = [
+                    w for w in task.lower().split() if w not in _stop and len(w) > 3
+                ][:8]
+                skills_ctx = _skill_wiki.query_skills(_skill_terms, agent_type=agent_type)
+                if skills_ctx:
+                    _skill_cap = self.char_budget(fraction=0.04, cap=8_000)
+                    parts.append(skills_ctx[:_skill_cap])
+        except Exception as _sk_err:
+            self.logger.debug("skill_context_failed", error=str(_sk_err))
 
         return "\n".join(parts)

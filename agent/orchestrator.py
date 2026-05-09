@@ -24,7 +24,7 @@ from agent.agents.reviewer_agent import ReviewerAgent
 from agent.agents.architect_agent import ArchitectAgent
 from agent.agents.chat_agent import ChatAgent
 from agent.agents.research_agent import ResearchAgent
-from agent.agents.verifier_agent import VerifierAgent
+from agent.agents.verifier_agent import VerifierAgent, VerifierResult
 from agent.agents.mapper_agent import MapperAgent
 from agent.agents.red_team_agent import RedTeamAgent
 from agent.agents.documenter_agent import DocumenterAgent
@@ -482,14 +482,16 @@ class AgentOrchestrator:
                 except Exception:
                     pass
 
-        # 1. Plan
+        # 1. Plan — build compact planning context then generate tasks + criteria
         _emit("planning:tasks")
-        enriched_preview = await self.context_builder.build(objective)
-        task_specs = await self.planner_agent.plan(
+        planning_ctx = await self.context_builder.build_planning_context(objective)
+        plan_result = await self.planner_agent.plan_with_criteria(
             objective,
-            context=enriched_preview[:600],
+            context=planning_ctx,
             task_type=task_type,
         )
+        task_specs = list(plan_result.tasks)
+        completion_criteria = plan_result.completion_criteria
 
         # 1b. Review and improve the plan before executing (plan-review-plan loop).
         # Only runs for develop/sdlc tasks with ≥3 steps — skips trivial plans.
@@ -518,10 +520,21 @@ class AgentOrchestrator:
         # into downstream tasks in the same loop.
         _task_outputs: dict[str, list[str]] = {}
         _verifier_rounds = 0
-        _prev_verifier_score = -1  # sentinel: no previous round yet
-        _final_verifier_score: int | None = None  # last score from any verifier round
-        # Cap is env-configurable; default 3. Minimum 1.
-        _MAX_VERIFIER_ROUNDS = max(1, int(os.getenv("VERIFIER_MAX_ROUNDS", "3")))
+        _prev_verifier_score = -1   # sentinel: no previous round yet
+        _plateau_count = 0          # consecutive rounds at the same score
+        _zero_score_count = 0       # consecutive rounds at score == 0
+        _final_verifier_score: int | None = None
+        _verifier_snapshot_files: set[str] = set()  # files known after last verifier round
+        # Criterion-driven loop state
+        _fix_budget = max(1, int(os.getenv("FIX_BUDGET", "20")))
+        _criterion_fix_count = 0
+        _criterion_attempts: dict[str, int] = {}  # per-criterion failure count
+        # Develop/sdlc tasks get more rounds — complex builds need more fix cycles.
+        # Research stays at 3 since each round is an LLM-heavy web search.
+        if task_type in ("develop", "sdlc"):
+            _MAX_VERIFIER_ROUNDS = max(1, int(os.getenv("DEVELOP_VERIFIER_ROUNDS", "6")))
+        else:
+            _MAX_VERIFIER_ROUNDS = max(1, int(os.getenv("RESEARCH_VERIFIER_ROUNDS", "3")))
         # Task types where verification is meaningful (skip chat, plan, mapper).
         _VERIFIABLE_TYPES = {"develop", "research", "sdlc"}
 
@@ -531,9 +544,79 @@ class AgentOrchestrator:
                 task_obj = self.task_store.get_next_pending(job_id)
                 if task_obj is None:
                     # All tasks done — run verifier if applicable.
-                    if task_type in _VERIFIABLE_TYPES and _verifier_rounds < _MAX_VERIFIER_ROUNDS:
+                    if completion_criteria and task_type in _VERIFIABLE_TYPES:
+                        # Criterion-driven fix loop
+                        _tex = self.tool_executor
+
+                        async def _crit_shell_jid(cmd: str, _t=_tex) -> str:
+                            if not _t:
+                                return ""
+                            try:
+                                out = await _t.execute("shell", {"command": cmd})
+                                return str(out) if out else ""
+                            except Exception:
+                                return ""
+
+                        _ws_crit = Path(getattr(_tex, "workspace_path", ".") if _tex else ".")
+                        combined_so_far = "\n\n---\n\n".join(all_responses)
+                        _emit(f"verifying:criteria-{_criterion_fix_count + 1}")
+                        crit_results = await self.verifier_coordinator.evaluate_criteria(
+                            completion_criteria, _ws_crit, _crit_shell_jid, combined_so_far
+                        )
+                        _failing = [r for r in crit_results if not r.passed]
+                        _passed_count = len(crit_results) - len(_failing)
+
+                        async def _run_final_verifier_jid() -> VerifierResult:
+                            nonlocal _final_verifier_score
+                            _emit("verifying:final")
+                            _c = "\n\n---\n\n".join(all_responses)
+                            _vr = await self.verifier_coordinator.run_verification(
+                                objective, task_type, _c, all_files, tool_executor=self.tool_executor
+                            )
+                            _final_verifier_score = _vr.score
+                            if _vr.passed:
+                                try:
+                                    self.session_memory.store_episodic(session_id, objective, _c[:500], _vr.score, task_type)
+                                except Exception:
+                                    pass
+                            return _vr
+
+                        if not _failing:
+                            _vr = await _run_final_verifier_jid()
+                            task_summaries.append(f"✅ **All {len(completion_criteria)} criteria satisfied** — score {_vr.score}/10")
+                            break
+
+                        if _criterion_fix_count >= _fix_budget:
+                            _vr = await _run_final_verifier_jid()
+                            task_summaries.append(
+                                f"🎯 Fix budget ({_fix_budget}) exhausted — {_passed_count}/{len(completion_criteria)} criteria passing — score {_vr.score}/10"
+                            )
+                            break
+
+                        _target = next(
+                            (r for r in _failing if _criterion_attempts.get(r.criterion, 0) < 3),
+                            None,
+                        )
+                        if _target is None:
+                            _vr = await _run_final_verifier_jid()
+                            task_summaries.append(f"🔍 All failing criteria abandoned after 3 attempts — score {_vr.score}/10")
+                            break
+
+                        _criterion_attempts[_target.criterion] = _criterion_attempts.get(_target.criterion, 0) + 1
+                        _criterion_fix_count += 1
+                        _fix_spec = self.verifier_coordinator.make_targeted_fix_spec(_target, objective, _criterion_fix_count)
+                        new_fix = self.task_store.create_task(job_id=job_id, description=_fix_spec["description"], agent_type=_fix_spec["agent_type"])
+                        total = max(total, new_fix.sequence)
+                        task_summaries.append(f"🎯 **Criterion fix** ({_criterion_fix_count}/{_fix_budget}) — failing: {_target.criterion[:60]}")
+                        self.logger.info("criterion_fix_injected", criterion=_target.criterion[:60], attempt=_criterion_attempts[_target.criterion], fix_num=_criterion_fix_count)
+                        continue
+
+                    elif task_type in _VERIFIABLE_TYPES and _verifier_rounds < _MAX_VERIFIER_ROUNDS:
                         combined_so_far = "\n\n---\n\n".join(all_responses)
                         _emit(f"verifying:round-{_verifier_rounds + 1}")
+                        # Capture which files were added since the last verifier round
+                        _new_files_this_round = [f for f in all_files if f not in _verifier_snapshot_files]
+                        _verifier_snapshot_files = set(all_files)
                         vresult = await self.verifier_coordinator.run_verification(
                             objective, task_type, combined_so_far, all_files,
                             tool_executor=self.tool_executor,
@@ -556,22 +639,45 @@ class AgentOrchestrator:
                             except Exception:
                                 pass
                         if not vresult.passed:
-                            # Stop on true stagnation: plateau (same score) or drop ≥ 2.
-                            # A 1-point fluctuation is within LLM judge variance — let it continue.
-                            if _prev_verifier_score >= 0:
-                                _drop = _prev_verifier_score - vresult.score
-                                if vresult.score == _prev_verifier_score or _drop >= 2:
-                                    reason = "plateau" if _drop == 0 else f"dropped {_drop} pts"
+                            # Stagnation rules:
+                            #  - Hard stop: score drops 2+ pts (getting worse, not just noise)
+                            #  - Soft stop: score >= 5 and has plateaued for 2 consecutive rounds
+                            #  - Zero stop: score == 0 for 2 consecutive rounds (futile)
+                            #  - Very low scores (< 5) always get full round budget
+                            if vresult.score == 0:
+                                _zero_score_count += 1
+                                if _zero_score_count >= 2:
                                     task_summaries.append(
-                                        f"🔍 **Verifier** stagnated at {vresult.score}/10 "
-                                        f"({reason} from {_prev_verifier_score}/10) — stopping"
+                                        f"🔍 **Verifier** stuck at 0/10 for {_zero_score_count} rounds — stopping"
                                     )
                                     break
-                            _prev_verifier_score = vresult.score
+                            else:
+                                _zero_score_count = 0
+                            if _prev_verifier_score >= 0:
+                                _drop = _prev_verifier_score - vresult.score
+                                if _drop >= 2:
+                                    task_summaries.append(
+                                        f"🔍 **Verifier** stagnated at {vresult.score}/10 "
+                                        f"(dropped {_drop} pts from {_prev_verifier_score}/10) — stopping"
+                                    )
+                                    break
+                                if vresult.score == _prev_verifier_score and vresult.score >= 5:
+                                    _plateau_count += 1
+                                    if _plateau_count >= 2:
+                                        task_summaries.append(
+                                            f"🔍 **Verifier** stagnated at {vresult.score}/10 "
+                                            f"(plateau ×2) — stopping"
+                                        )
+                                        break
+                                else:
+                                    _plateau_count = 0  # score improved or still in low range
                             fix_specs = self.verifier_coordinator.make_fix_specs(
                                 objective, task_type, vresult, _verifier_rounds,
                                 files_created=all_files,
+                                files_changed_this_round=_new_files_this_round,
+                                prev_score=_prev_verifier_score,
                             )
+                            _prev_verifier_score = vresult.score
                             for spec in fix_specs:
                                 new_fix = self.task_store.create_task(
                                     job_id=job_id,
@@ -594,9 +700,78 @@ class AgentOrchestrator:
             else:
                 # No persistence — run specs in order
                 if task_num >= len(task_specs):
-                    if task_type in _VERIFIABLE_TYPES and _verifier_rounds < _MAX_VERIFIER_ROUNDS:
+                    if completion_criteria and task_type in _VERIFIABLE_TYPES:
+                        # Criterion-driven fix loop (no-persistence path)
+                        _tex2 = self.tool_executor
+
+                        async def _crit_shell_np(cmd: str, _t=_tex2) -> str:
+                            if not _t:
+                                return ""
+                            try:
+                                out = await _t.execute("shell", {"command": cmd})
+                                return str(out) if out else ""
+                            except Exception:
+                                return ""
+
+                        _ws_crit2 = Path(getattr(_tex2, "workspace_path", ".") if _tex2 else ".")
+                        combined_so_far = "\n\n---\n\n".join(all_responses)
+                        _emit(f"verifying:criteria-{_criterion_fix_count + 1}")
+                        crit_results2 = await self.verifier_coordinator.evaluate_criteria(
+                            completion_criteria, _ws_crit2, _crit_shell_np, combined_so_far
+                        )
+                        _failing2 = [r for r in crit_results2 if not r.passed]
+                        _passed_count2 = len(crit_results2) - len(_failing2)
+
+                        async def _run_final_verifier_np() -> VerifierResult:
+                            nonlocal _final_verifier_score
+                            _emit("verifying:final")
+                            _c = "\n\n---\n\n".join(all_responses)
+                            _vr = await self.verifier_coordinator.run_verification(
+                                objective, task_type, _c, all_files, tool_executor=self.tool_executor
+                            )
+                            _final_verifier_score = _vr.score
+                            if _vr.passed:
+                                try:
+                                    self.session_memory.store_episodic(session_id, objective, _c[:500], _vr.score, task_type)
+                                except Exception:
+                                    pass
+                            return _vr
+
+                        if not _failing2:
+                            _vr2 = await _run_final_verifier_np()
+                            task_summaries.append(f"✅ **All {len(completion_criteria)} criteria satisfied** — score {_vr2.score}/10")
+                            break
+
+                        if _criterion_fix_count >= _fix_budget:
+                            _vr2 = await _run_final_verifier_np()
+                            task_summaries.append(
+                                f"🎯 Fix budget ({_fix_budget}) exhausted — {_passed_count2}/{len(completion_criteria)} criteria passing — score {_vr2.score}/10"
+                            )
+                            break
+
+                        _target2 = next(
+                            (r for r in _failing2 if _criterion_attempts.get(r.criterion, 0) < 3),
+                            None,
+                        )
+                        if _target2 is None:
+                            _vr2 = await _run_final_verifier_np()
+                            task_summaries.append(f"🔍 All failing criteria abandoned after 3 attempts — score {_vr2.score}/10")
+                            break
+
+                        _criterion_attempts[_target2.criterion] = _criterion_attempts.get(_target2.criterion, 0) + 1
+                        _criterion_fix_count += 1
+                        _fix_spec2 = self.verifier_coordinator.make_targeted_fix_spec(_target2, objective, _criterion_fix_count)
+                        task_specs.append(_fix_spec2)
+                        total = len(task_specs)
+                        task_summaries.append(f"🎯 **Criterion fix** ({_criterion_fix_count}/{_fix_budget}) — failing: {_target2.criterion[:60]}")
+                        self.logger.info("criterion_fix_injected", criterion=_target2.criterion[:60], attempt=_criterion_attempts[_target2.criterion], fix_num=_criterion_fix_count)
+                        continue
+
+                    elif task_type in _VERIFIABLE_TYPES and _verifier_rounds < _MAX_VERIFIER_ROUNDS:
                         combined_so_far = "\n\n---\n\n".join(all_responses)
                         _emit(f"verifying:round-{_verifier_rounds + 1}")
+                        _new_files_this_round = [f for f in all_files if f not in _verifier_snapshot_files]
+                        _verifier_snapshot_files = set(all_files)
                         vresult = await self.verifier_coordinator.run_verification(
                             objective, task_type, combined_so_far, all_files,
                             tool_executor=self.tool_executor,
@@ -612,17 +787,40 @@ class AgentOrchestrator:
                             except Exception:
                                 pass
                         if not vresult.passed:
-                            if _prev_verifier_score >= 0 and vresult.score <= _prev_verifier_score:
-                                task_summaries.append(
-                                    f"🔍 **Verifier** stagnated at {vresult.score}/10 "
-                                    f"(≤ previous {_prev_verifier_score}/10) — stopping"
-                                )
-                                break
-                            _prev_verifier_score = vresult.score
+                            if vresult.score == 0:
+                                _zero_score_count += 1
+                                if _zero_score_count >= 2:
+                                    task_summaries.append(
+                                        f"🔍 **Verifier** stuck at 0/10 for {_zero_score_count} rounds — stopping"
+                                    )
+                                    break
+                            else:
+                                _zero_score_count = 0
+                            if _prev_verifier_score >= 0:
+                                _drop = _prev_verifier_score - vresult.score
+                                if _drop >= 2:
+                                    task_summaries.append(
+                                        f"🔍 **Verifier** stagnated at {vresult.score}/10 "
+                                        f"(dropped {_drop} pts) — stopping"
+                                    )
+                                    break
+                                if vresult.score == _prev_verifier_score and vresult.score >= 5:
+                                    _plateau_count += 1
+                                    if _plateau_count >= 2:
+                                        task_summaries.append(
+                                            f"🔍 **Verifier** stagnated at {vresult.score}/10 "
+                                            f"(plateau ×2) — stopping"
+                                        )
+                                        break
+                                else:
+                                    _plateau_count = 0
                             fix_specs = self.verifier_coordinator.make_fix_specs(
                                 objective, task_type, vresult, _verifier_rounds,
                                 files_created=all_files,
+                                files_changed_this_round=_new_files_this_round,
+                                prev_score=_prev_verifier_score,
                             )
+                            _prev_verifier_score = vresult.score
                             task_specs.extend(fix_specs)
                             total = len(task_specs)
                             task_summaries.append(
