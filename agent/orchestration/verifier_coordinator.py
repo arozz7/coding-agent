@@ -12,14 +12,16 @@ import re
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING, Callable, Coroutine, Optional
+from typing import TYPE_CHECKING, Callable, Coroutine, List, Optional
 
 import structlog
 
 from agent.orchestration.context_builder import char_budget
 
 if TYPE_CHECKING:
+    from agent.agents.acceptance_tester_agent import AcceptanceTesterAgent, AcceptanceResult
     from agent.agents.verifier_agent import VerifierAgent, VerifierResult
+    from agent.orchestration.app_probe import AppProbe
     from llm import ModelRouter
 
 
@@ -195,17 +197,65 @@ class VerifierCoordinator:
             self.logger.warning("llm_criterion_eval_failed", error=str(exc))
         return CriterionResult(criterion=criterion, passed=False, detail="(evaluation error)")
 
+    async def run_acceptance_tests(
+        self,
+        criteria: List[str],
+        workspace: Path,
+        app_probe: "AppProbe",
+        acceptance_tester: "AcceptanceTesterAgent",
+    ) -> List["AcceptanceResult"]:
+        """Launch the app, screenshot it, evaluate acceptance criteria, teardown.
+
+        Returns one AcceptanceResult per criterion.  On any launch failure all
+        criteria are returned as failed so the fix loop gets signal.
+        """
+        from agent.agents.acceptance_tester_agent import AcceptanceResult
+
+        if not criteria:
+            return []
+
+        handle = await app_probe.launch()
+        screenshot_path: Optional[str] = None
+
+        if handle is None:
+            self.logger.warning("acceptance_launch_failed", workspace=str(workspace))
+            return [
+                AcceptanceResult(criterion=c, passed=False, detail="(app failed to launch)")
+                for c in criteria
+            ]
+
+        try:
+            screenshot_path = await app_probe.screenshot(handle)
+            results = await acceptance_tester.run_tests(criteria, workspace, screenshot_path=screenshot_path)
+        finally:
+            await app_probe.teardown(handle)
+
+        passed = sum(1 for r in results if r.passed)
+        self.logger.info(
+            "acceptance_tests_done",
+            total=len(results),
+            passed=passed,
+            screenshot=screenshot_path is not None,
+        )
+        return results
+
     def make_targeted_fix_spec(
         self,
         failing: "CriterionResult",
         objective: str,
         round_num: int,
         test_out: str = "",
+        screenshot_path: Optional[str] = None,
     ) -> dict:
         """Return a single fix task spec targeted at one failing criterion."""
         phase, instruction = self._detect_fix_phase(test_out, failing.detail, round_num)
         detail_block = f"\n\nWhy it failed: {failing.detail}" if failing.detail else ""
         test_block = f"\n\nVerifier output:\n```\n{test_out[:600]}\n```" if test_out else ""
+        shot_block = (
+            f"\n\nScreenshot of the running app: {screenshot_path}\n"
+            "The screenshot shows the visual state at the time of failure — use it to understand what the user sees."
+            if screenshot_path else ""
+        )
         return {
             "description": (
                 f"[Criterion fix — round {round_num}] {instruction}\n"
@@ -213,6 +263,7 @@ class VerifierCoordinator:
                 f"Failing criterion: {failing.criterion}"
                 f"{detail_block}"
                 f"{test_block}"
+                f"{shot_block}"
             ),
             "agent_type": "develop",
         }
