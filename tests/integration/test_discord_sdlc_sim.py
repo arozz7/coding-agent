@@ -168,7 +168,7 @@ class TestSDLCDiscordFlow:
         # Track on_phase calls
         seen_phases: list[str] = []
 
-        async def run_task_with_phases(task, session_id, include_history, on_phase, job_id=None):
+        async def run_task_with_phases(task, session_id, include_history, on_phase, job_id=None, force_task_type=None):
             for phase in phase_sequence:
                 seen_phases.append(phase)
                 if on_phase:
