@@ -12,18 +12,19 @@ A comprehensive guide to using the Local Coding Agent.
 6. [Agent Chains](#agent-chains)
 7. [Deep Research Mode](#deep-research-mode)
 8. [Verifier / Critic Agent](#verifier--critic-agent)
-9. [Workspace & Project Scoping](#workspace--project-scoping)
-   - [!wiki commands](#wiki-commands)
-   - [Project Lifecycle Management](#project-lifecycle-management)
-10. [Model Management](#model-management)
-11. [Context Bridge](#context-bridge)
-12. [Agent Wiki Memory](#agent-wiki-memory)
-13. [Memory Architecture](#memory-architecture)
-14. [Interactive Testing Tools](#interactive-testing-tools)
-15. [REST API Reference](#rest-api-reference)
-16. [Advanced File Operations](#advanced-file-operations)
-17. [Security](#security)
-18. [Troubleshooting](#troubleshooting)
+9. [Goal-Driven Planning & Criterion-Driven Fix Loop](#goal-driven-planning--criterion-driven-fix-loop)
+10. [Workspace & Project Scoping](#workspace--project-scoping)
+    - [!wiki commands](#wiki-commands)
+    - [Project Lifecycle Management](#project-lifecycle-management)
+11. [Model Management](#model-management)
+12. [Context Bridge](#context-bridge)
+13. [Agent Wiki Memory](#agent-wiki-memory)
+14. [Memory Architecture](#memory-architecture)
+15. [Interactive Testing Tools](#interactive-testing-tools)
+16. [REST API Reference](#rest-api-reference)
+17. [Advanced File Operations](#advanced-file-operations)
+18. [Security](#security)
+19. [Troubleshooting](#troubleshooting)
 
 ---
 
@@ -78,6 +79,7 @@ python -m pip install -e .
 | `MAX_FIND_RESULTS` | No | `200` | Maximum results returned by `find_files` or `grep_code`. |
 | `SKIP_PATH_PREFIXES` | No | `dist/,build/,node_modules/,.cache/` | Comma-separated path prefixes excluded from fix-loop file context reads. Add project-specific compiled output dirs here. |
 | `AGENT_API_KEY` | No | _(none)_ | When set, callers must send `X-API-Key: <value>` on mutating endpoints (`POST /task`, `/task/start`, `/task/stream`, `/workspace/project`). Leave unset to disable auth (safe for local-only use). |
+| `FIX_BUDGET` | No | `20` | Maximum criterion-fix tasks the orchestrator will inject for a single job before declaring it complete. Each failing criterion can consume at most 3 attempts before being abandoned. Raise this for very large codebases; lower it to fail fast. |
 
 ### Model Configuration (`config/models.yaml`)
 
@@ -537,6 +539,52 @@ After every develop or research task (including each subtask in a multi-step job
 - **Research task without files**: a single combined research fix task covers all gaps.
 
 The fix rounds are transparent — Discord shows them as additional task steps, and the final result reflects all rounds. You can always see what gaps triggered a fix in the job transcript (`!result`).
+
+---
+
+## Goal-Driven Planning & Criterion-Driven Fix Loop
+
+For `develop` and `sdlc` task types the orchestrator uses a two-stage planning flow that replaces holistic score oscillation with measurable per-criterion progress.
+
+### Pre-planning context enrichment
+
+Before the planner generates tasks, the orchestrator builds a compact (~2 000 char) planning context and injects it into the planner prompt:
+
+- **Tech-stack fingerprint** — scans the workspace root for `package.json`, `Cargo.toml`, `requirements.txt`, `pyproject.toml`, `go.mod`, `pom.xml`, `build.gradle`, `composer.json`, `Gemfile` and reports detected stacks
+- **Workspace snapshot** — top-level directory names (ignoring `node_modules`, `.git`, etc.)
+- **Top-2 episodic memories** — best-matching past tasks (score ≥ 7) from SQLite episodic memory
+- **Known pitfalls** — relevant entries from the agent wiki
+
+This gives the planner project-specific awareness on the first pass, resulting in more concrete task sequences without requiring an explicit recon step.
+
+### Completion criteria
+
+After generating the task list, the planner makes a second LLM call to produce 3–5 testable *completion criteria* for the job. Criteria prefer auto-checkable formats:
+
+| Criterion format | How it is evaluated |
+|-----------------|-------------------|
+| `"command exits 0: npm test"` | Shell command run; checks exit code |
+| `"file exists: src/app.js"` | `stat` check against workspace |
+| `"file contains: README.md:# Usage"` | Substring search in file |
+| Plain English (e.g. `"The score counter appears on screen"`) | LLM pass/fail call using task output |
+
+Server-like commands (`npm start`, `flask run`, `uvicorn`, etc.) are detected and skipped automatically — they would block the loop indefinitely.
+
+### Fix loop behaviour
+
+Each round after the main task list completes:
+
+1. All criteria are evaluated
+2. If **all pass** → final verifier runs once for episodic memory recording → job complete
+3. If the **fix budget** is exhausted (default 20, set `FIX_BUDGET` env var) → final verifier → job complete
+4. If **all failing criteria have been attempted 3 times** and keep failing → final verifier → job complete
+5. Otherwise → a single targeted fix task is injected for the **first unabandoned failing criterion**, with its exact failure detail included in the task description
+
+This means each fix task has a clear, specific target rather than a vague "fix all issues" instruction.
+
+### Backward compatibility
+
+When criteria generation returns an empty list (research tasks, tasks where criteria generation fails gracefully, or when `task_type` is not `develop`/`sdlc`) the orchestrator falls back to the previous score-based verifier loop unchanged.
 
 ---
 
@@ -1267,4 +1315,4 @@ Get-Content logs\bot-20260415-120005.log -Wait   # tail the latest bot log
 
 ---
 
-*Last updated: 2026-05-08 — Phases 26–29: deep research mode (8 sub-questions, 4 gap passes, 3 coverage rounds, 28k budget, file output); verifier/critic agent with research and code rubrics, fix rounds, stagnation detection; project lifecycle management (`!project delete`, dry-run preview, API endpoints); memory architecture (write-path quality gate, MemoryWiki code-graph context, episodic memory, dynamic content budgets); orchestrator split into `agent/orchestration/` package (`ContextBuilder`, `TaskRouter`, `VerifierCoordinator`)*
+*Last updated: 2026-05-09 — Phase 28: goal-driven planning architecture — planner generates testable completion criteria (auto-checkable file/command/substring checks + LLM fallback for behavioral criteria); criterion-driven fix loop targets one failing criterion per fix task with 3-strike per-criterion abandon and `FIX_BUDGET` cap; pre-planning context enrichment injects tech-stack fingerprint and top-2 episodic memories before task generation; score-based verifier loop retained as backward-compatible fallback when criteria are empty. Earlier: Phases 26–27: deep research mode, verifier/critic agent, project lifecycle management, memory architecture, orchestration package split.*
