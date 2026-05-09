@@ -1157,7 +1157,7 @@ class AgentOrchestrator:
             or Path(_project_name).name != _project_name
         ):
             raise ValueError(f"Invalid project_name {project_name!r}")
-        _ws_root = Path(os.getenv("WORKSPACE_PATH", "./workspace")).resolve()
+        _ws_root = Path(self.workspace_path).resolve()
         _project_dir = (_ws_root / _project_name).resolve()
         if not _project_dir.is_relative_to(_ws_root):
             raise ValueError(
@@ -1173,8 +1173,12 @@ class AgentOrchestrator:
         chroma_chunks = self.codebase_memory.count_project_chunks(_project_short_name)
 
         wiki_entries = 0
-        wiki_dir = _project_dir / ".agent-wiki"
-        wiki_index = wiki_dir / "index.md"
+        wiki_dir = (_project_dir / ".agent-wiki").resolve()
+        if not wiki_dir.is_relative_to(_ws_root):
+            raise ValueError(f"wiki_dir {wiki_dir!r} outside workspace root {_ws_root}")
+        wiki_index = (wiki_dir / "index.md").resolve()
+        if not wiki_index.is_relative_to(_ws_root):
+            raise ValueError(f"wiki_index {wiki_index!r} outside workspace root {_ws_root}")
         if wiki_index.exists():
             try:
                 lines = wiki_index.read_text(encoding="utf-8").splitlines()
