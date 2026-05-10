@@ -117,31 +117,34 @@ class TestScanTaskDirs:
 
 
 class TestLocalDirRoutingOverride:
-    """_scan_task_dirs results should suppress web search when dirs were read."""
+    """_scan_task_dirs results should suppress web search only when dirs were read
+    and the task has no explicit web-search signals."""
 
-    @pytest.mark.asyncio
-    async def test_needs_web_false_when_local_dirs_found(self):
-        """Simulate the routing logic: _found_local_dirs suppresses needs_web."""
-        from agent.agents.research_agent import ResearchRole, _LOCAL_TASK_RE
+    def _needs_web(self, task: str, local_sections: list) -> bool:
+        from agent.agents.research_agent import _LOCAL_TASK_RE, _SEARCH_TRIGGERS
+        _found_local_dirs = any(s.startswith("Contents of ") for s in local_sections)
+        _has_web_signals = bool(_SEARCH_TRIGGERS.search(task))
+        return not bool(_LOCAL_TASK_RE.search(task)) and not (_found_local_dirs and not _has_web_signals)
 
-        # Simulate task that doesn't match _LOCAL_TASK_RE but mentions a local dir
+    def test_suppresses_web_when_local_dirs_found_no_web_signals(self):
+        """Pure local task: local dirs found, no web signals → web suppressed."""
         task = "Scan the docs and research-cache directories to review existing research"
-        assert not _LOCAL_TASK_RE.search(task), "Pre-condition: task does not match LOCAL regex"
+        sections = ["Contents of docs/:\n📄 report.md\n", "--- docs/report.md ---\nContent"]
+        assert not self._needs_web(task, sections)
 
-        local_sections = ["Contents of docs/:\n📄 report.md\n", "--- docs/report.md ---\nContent"]
-        _found_local_dirs = any(s.startswith("Contents of ") for s in local_sections)
-        needs_web = not bool(_LOCAL_TASK_RE.search(task)) and not _found_local_dirs
+    def test_allows_web_when_local_dirs_found_but_web_signals_present(self):
+        """Hybrid task: local dirs found AND explicit web signals → web still fires."""
+        task = "Review the docs directory and search the web for any gaps we missed"
+        sections = ["Contents of docs/:\n📄 report.md\n", "--- docs/report.md ---\nContent"]
+        assert self._needs_web(task, sections)
 
-        assert not needs_web, "Should suppress web search when local dirs were successfully read"
-
-    @pytest.mark.asyncio
-    async def test_needs_web_true_when_no_local_dirs(self):
-        """Web search still fires when no directory content was found."""
-        from agent.agents.research_agent import _LOCAL_TASK_RE
-
+    def test_allows_web_when_no_local_dirs(self):
+        """No local dir content → web search still fires (default research path)."""
         task = "Research architectural patterns for self-improving agents"
-        local_sections = ["Workspace contents:\n📁 docs\n📄 README.md"]
-        _found_local_dirs = any(s.startswith("Contents of ") for s in local_sections)
-        needs_web = not bool(_LOCAL_TASK_RE.search(task)) and not _found_local_dirs
+        sections = ["Workspace contents:\n📁 docs\n📄 README.md"]
+        assert self._needs_web(task, sections)
 
-        assert needs_web, "Should still do web search when no local dirs were scanned"
+    def test_allows_web_for_pure_research_task(self):
+        """Explicit research/investigate task with no local dirs → web search."""
+        task = "Investigate state-of-the-art recursive self-improvement techniques"
+        assert self._needs_web(task, [])

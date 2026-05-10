@@ -168,10 +168,12 @@ Guidelines:
         # _SEARCH_TRIGGERS was too narrow — planner-generated subtasks like
         # "Research state persistence..." don't contain trigger words but clearly
         # need web search, not local file scanning.
-        # Exception: if we successfully read local directory content that the task
-        # asked for, skip the web-search path — it would only return generic noise.
+        # Exception: if we successfully read local directory content AND the task
+        # has no explicit web-search signals, skip web — it would return generic noise.
+        # Tasks that want both ("review docs AND search for gaps") still get web search.
         _found_local_dirs = any(s.startswith("Contents of ") for s in local_sections)
-        needs_web = not bool(_LOCAL_TASK_RE.search(task)) and not _found_local_dirs
+        _has_web_signals = bool(_SEARCH_TRIGGERS.search(task))
+        needs_web = not bool(_LOCAL_TASK_RE.search(task)) and not (_found_local_dirs and not _has_web_signals)
 
         wants_files = bool(_FILE_WRITE_RE.search(task))
 
