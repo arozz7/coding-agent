@@ -119,6 +119,7 @@ class ToolExecutor:
 
         # Document tools
         self.tools["read_document"] = self._read_document  # PDF/DOCX/XLSX/CSV
+        self.tools["pdf_fetch"] = self._pdf_fetch          # download & parse PDF from URL
 
         # Interactive testing tools
         self.tools["interactive_shell"] = self._run_interactive_shell   # CLI apps via stdin/stdout
@@ -372,6 +373,21 @@ class ToolExecutor:
                 return str(result)
         except Exception as e:
             return f"Error reading document {path}: {e}"
+
+    def _pdf_fetch(self, input: Dict[str, Any]) -> str:
+        """Download a PDF from a URL and return its extracted text."""
+        url = input.get("url", "")
+        if not url:
+            return "Error: 'url' is required"
+        try:
+            result = self.document_tool.read_pdf_url(url)
+            if not result.get("success"):
+                return f"PDF fetch failed: {result.get('error')}"
+            truncated = " [truncated]" if result.get("truncated") else ""
+            pages = result.get("total_pages", "?")
+            return f"[PDF: {url[:80]} — {pages} pages{truncated}]\n\n{result.get('text', '')}"
+        except Exception as e:
+            return f"Error fetching PDF {url}: {e}"
 
     async def _run_interactive_shell(self, input: Dict[str, Any]) -> str:
         """Spawn a process and follow an expect/send script via stdin/stdout pipes.

@@ -8,6 +8,15 @@ from agent.tools.web_tool import extract_urls
 
 _DOCUMENT_EXTS = {".pdf", ".docx", ".doc", ".xlsx", ".xls", ".csv", ".tsv"}
 
+# PDF MIME signature — detect binary content that slipped through web_fetch.
+_PDF_MAGIC = "%PDF"
+
+
+def _is_pdf_url(url: str) -> bool:
+    lower = url.lower()
+    return lower.endswith(".pdf") or "/pdf/" in lower
+
+
 # Maximum sub-questions from decomposition; follow-up queries per gap pass; coverage rounds.
 _MAX_QUESTIONS = 5
 _MAX_FOLLOWUPS = 3
@@ -303,37 +312,47 @@ Guidelines:
                 # Deep-fetch the first URL for richer content.
                 urls = re.findall(r"https?://\S+", raw)
                 if urls:
-                    try:
-                        page = await tool_executor.execute("web_fetch", {"url": urls[0]})
-                        _needs_browser = (
-                            not page
-                            or page.startswith("Error")
-                            or len(page) < 500
-                            or any(s in page.lower() for s in (
-                                "access denied", "403 forbidden", "cloudflare",
-                                "just a moment", "enable javascript", "captcha",
-                                "robot", "checking your browser",
-                            ))
-                        )
-                        if not _needs_browser:
-                            sections.append(f"[Page: {urls[0][:80]}]\n{page[:1500]}")
-                        else:
-                            # JS-heavy or access-denied page — fall back to headless browser.
-                            try:
-                                browser_result = await tool_executor.execute(
-                                    "browser_interact",
-                                    {"url": urls[0], "actions": [{"type": "text", "selector": "body"}]},
-                                )
-                                if browser_result and not str(browser_result).startswith("Error"):
-                                    sections.append(f"[Browser: {urls[0][:80]}]\n{str(browser_result)[:1500]}")
-                                elif page and not page.startswith("Error") and len(page) >= 500:
-                                    # Browser also failed — use the original fetch result anyway
-                                    sections.append(f"[Page: {urls[0][:80]}]\n{page[:1500]}")
-                            except Exception:
-                                if page and not page.startswith("Error") and len(page) >= 500:
-                                    sections.append(f"[Page: {urls[0][:80]}]\n{page[:1500]}")
-                    except Exception:
-                        pass
+                    url = urls[0]
+                    if _is_pdf_url(url):
+                        # PDF path: download and parse with pdfplumber via pdf_fetch tool.
+                        try:
+                            text = await tool_executor.execute("pdf_fetch", {"url": url})
+                            if text and not text.startswith("Error"):
+                                sections.append(f"[PDF: {url[:80]}]\n{text[:1500]}")
+                        except Exception:
+                            pass
+                    else:
+                        # Normal path: web fetch with headless-browser fallback.
+                        try:
+                            page = await tool_executor.execute("web_fetch", {"url": url})
+                            _needs_browser = (
+                                not page
+                                or page.startswith("Error")
+                                or page.startswith(_PDF_MAGIC)
+                                or len(page) < 500
+                                or any(s in page.lower() for s in (
+                                    "access denied", "403 forbidden", "cloudflare",
+                                    "just a moment", "enable javascript", "captcha",
+                                    "robot", "checking your browser",
+                                ))
+                            )
+                            if not _needs_browser:
+                                sections.append(f"[Page: {url[:80]}]\n{page[:1500]}")
+                            else:
+                                try:
+                                    browser_result = await tool_executor.execute(
+                                        "browser_interact",
+                                        {"url": url, "actions": [{"type": "text", "selector": "body"}]},
+                                    )
+                                    if browser_result and not str(browser_result).startswith("Error"):
+                                        sections.append(f"[Browser: {url[:80]}]\n{str(browser_result)[:1500]}")
+                                    elif page and not page.startswith("Error") and len(page) >= 500:
+                                        sections.append(f"[Page: {url[:80]}]\n{page[:1500]}")
+                                except Exception:
+                                    if page and not page.startswith("Error") and len(page) >= 500:
+                                        sections.append(f"[Page: {url[:80]}]\n{page[:1500]}")
+                        except Exception:
+                            pass
         except Exception as e:
             self.logger.warning("search_question_failed", query=query[:60], error=str(e))
         return "\n\n".join(sections)
@@ -413,7 +432,7 @@ Guidelines:
             f"{structure_instruction}\n\n"
             f"{detail_rules}"
         )
-        response = await model_router.generate(prompt, model, system_prompt=self.get_system_prompt())
+        response = await model_router.generate(prompt, model, system_prompt=self.get_system_prompt(), enable_thinking=False)
         return {
             "success": True,
             "role": self.name,

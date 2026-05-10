@@ -44,15 +44,23 @@ class DocumenterRole:
             return {"success": False, "error": "No coding model configured"}
 
         enriched_full = context.get("enriched_context", "")
+        # Reserve headroom for the model to generate a full document:
+        # use 60% of context window for input (chars = tokens * 4), min 20k.
+        _output_reserve_chars = max(8_000, model.context_window * 4 // 5)
+        _max_input_chars = max(20_000, model.context_window * 4 - _output_reserve_chars - 2_000)
         # Research content is appended after the standard context under a known marker.
-        # Cap the standard preamble tightly but let the research section through in full
-        # so the documenter has all gathered findings to synthesize from.
+        # Cap the standard preamble tightly; cap the research section to leave room for generation.
         _RESEARCH_MARKER = "## Research findings to synthesize"
         if _RESEARCH_MARKER in enriched_full:
             split_idx = enriched_full.index(_RESEARCH_MARKER)
-            enriched = enriched_full[:split_idx][:800] + "\n\n" + enriched_full[split_idx:]
+            preamble = enriched_full[:split_idx][:800]
+            research = enriched_full[split_idx:]
+            research_budget = _max_input_chars - len(preamble) - 200
+            if len(research) > research_budget:
+                research = research[:research_budget] + "\n\n[Research content trimmed to fit context window]"
+            enriched = preamble + "\n\n" + research
         else:
-            enriched = enriched_full[:1500]
+            enriched = enriched_full[:_max_input_chars]
         prompt = (
             f"{enriched}\n\n"
             f"## Documentation Task\n{task}\n\n"
@@ -62,7 +70,7 @@ class DocumenterRole:
         )
 
         response = await model_router.generate(
-            prompt, model, system_prompt=self.get_system_prompt()
+            prompt, model, system_prompt=self.get_system_prompt(), enable_thinking=False
         )
 
         files_created: List[str] = []

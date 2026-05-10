@@ -9,7 +9,7 @@ models:
     recommended_for: [coding, code_review, test_generation, planning, research]
     rate_limit_rpm: 120
 
-  - name: qwen3.5-35b-a3b
+  - name: qwen3.6-36b-a3b
     type: local
     provider: lmstudio   # lmstudio | ollama | llama_cpp
     # Set LM_STUDIO_URL in .env to override; falls back to localhost:1234

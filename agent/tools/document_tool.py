@@ -60,37 +60,64 @@ class DocumentTool:
     # ------------------------------------------------------------------
 
     def read_pdf(self, path: str) -> Dict[str, Any]:
-        """Extract text from a PDF using pypdf."""
+        """Extract text from a local PDF file using pdfplumber."""
+        return self._extract_pdf(Path(path))
+
+    def read_pdf_url(self, url: str) -> Dict[str, Any]:
+        """Download a PDF from a URL and extract its text using pdfplumber."""
+        import tempfile
+        import urllib.request
+
+        tmp_path: Optional[Path] = None
         try:
-            import pypdf  # type: ignore
+            with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as tmp:
+                tmp_path = Path(tmp.name)
+            urllib.request.urlretrieve(url, tmp_path)  # noqa: S310 — URL from trusted research pipeline
+            result = self._extract_pdf(tmp_path)
+            result["url"] = url
+            return result
+        except Exception as e:
+            self.logger.error("pdf_url_read_failed", url=url, error=str(e))
+            return {"success": False, "error": str(e)}
+        finally:
+            if tmp_path and tmp_path.exists():
+                try:
+                    tmp_path.unlink()
+                except Exception:
+                    pass
+
+    def _extract_pdf(self, path: Path) -> Dict[str, Any]:
+        """Extract text from a PDF file on disk using pdfplumber."""
+        try:
+            import pdfplumber  # type: ignore
         except ImportError:
-            return {"success": False, "error": "pypdf not installed — run: pip install pypdf"}
+            return {"success": False, "error": "pdfplumber not installed — run: pip install pdfplumber"}
 
         try:
-            reader = pypdf.PdfReader(path)
-            total_pages = len(reader.pages)
             parts: List[str] = []
             chars = 0
-
-            for i, page in enumerate(reader.pages):
-                page_text = page.extract_text() or ""
-                parts.append(f"[Page {i + 1}]\n{page_text}")
-                chars += len(page_text)
-                if chars >= _MAX_CHARS:
-                    parts.append(f"[truncated — {total_pages - i - 1} more pages]")
-                    break
+            total_pages = 0
+            with pdfplumber.open(path) as pdf:
+                total_pages = len(pdf.pages)
+                for i, page in enumerate(pdf.pages):
+                    page_text = page.extract_text() or ""
+                    parts.append(f"[Page {i + 1}]\n{page_text}")
+                    chars += len(page_text)
+                    if chars >= _MAX_CHARS:
+                        parts.append(f"[truncated — {total_pages - i - 1} more pages]")
+                        break
 
             text = "\n\n".join(parts)
             return {
                 "success": True,
-                "path": path,
+                "path": str(path),
                 "type": "pdf",
                 "total_pages": total_pages,
                 "text": text[:_MAX_CHARS],
                 "truncated": chars >= _MAX_CHARS,
             }
         except Exception as e:
-            self.logger.error("pdf_read_failed", path=path, error=str(e))
+            self.logger.error("pdf_extract_failed", path=str(path), error=str(e))
             return {"success": False, "error": str(e)}
 
     def read_docx(self, path: str) -> Dict[str, Any]:
