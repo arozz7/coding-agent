@@ -132,6 +132,7 @@ Guidelines:
 
         # --- Local orientation (always runs) ---
         local_sections: List[str] = []
+        listing = ""
         if tool_executor:
             try:
                 listing = await tool_executor.execute("file_list", {"path": ""})
@@ -155,13 +156,22 @@ Guidelines:
                 except Exception as e:
                     self.logger.warning("doc_read_failed", path=dp, error=str(e))
 
+            # Scan workspace directories explicitly mentioned in the task.
+            # This lets the agent read research-cache/, docs/, etc. without
+            # having to know specific filenames upfront.
+            dir_sections = await self._scan_task_dirs(task, listing, tool_executor)
+            local_sections.extend(dir_sections)
+
         # --- Routing decision ---
         # Default to web search for research tasks. Only skip it when the task
         # explicitly refers to the local workspace/codebase (errors, logs, files).
         # _SEARCH_TRIGGERS was too narrow — planner-generated subtasks like
         # "Research state persistence..." don't contain trigger words but clearly
         # need web search, not local file scanning.
-        needs_web = not bool(_LOCAL_TASK_RE.search(task))
+        # Exception: if we successfully read local directory content that the task
+        # asked for, skip the web-search path — it would only return generic noise.
+        _found_local_dirs = any(s.startswith("Contents of ") for s in local_sections)
+        needs_web = not bool(_LOCAL_TASK_RE.search(task)) and not _found_local_dirs
 
         wants_files = bool(_FILE_WRITE_RE.search(task))
 
@@ -569,6 +579,56 @@ Guidelines:
                     results.append(str(p))
                     break
         return results
+
+    async def _scan_task_dirs(
+        self, task: str, root_listing: str, tool_executor
+    ) -> List[str]:
+        """List and read text/markdown files from workspace dirs mentioned in the task.
+
+        Parses the root listing for directory names, finds which ones the task
+        references, then reads up to _MAX_FILES_PER_DIR files from each.
+        Docs/high-value dirs get a larger per-file budget than cache dirs.
+        """
+        _MAX_DIRS = 3
+        _MAX_FILES_PER_DIR = 6
+        _HIGH_VALUE_DIRS = {"docs", "doc", ".agent-wiki", "agent-wiki"}
+        _HIGH_BUDGET = 5_000   # chars per file for docs
+        _NORMAL_BUDGET = 2_500  # chars per file for cache/other dirs
+
+        # Extract directory names from the root listing (📁 prefix from file_list).
+        dirs_in_workspace = re.findall(r"📁 (\S+)", root_listing)
+        if not dirs_in_workspace:
+            return []
+
+        task_lower = task.lower()
+        dirs_to_scan = [d for d in dirs_in_workspace if d.lower() in task_lower][:_MAX_DIRS]
+        if not dirs_to_scan:
+            return []
+
+        sections: List[str] = []
+        for dir_name in dirs_to_scan:
+            try:
+                dir_listing = await tool_executor.execute("file_list", {"path": dir_name})
+                if not dir_listing or dir_listing.startswith("Error"):
+                    continue
+                sections.append(f"Contents of {dir_name}/:\n{dir_listing}")
+                self.logger.info("scanning_task_dir", dir=dir_name)
+
+                budget = _HIGH_BUDGET if dir_name.lower() in _HIGH_VALUE_DIRS else _NORMAL_BUDGET
+                # Find .md and .txt files in the listing (📄 prefix).
+                file_names = re.findall(r"📄 (\S+\.(?:md|txt))", dir_listing)
+                for fname in file_names[:_MAX_FILES_PER_DIR]:
+                    rel_path = f"{dir_name}/{fname}"
+                    try:
+                        content = await tool_executor.execute("file_read", {"path": rel_path})
+                        if content and not content.startswith("Error"):
+                            sections.append(f"--- {rel_path} ---\n{content[:budget]}")
+                    except Exception:
+                        pass
+            except Exception as e:
+                self.logger.warning("dir_scan_failed", dir=dir_name, error=str(e))
+
+        return sections
 
 
 def _trim_to_budget(sections: List[str], budget: int) -> List[str]:
