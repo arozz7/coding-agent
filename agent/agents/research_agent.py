@@ -593,8 +593,8 @@ Guidelines:
         _MAX_DIRS = 3
         _MAX_FILES_PER_DIR = 6
         _HIGH_VALUE_DIRS = {"docs", "doc", ".agent-wiki", "agent-wiki"}
-        _HIGH_BUDGET = 5_000   # chars per file for docs
-        _NORMAL_BUDGET = 2_500  # chars per file for cache/other dirs
+        _HIGH_BUDGET = 14_000  # chars per file for docs (covers files up to ~14k bytes untruncated)
+        _NORMAL_BUDGET = 3_000  # chars per file for cache/other dirs
 
         # Extract directory names from the root listing (📁 prefix from file_list).
         dirs_in_workspace = re.findall(r"📁 (\S+)", root_listing)

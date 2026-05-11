@@ -299,7 +299,9 @@ class VerifierCoordinator:
                 specs.append({
                     "description": (
                         f"[Fix round {round_num} — research] "
-                        f"Search the web and investigate: {gap}. "
+                        f"Review the workspace docs and research-cache directories for existing coverage, "
+                        f"then search the web if the information is not already present. "
+                        f"Investigate: {gap}. "
                         f"Context: {objective[:80]}"
                     ),
                     "agent_type": "research",
