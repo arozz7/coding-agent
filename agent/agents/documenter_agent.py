@@ -4,11 +4,35 @@ Modelled after the pi-vs-claude-code documenter agent — generates clear,
 concise documentation that matches the project's existing style.
 """
 
+import re
 from typing import Any, Dict, List
 
 import structlog
 
 logger = structlog.get_logger()
+
+
+def _extract_file_blocks(response: str) -> list[tuple[str, str]]:
+    """Extract (path, content) pairs from FILE: blocks, handling nested code fences.
+
+    The naive regex stops at the first ``` it sees, which breaks when the content
+    itself contains code fences (e.g. mermaid diagrams inside a markdown file).
+    This parser splits on FILE: boundaries and takes content up to the LAST ```
+    within each segment, which is the true outer closing fence.
+    """
+    results = []
+    parts = re.split(r'(?m)^(?=FILE:)', response)
+    for part in parts:
+        m = re.match(r'FILE:\s*(.+?)\n```\w*\n(.*)', part, re.DOTALL)
+        if not m:
+            continue
+        path = m.group(1).strip()
+        inner = m.group(2)
+        last_fence = inner.rfind('\n```')
+        content = inner[:last_fence].strip() if last_fence != -1 else inner.strip().rstrip('`')
+        if path and content:
+            results.append((path, content))
+    return results
 
 
 class DocumenterRole:
@@ -75,10 +99,7 @@ class DocumenterRole:
 
         files_created: List[str] = []
         if tool_executor:
-            import re
-            for path_str, content in re.findall(
-                r'FILE:\s*(.+?)\n```\w*\n(.*?)```', response, re.DOTALL
-            ):
+            for path_str, content in _extract_file_blocks(response):
                 fp = path_str.strip()
                 try:
                     await tool_executor.execute("file_write", {"path": fp, "content": content.strip()})

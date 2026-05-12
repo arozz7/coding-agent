@@ -36,6 +36,14 @@ class CriterionResult:
 logger = structlog.get_logger()
 
 
+def _select_primary_file(output_files: list[str]) -> str:
+    """Prefer root-level files over subdirectory files; fall back to first."""
+    for f in output_files:
+        if "/" not in f.replace("\\", "/").lstrip("/"):
+            return f
+    return output_files[0]
+
+
 class VerifierCoordinator:
     """Runs verification and assembles fix-task specs after failed rounds."""
 
@@ -293,7 +301,7 @@ class VerifierCoordinator:
         output_files = files_created or []
 
         if task_type == "research" and output_files:
-            file_ref = output_files[0]
+            file_ref = _select_primary_file(output_files)
             specs: list[dict] = []
             for gap in gaps[:2]:
                 specs.append({
