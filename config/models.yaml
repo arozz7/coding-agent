@@ -1,4 +1,17 @@
 models:
+  # ---- TurboQuantLoader (local llama-server proxy on port 7432) ----
+  # Start TurboQuantLoader before using: .\run.ps1 from J:\Projects\TurboQuantLoader
+  # Model name must match the .gguf file stem returned by GET /v1/models.
+  # single_model_only is overridden to false below — TQL manages its own lifecycle.
+  - name: Qwen3.6-27B-Q6_K
+    type: local
+    provider: turboquant  # non-lmstudio: skips LM Studio load/unload API; OllamaClient still hits /v1/chat/completions
+    endpoint: ${TURBOQUANT_URL:-http://127.0.0.1:7432}
+    context_window: 262144
+    is_coding_optimized: true
+    recommended_for: [coding, code_review, test_generation, planning, research]
+    rate_limit_rpm: 60
+
   - name: qwen3.6-27b
     type: local
     provider: lmstudio   # lmstudio | ollama | llama_cpp
@@ -9,7 +22,7 @@ models:
     recommended_for: [coding, code_review, test_generation, planning, research]
     rate_limit_rpm: 120
 
-  - name: qwen3.6-36b-a3b
+  - name: qwen3.6-35b-a3b
     type: local
     provider: lmstudio   # lmstudio | ollama | llama_cpp
     # Set LM_STUDIO_URL in .env to override; falls back to localhost:1234
@@ -102,20 +115,21 @@ rate_limiting:
   max_backoff_seconds: 60
 
 defaults:
-  coding_model: qwen3.6-27b
-  planning_model: qwen3.6-27b
+  coding_model: Qwen3.6-27B-Q6_K
+  planning_model: Qwen3.6-27B-Q6_K
   fallback_model: openai/gpt-oss-120b:free
 
   # Local model runtime behaviour.
-  # single_model_only: true — unload any other loaded local model before
-  #   loading a new one.  Recommended for machines with limited VRAM.
-  #   Set to false if you have enough VRAM for multiple models.
+  # single_model_only: false — TurboQuantLoader manages its own lifecycle and
+  #   does not implement LM Studio's load/unload API.  Setting true would cause
+  #   404 errors against port 7432.  If switching back to LM Studio as primary,
+  #   set this to true and update coding_model / planning_model above.
   # load_timeout_secs: how long to poll after triggering a load before
   #   giving up and falling back to remote.
   # load_poll_interval_secs: how often to check if the model is loaded.
   # max_load_attempts: how many load+poll cycles before switching to remote.
   local_runtime:
-    single_model_only: true
+    single_model_only: false
     load_timeout_secs: 300
     load_poll_interval_secs: 10
     max_load_attempts: 2
