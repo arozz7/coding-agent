@@ -276,10 +276,13 @@ class PlannerAgent:
             "criteria for the objective. Be concrete and verifiable — a CI system "
             "should be able to check each one automatically or a reviewer should be "
             "able to tick it off in under 10 seconds.\n\n"
-            "Prefer these auto-checkable formats when applicable:\n"
-            '  "command exits 0: <shell command>"  — runs the command, expects exit 0\n'
+            "Prefer these auto-checkable formats in priority order:\n"
             '  "file exists: <relative path>"      — checks path is present\n'
-            '  "file contains: <path>:<substring>" — checks file includes the text\n'
+            '  "file contains: <path>:<substring>" — checks file includes exact text\n'
+            '  "command exits 0: <shell command>"  — runs a BUILD or TEST command (e.g. npm run build, cargo check, python -m pytest). '
+            "Use ONLY for build/test verification, NEVER for checking file contents. "
+            "NEVER use grep, sed, awk, find, cat, ls, or any Unix-only utility in this field — "
+            "they do not exist on Windows and will always fail.\n"
             "For behavioral/visual criteria use plain English.\n\n"
             'Return ONLY valid JSON: {"criteria": ["<criterion 1>", ...]}'
         )
