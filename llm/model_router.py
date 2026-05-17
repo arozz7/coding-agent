@@ -270,6 +270,23 @@ class ModelRouter:
             interval=float(self._local_runtime.get("load_poll_interval_secs", 10)),
         )
 
+    async def _turboquant_is_reachable(self, config: ModelConfig) -> bool:
+        """Return True if TurboQuantLoader TCP socket is accepting connections.
+
+        Any HTTP response (even non-200) counts as reachable — we only want to
+        know whether TQL is running at all, not whether a model is ready.
+        """
+        import httpx
+        url = (config.endpoint or "http://127.0.0.1:7432").rstrip("/")
+        try:
+            async with httpx.AsyncClient(timeout=5.0) as client:
+                await client.get(f"{url}/health")
+                return True
+        except httpx.ConnectError:
+            return False
+        except Exception:
+            return True  # other errors (timeout, non-200) still mean TQL is up
+
     @staticmethod
     def _is_rate_limit_error(exc: Exception) -> bool:
         """Return True if *exc* is a 429 response from a remote API."""
@@ -312,6 +329,17 @@ class ModelRouter:
         max_load_attempts = int(self._local_runtime.get("max_load_attempts", 2))
 
         for attempt in range(max_retries):
+            # Turboquant pre-flight: warn early if TQL is completely unreachable.
+            # TQL handles model switching automatically — we never trigger loads.
+            if config.provider == "turboquant" and attempt == 0:
+                if not await self._turboquant_is_reachable(config):
+                    self.logger.warning(
+                        "turboquant_unreachable",
+                        model=config.name,
+                        endpoint=config.endpoint,
+                        hint="Ensure TurboQuantLoader is running and accessible",
+                    )
+
             try:
                 if config.type == "local":
                     result = await self.ollama.generate(
@@ -351,8 +379,21 @@ class ModelRouter:
                         model=config.name,
                         load_attempt=model_load_attempts,
                     )
-                elif config.provider != "lmstudio" and model_load_attempts <= max_load_attempts:
-                    # Non-LM Studio backend: fall back to blind wait
+                elif config.provider == "turboquant" and model_load_attempts <= max_load_attempts:
+                    # TQL auto-switches models and returns 503 + Retry-After: 10.
+                    # Just wait the indicated time and retry — no manual load needed.
+                    wait_secs = getattr(e, "retry_after", None) or 10
+                    self.logger.info(
+                        "turboquant_switching_waiting",
+                        model=config.name,
+                        wait_secs=wait_secs,
+                        attempt=model_load_attempts,
+                    )
+                    await asyncio.sleep(wait_secs)
+                    attempt = 0  # noqa: PLW2901
+                    continue
+                elif config.provider not in ("lmstudio", "turboquant") and model_load_attempts <= max_load_attempts:
+                    # Other backends (ollama, llama_cpp): blind wait — no programmatic load API.
                     self.logger.warning(
                         "model_not_ready_waiting",
                         model=config.name,
@@ -368,7 +409,7 @@ class ModelRouter:
                 return await self._run_fallback_chain(
                     prompt=prompt,
                     exclude=config.name,
-                    reason="load_timeout" if config.provider == "lmstudio" else "reload_exhausted",
+                    reason="load_timeout" if config.provider in ("lmstudio", "turboquant") else "reload_exhausted",
                     chain=_fallback_chain,
                     max_retries=max_retries,
                     timeout=timeout,

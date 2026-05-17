@@ -35,6 +35,28 @@ def _extract_file_blocks(response: str) -> list[tuple[str, str]]:
     return results
 
 
+def _extract_append_blocks(response: str) -> list[tuple[str, str]]:
+    """Extract (path, content) pairs from APPEND: blocks, handling nested code fences.
+
+    APPEND: blocks are used for fix-round updates where only new sections should
+    be written — the caller reads the existing file and merges rather than
+    requiring the model to regenerate the full document.
+    """
+    results = []
+    parts = re.split(r'(?m)^(?=APPEND:)', response)
+    for part in parts:
+        m = re.match(r'APPEND:\s*(.+?)\n```\w*\n(.*)', part, re.DOTALL)
+        if not m:
+            continue
+        path = m.group(1).strip()
+        inner = m.group(2)
+        last_fence = inner.rfind('\n```')
+        content = inner[:last_fence].strip() if last_fence != -1 else inner.strip().rstrip('`')
+        if path and content:
+            results.append((path, content))
+    return results
+
+
 class DocumenterRole:
     name = "documenter"
 
@@ -48,10 +70,17 @@ class DocumenterRole:
             "- Write usage examples that actually run\n"
             "- Keep changelogs in Keep-a-Changelog format\n"
             "- Never duplicate what the code already says — document intent, not implementation\n\n"
-            "Write files using FILE: blocks:\n"
+            "Write NEW files using FILE: blocks:\n"
             "FILE: path/to/file.md\n"
             "```markdown\n"
             "content\n"
+            "```\n\n"
+            "When asked to ADD sections to an EXISTING file, use APPEND: blocks instead.\n"
+            "Write ONLY the new sections — do not repeat content that already exists.\n"
+            "APPEND: path/to/file.md\n"
+            "```markdown\n"
+            "## New Section\n"
+            "new content only\n"
             "```"
         )
 
@@ -107,6 +136,19 @@ class DocumenterRole:
                     logger.info("documenter_file_written", path=fp)
                 except Exception as e:
                     logger.warning("documenter_file_write_failed", path=fp, error=str(e))
+
+            for path_str, new_content in _extract_append_blocks(response):
+                fp = path_str.strip()
+                try:
+                    existing = await tool_executor.execute("file_read", {"path": fp})
+                    if existing.startswith("Error reading file:"):
+                        existing = ""
+                    combined = (existing.rstrip() + "\n\n" + new_content.strip()) if existing else new_content.strip()
+                    await tool_executor.execute("file_write", {"path": fp, "content": combined})
+                    files_created.append(fp)
+                    logger.info("documenter_file_appended", path=fp, new_bytes=len(new_content))
+                except Exception as e:
+                    logger.warning("documenter_append_failed", path=fp, error=str(e))
 
         summary = f"Documentation written: {', '.join(files_created) or 'inline updates'}."
         return {

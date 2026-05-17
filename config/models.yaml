@@ -5,13 +5,22 @@ models:
   # single_model_only is overridden to false below — TQL manages its own lifecycle.
   - name: Qwen3.6-27B-Q6_K
     type: local
-    provider: turboquant  # non-lmstudio: skips LM Studio load/unload API; OllamaClient still hits /v1/chat/completions
+    provider: turboquant  # TQL auto-switches models; name must match TQL [[models]] registry or models_dir file stem
     endpoint: ${TURBOQUANT_URL:-http://127.0.0.1:7432}
     context_window: 262144
     is_coding_optimized: true
     recommended_for: [coding, code_review, test_generation, planning, research]
     rate_limit_rpm: 60
 
+  - name: Qwen3.6-27B-Q4_K_S
+    type: local
+    provider: turboquant  # TQL auto-switches models; name must match TQL [[models]] registry or models_dir file stem
+    endpoint: ${TURBOQUANT_URL:-http://127.0.0.1:7432}
+    context_window: 262144
+    is_coding_optimized: true
+    recommended_for: [coding, code_review, test_generation, planning, research]
+    rate_limit_rpm: 60
+    
   - name: qwen3.6-27b
     type: local
     provider: lmstudio   # lmstudio | ollama | llama_cpp
@@ -115,8 +124,8 @@ rate_limiting:
   max_backoff_seconds: 60
 
 defaults:
-  coding_model: Qwen3.6-27B-Q6_K
-  planning_model: Qwen3.6-27B-Q6_K
+  coding_model: Qwen3.6-27B-Q4_K_S
+  planning_model: Qwen3.6-27B-Q4_K_S
   fallback_model: openai/gpt-oss-120b:free
 
   # Local model runtime behaviour.

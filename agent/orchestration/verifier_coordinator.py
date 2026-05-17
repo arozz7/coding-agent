@@ -314,31 +314,30 @@ class VerifierCoordinator:
                     ),
                     "agent_type": "research",
                 })
-            existing_content = ""
+            existing_headings = ""
             try:
                 _ws = os.getenv("WORKSPACE_PATH", "./workspace")
                 _ws_base = Path(_ws).resolve()
                 _fp = (_ws_base / file_ref).resolve()
                 if _fp.is_relative_to(_ws_base) and _fp.exists():
-                    existing_content = _fp.read_text(encoding="utf-8", errors="ignore")
+                    raw = _fp.read_text(encoding="utf-8", errors="ignore")
+                    existing_headings = "\n".join(
+                        line for line in raw.splitlines() if line.startswith("#")
+                    )
             except Exception:
                 pass
             gaps_text = "; ".join(gaps[:3])
-            _existing_cap = char_budget(self.model_router, fraction=0.10, cap=60_000)
-            existing_block = (
-                f"\n\n### EXISTING FILE CONTENT — copy this verbatim then add new sections after it:\n"
-                f"```\n{existing_content[:_existing_cap]}\n```"
-                if existing_content else ""
+            headings_block = (
+                f"\n\nExisting sections (do not repeat these):\n{existing_headings[:2000]}"
+                if existing_headings else ""
             )
             specs.append({
                 "description": (
                     f"[Fix round {round_num} — update file] "
-                    f"Extend '{file_ref}' to cover these missing topics: {gaps_text}. "
-                    f"CRITICAL: The existing file content is shown below. "
-                    f"You MUST output EVERY existing section unchanged, then append new sections for the gaps. "
-                    f"Do NOT summarize or shorten existing content. "
-                    f"Write the complete updated file using FILE: blocks."
-                    f"{existing_block}"
+                    f"Add new sections to '{file_ref}' covering these missing topics: {gaps_text}. "
+                    f"Write ONLY the new sections using APPEND: blocks — "
+                    f"do NOT rewrite or repeat any content that already exists."
+                    f"{headings_block}"
                 ),
                 "agent_type": "documenter",
             })

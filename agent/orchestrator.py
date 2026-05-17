@@ -1153,6 +1153,14 @@ class AgentOrchestrator:
             "verifier_score": _final_verifier_score,
         }
 
+    def _detect_task_type_keyword(self, task: str) -> str:
+        """Synchronous keyword-only task classifier — zero latency, no LLM call.
+
+        Used by the background job API to pre-classify a task before the async
+        LLM classifier runs inside run_task(). Delegates to TaskRouter._detect_keyword.
+        """
+        return self.task_router._detect_keyword(task)
+
     async def run_task(
         self,
         task: str,

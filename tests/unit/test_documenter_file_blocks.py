@@ -1,6 +1,6 @@
-"""Tests for _extract_file_blocks — ensures nested code fences (mermaid) are handled."""
+"""Tests for _extract_file_blocks and _extract_append_blocks."""
 import pytest
-from agent.agents.documenter_agent import _extract_file_blocks
+from agent.agents.documenter_agent import _extract_file_blocks, _extract_append_blocks
 
 
 class TestExtractFileBlocks:
@@ -129,3 +129,61 @@ class TestSelectPrimaryFile:
     def test_single_root_file(self):
         from agent.orchestration.verifier_coordinator import _select_primary_file
         assert _select_primary_file(["README.md"]) == "README.md"
+
+
+class TestExtractAppendBlocks:
+    def test_simple_append_block(self):
+        response = "APPEND: docs/guide.md\n```markdown\n## New Section\ncontent here\n```"
+        result = _extract_append_blocks(response)
+        assert len(result) == 1
+        path, content = result[0]
+        assert path == "docs/guide.md"
+        assert "## New Section" in content
+        assert "content here" in content
+
+    def test_nested_fence_inside_append(self):
+        response = (
+            "APPEND: README.md\n"
+            "```markdown\n"
+            "## Examples\n\n"
+            "```python\n"
+            "print('hello')\n"
+            "```\n"
+            "```"
+        )
+        result = _extract_append_blocks(response)
+        assert len(result) == 1
+        _, content = result[0]
+        assert "```python" in content
+        assert "print('hello')" in content
+
+    def test_no_append_blocks_returns_empty(self):
+        response = "FILE: out.md\n```markdown\n# Doc\n```"
+        assert _extract_append_blocks(response) == []
+
+    def test_multiple_append_blocks(self):
+        response = (
+            "APPEND: a.md\n```markdown\n## Section A\nfoo\n```\n\n"
+            "APPEND: b.md\n```markdown\n## Section B\nbar\n```"
+        )
+        result = _extract_append_blocks(response)
+        assert len(result) == 2
+        assert result[0][0] == "a.md"
+        assert result[1][0] == "b.md"
+
+    def test_file_and_append_blocks_dont_interfere(self):
+        response = (
+            "FILE: new.md\n```markdown\n# New File\n```\n\n"
+            "APPEND: existing.md\n```markdown\n## Extra Section\ncontent\n```"
+        )
+        file_blocks = _extract_file_blocks(response)
+        append_blocks = _extract_append_blocks(response)
+        assert len(file_blocks) == 1
+        assert file_blocks[0][0] == "new.md"
+        assert len(append_blocks) == 1
+        assert append_blocks[0][0] == "existing.md"
+
+    def test_content_stripped(self):
+        response = "APPEND: f.md\n```markdown\n\n## Title\n\n```"
+        result = _extract_append_blocks(response)
+        assert result[0][1] == "## Title"

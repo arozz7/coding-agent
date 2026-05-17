@@ -19,5 +19,5 @@ class ModelConfig(BaseModel):
     enable_thinking: Optional[bool] = None
     # Inference backend for local models.  Used to decide whether programmatic
     # load/unload via the LM Studio REST API is available.
-    # Values: "lmstudio" | "ollama" | "llama_cpp"
+    # Values: "lmstudio" | "ollama" | "llama_cpp" | "turboquant"
     provider: str = "lmstudio"

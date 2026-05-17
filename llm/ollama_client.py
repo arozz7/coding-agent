@@ -22,11 +22,16 @@ _MODEL_NOT_READY_HINTS = (
 
 
 class ModelNotReadyError(RuntimeError):
-    """Raised when the local inference server has no model loaded.
+    """Raised when the local inference server has no model loaded or is switching.
 
-    Distinct from generic RuntimeError so callers can apply a longer
-    wait/retry strategy rather than the normal 1-2 s backoff.
+    Distinct from generic RuntimeError so callers can apply the right wait
+    strategy rather than the normal 1-2 s backoff.  ``retry_after`` carries
+    the server's Retry-After hint in seconds when present (e.g. TurboQuantLoader
+    sends Retry-After: 10 during an auto-switch).
     """
+    def __init__(self, msg: str, retry_after: Optional[int] = None):
+        super().__init__(msg)
+        self.retry_after = retry_after
 
 
 class OllamaClient:
@@ -141,10 +146,19 @@ class OllamaClient:
                 status=e.response.status_code,
                 body=body[:500],
             )
-            # Detect model-not-loaded conditions so the caller can apply a
-            # longer retry wait rather than the normal 1-2 s backoff.
+            # 503 always means the backend is temporarily unavailable (model loading
+            # or switching).  Extract Retry-After so callers can wait the right amount.
+            # TurboQuantLoader sends Retry-After: 10 during auto-switch.
+            if e.response.status_code == 503:
+                raw_ra = e.response.headers.get("Retry-After")
+                retry_after = int(raw_ra) if raw_ra and raw_ra.isdigit() else None
+                raise ModelNotReadyError(
+                    f"Model {model!r} not ready (503): {body[:200]}",
+                    retry_after=retry_after,
+                )
+            # For 404/400, check body hints before treating as a load error.
             lower_body = body.lower()
-            if e.response.status_code in (503, 404, 400) and any(
+            if e.response.status_code in (404, 400) and any(
                 hint in lower_body for hint in _MODEL_NOT_READY_HINTS
             ):
                 raise ModelNotReadyError(
