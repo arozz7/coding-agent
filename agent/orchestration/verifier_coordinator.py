@@ -44,6 +44,42 @@ def _select_primary_file(output_files: list[str]) -> str:
     return output_files[0]
 
 
+def _summarize_existing_sections(text: str, max_chars: int = 3000) -> str:
+    """Return a compact map of heading + first 150 chars of each section body.
+
+    This gives the documenter enough context to know what each section already
+    covers without sending the full file, preventing it from generating content
+    that duplicates existing sections under different headings.
+    """
+    lines = text.splitlines()
+    sections: list[str] = []
+    current_heading = ""
+    body_lines: list[str] = []
+
+    def _flush():
+        if not current_heading:
+            return
+        body = " ".join(body_lines).strip()
+        snippet = body[:150].rstrip()
+        if len(body) > 150:
+            snippet += "…"
+        sections.append(f"{current_heading}  →  {snippet}" if snippet else current_heading)
+
+    for line in lines:
+        if line.startswith("#"):
+            _flush()
+            current_heading = line.strip()
+            body_lines = []
+        else:
+            stripped = line.strip()
+            if stripped and not stripped.startswith("|") and len(body_lines) < 4:
+                body_lines.append(stripped)
+    _flush()
+
+    result = "\n".join(sections)
+    return result[:max_chars]
+
+
 class VerifierCoordinator:
     """Runs verification and assembles fix-task specs after failed rounds."""
 
@@ -314,22 +350,20 @@ class VerifierCoordinator:
                     ),
                     "agent_type": "research",
                 })
-            existing_headings = ""
+            existing_coverage = ""
             try:
                 _ws = os.getenv("WORKSPACE_PATH", "./workspace")
                 _ws_base = Path(_ws).resolve()
                 _fp = (_ws_base / file_ref).resolve()
                 if _fp.is_relative_to(_ws_base) and _fp.exists():
                     raw = _fp.read_text(encoding="utf-8", errors="ignore")
-                    existing_headings = "\n".join(
-                        line for line in raw.splitlines() if line.startswith("#")
-                    )
+                    existing_coverage = _summarize_existing_sections(raw, max_chars=3000)
             except Exception:
                 pass
             gaps_text = "; ".join(gaps[:3])
             headings_block = (
-                f"\n\nExisting sections (do not repeat these):\n{existing_headings[:2000]}"
-                if existing_headings else ""
+                f"\n\nExisting file structure (do not repeat any of this):\n{existing_coverage}"
+                if existing_coverage else ""
             )
             specs.append({
                 "description": (

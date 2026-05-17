@@ -110,6 +110,14 @@ class VerifierAgent:
                 gaps.append("Required output files were not created")
 
         files_ok = not any("file" in g.lower() for g in gaps if "Required output" in g)
+
+        # Structural coherence: penalise documents with duplicate headings — a sign
+        # that fix rounds appended content that already existed.
+        dup_penalty = self._duplicate_heading_penalty(response, files_created)
+        if dup_penalty > 0:
+            gaps.insert(0, f"Document contains duplicate sections (structural redundancy detected)")
+            score = max(0, score - dup_penalty)
+
         report = self._format_research_report(coverage, depth, files_ok, score, gaps)
         self.logger.info(
             "verify_research_complete",
@@ -374,6 +382,44 @@ class VerifierAgent:
         except Exception as exc:
             self.logger.warning("verifier_llm_error", error=str(exc))
             return {}
+
+    def _duplicate_heading_penalty(self, response: str, files_created: List[str]) -> int:
+        """Return a score penalty (0-2) if output files contain duplicate H2/H3 headings.
+
+        Reads the primary output file directly so we inspect the actual written
+        content, not just the agent's response excerpt.
+        """
+        import os
+        from pathlib import Path as _Path
+
+        texts_to_check: list[str] = []
+
+        if files_created:
+            _ws = os.getenv("WORKSPACE_PATH", "./workspace")
+            _ws_base = _Path(_ws).resolve()
+            for fp in files_created[:3]:
+                try:
+                    full = (_ws_base / fp).resolve()
+                    if full.is_relative_to(_ws_base) and full.exists() and full.suffix in (".md", ".txt"):
+                        texts_to_check.append(full.read_text(encoding="utf-8", errors="ignore"))
+                except Exception:
+                    pass
+
+        if not texts_to_check:
+            texts_to_check = [response]
+
+        for text in texts_to_check:
+            headings = [
+                ln.strip().lower()
+                for ln in text.splitlines()
+                if re.match(r"^#{2,3}\s", ln)
+            ]
+            if len(headings) != len(set(headings)):
+                dup_count = len(headings) - len(set(headings))
+                self.logger.warning("verifier_duplicate_headings", count=dup_count)
+                return 2
+
+        return 0
 
     def _format_research_report(
         self, coverage: int, depth: int, files_ok: bool, score: int, gaps: List[str]
