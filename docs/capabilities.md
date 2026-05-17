@@ -74,6 +74,12 @@
 - **Explain concepts** and patterns
 - **Current date awareness** — always knows today's date for time-sensitive questions
 
+### Local Model Integration
+
+- **LM Studio** (`provider: lmstudio`) — programmatic load/unload via LM Studio REST API; polls until model ready
+- **TurboQuantLoader** (`provider: turboquant`) — llama-server proxy on a configurable port; supports auto-switch: sending a request with a different `model` name triggers a background hot-swap; the agent respects the `Retry-After` header and retries automatically
+- **Ollama / llama.cpp** (`provider: ollama` / `llama_cpp`) — blind wait and retry when model is not ready
+
 ### Cloud Model Integration
 
 - **OpenRouter** — access 200+ models (GPT, Gemini, LLaMA, Mistral, etc.) via a single key

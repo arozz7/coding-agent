@@ -324,11 +324,16 @@ class ModelRouter:
         # per-model config, then None (let the model decide).
         effective_thinking = enable_thinking if enable_thinking is not None else config.enable_thinking
 
-        # Track how many times we've tried to load this specific model.
+        # Track how many times we've tried to load / wait for this model.
+        # Governed by max_load_attempts (local_runtime), not by max_retries.
         model_load_attempts = 0
-        max_load_attempts = int(self._local_runtime.get("max_load_attempts", 2))
+        max_load_attempts = int(self._local_runtime.get("max_load_attempts", 20))
 
-        for attempt in range(max_retries):
+        # Use a while loop so that model-switching waits (ModelNotReadyError +
+        # continue) do not consume a retry slot.  attempt only increments on
+        # genuine request failures (network errors, bad responses, rate limits).
+        attempt = 0
+        while attempt < max_retries:
             # Turboquant pre-flight: warn early if TQL is completely unreachable.
             # TQL handles model switching automatically — we never trigger loads.
             if config.provider == "turboquant" and attempt == 0:
@@ -371,29 +376,27 @@ class ModelRouter:
                     loaded = await self._try_load_lmstudio_model(config)
                     if loaded:
                         self.logger.info("model_loaded_retrying", model=config.name)
-                        attempt = 0  # noqa: PLW2901 — intentional loop-var reset
-                        continue
-                    # Load triggered but timed out — count as a failed attempt
+                        continue  # don't increment attempt — retry immediately
                     self.logger.warning(
                         "model_load_timeout",
                         model=config.name,
                         load_attempt=model_load_attempts,
                     )
                 elif config.provider == "turboquant" and model_load_attempts <= max_load_attempts:
-                    # TQL auto-switches models and returns 503 + Retry-After: 10.
-                    # Just wait the indicated time and retry — no manual load needed.
+                    # TQL auto-switches models and returns 503 + Retry-After: N.
+                    # Wait the indicated time and retry without burning a retry slot.
                     wait_secs = getattr(e, "retry_after", None) or 10
                     self.logger.info(
                         "turboquant_switching_waiting",
                         model=config.name,
                         wait_secs=wait_secs,
-                        attempt=model_load_attempts,
+                        switch_attempt=model_load_attempts,
+                        max_switch_attempts=max_load_attempts,
                     )
                     await asyncio.sleep(wait_secs)
-                    attempt = 0  # noqa: PLW2901
-                    continue
+                    continue  # don't increment attempt
                 elif config.provider not in ("lmstudio", "turboquant") and model_load_attempts <= max_load_attempts:
-                    # Other backends (ollama, llama_cpp): blind wait — no programmatic load API.
+                    # Other backends (ollama, llama_cpp): blind wait.
                     self.logger.warning(
                         "model_not_ready_waiting",
                         model=config.name,
@@ -402,10 +405,9 @@ class ModelRouter:
                         error=str(e)[:120],
                     )
                     await asyncio.sleep(self._MODEL_RELOAD_WAIT_SECS)
-                    attempt = 0  # noqa: PLW2901
-                    continue
+                    continue  # don't increment attempt
 
-                # Load attempts exhausted — walk the fallback chain.
+                # Load / switch attempts exhausted — walk the fallback chain.
                 return await self._run_fallback_chain(
                     prompt=prompt,
                     exclude=config.name,
@@ -498,7 +500,9 @@ class ModelRouter:
                     raise
                 if attempt == max_retries - 1:
                     raise
-                await asyncio.sleep(2**attempt)
+                await asyncio.sleep(min(2 ** attempt, 30))
+
+            attempt += 1
 
         raise LLMError(f"All {max_retries} retries exhausted")
 
