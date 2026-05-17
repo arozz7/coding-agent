@@ -306,10 +306,16 @@ async def _init_agent_background() -> None:
         logger.info("model_probe_start", model=primary.name)
         ok = await _orchestrator.model_router.ollama.warmup(primary.name)
         if not ok:
+            action = (
+                "Ensure TurboQuantLoader is running and the model is loaded."
+                if primary.provider == "turboquant"
+                else "Open LM Studio and load the model — tasks will block until it is ready."
+            )
             logger.warning(
                 "model_not_ready_at_startup",
                 model=primary.name,
-                action="Open LM Studio and load the model — tasks will block until it is ready.",
+                provider=primary.provider,
+                action=action,
             )
 
 
