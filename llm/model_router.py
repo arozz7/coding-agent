@@ -121,10 +121,13 @@ class ModelRouter:
             if config.type == "local" and config.endpoint:
                 self._configure_ollama_endpoint(config)
 
-        # Honour the defaults.coding_model setting as the initial active model
+        # Honour the defaults.coding_model setting as the initial active model.
+        # Also configure its endpoint immediately — otherwise _configure_ollama_endpoint
+        # leaves base_url pointing at whichever local model was processed last above.
         default_name = self._defaults.get("coding_model")
         if default_name and default_name in self.config_by_name:
             self._active_model_name = default_name
+            self._configure_ollama_endpoint(self.config_by_name[default_name])
 
         self.logger.info(
             "configs_loaded",
@@ -347,6 +350,12 @@ class ModelRouter:
 
             try:
                 if config.type == "local":
+                    # Always configure the endpoint for this specific model before
+                    # calling generate — OllamaClient.base_url is shared state and
+                    # gets clobbered during _load_configs() by whichever local model
+                    # was processed last.  Setting it here ensures each model (and
+                    # every fallback hop) uses its own URL.
+                    self._configure_ollama_endpoint(config)
                     result = await self.ollama.generate(
                         prompt,
                         config.name,
