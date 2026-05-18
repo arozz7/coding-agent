@@ -496,7 +496,10 @@ class AgentOrchestrator:
         _greenfield_file = self._detect_greenfield_file(objective) if task_type == "develop" else None
         if _greenfield_file:
             self.logger.info("greenfield_bypass", file=_greenfield_file, objective=objective[:80])
-            task_specs = [{"description": objective, "agent_type": "develop"}]
+            # Pin the filename in the task description so the develop agent writes to
+            # exactly the file that the completion criterion will check for.
+            _pinned_desc = f"{objective}\n\nSave the output to: {_greenfield_file}"
+            task_specs = [{"description": _pinned_desc, "agent_type": "develop"}]
             completion_criteria = [f"file exists: {_greenfield_file}"]
             _acceptance_criteria = []
         else:

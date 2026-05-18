@@ -127,7 +127,24 @@ class VerifierCoordinator:
                     objective, excerpt, files_created
                 )
             else:
-                if len(combined_response) > 4500:
+                # For code tasks, prefer reading actual files over agent dialogue text.
+                # The dialogue is often shell commands / fix-round noise that confuses
+                # the scoring LLM and produces 0/10 even when the file is valid.
+                _ws = os.getenv("WORKSPACE_PATH", "./workspace")
+                _ws_base = Path(_ws).resolve()
+                _per_file = char_budget(self.model_router, fraction=0.08, cap=16_000)
+                file_excerpts: list[str] = []
+                for fp in files_created[:4]:
+                    try:
+                        full = (_ws_base / fp).resolve()
+                        if full.is_relative_to(_ws_base) and full.exists():
+                            content = full.read_text(encoding="utf-8", errors="ignore")
+                            file_excerpts.append(f"### File: {fp}\n\n{content[:_per_file]}")
+                    except Exception:
+                        pass
+                if file_excerpts:
+                    excerpt = "\n\n".join(file_excerpts)
+                elif len(combined_response) > 4500:
                     excerpt = combined_response[:1000] + "\n[...]\n" + combined_response[-3500:]
                 else:
                     excerpt = combined_response

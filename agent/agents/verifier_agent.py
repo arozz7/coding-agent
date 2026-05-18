@@ -159,8 +159,9 @@ class VerifierAgent:
             "requested in the objective?\n"
             "2. Completeness (0-3): Are edge cases, error handling, and all requested "
             "files/features present?\n"
-            "3. Test results (0-2): 2 if tests pass; 1 if no tests were requested; "
-            "0 if tests exist and are failing or if a web game cannot be served.\n\n"
+            "3. Test results (0-2): 2 if tests pass or if the output is a complete, "
+            "self-contained file (HTML, CSS, script) requiring no build step; "
+            "1 if no tests were requested; 0 if tests exist and are failing.\n\n"
             'Return: {"score": <sum 0-10>, '
             '"gaps": ["<specific missing requirement or defect>", ...], '
             '"feedback": "<one concise sentence>"}\n\n'
