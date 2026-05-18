@@ -286,8 +286,11 @@ class PlannerAgent:
             "should be able to check each one automatically or a reviewer should be "
             "able to tick it off in under 10 seconds.\n\n"
             "Prefer these auto-checkable formats in priority order:\n"
-            '  "file exists: <relative path>"      — checks path is present\n'
-            '  "file contains: <path>:<substring>" — checks file includes exact text\n'
+            '  "file exists: <path>"        — checks path is present. '
+            "Use a glob pattern (e.g. *.html, src/*.js) when the task does NOT specify an exact filename. "
+            "Only use a literal filename (e.g. index.html) when the objective explicitly names that file.\n"
+            '  "file contains: <path>:<substring>" — checks file includes exact text. '
+            "Path may be a glob (e.g. *.html:<canvas) when no exact filename is given.\n"
             '  "command exits 0: <shell command>"  — runs a BUILD or TEST command (e.g. npm run build, cargo check, python -m pytest). '
             "Use ONLY for build/test verification, NEVER for checking file contents. "
             "NEVER use grep, sed, awk, find, cat, ls, or any Unix-only utility in this field — "

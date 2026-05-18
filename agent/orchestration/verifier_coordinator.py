@@ -215,20 +215,35 @@ class VerifierCoordinator:
         # --- auto-check: file exists ---
         if lower.startswith("file exists:"):
             rel = criterion[len("file exists:"):].strip()
-            target = (ws / rel).resolve()
-            ok = target.exists()
-            return CriterionResult(criterion=criterion, passed=ok, detail=f"{'found' if ok else 'missing'}: {rel}")
+            if "*" in rel or "?" in rel:
+                matches = list(ws.glob(rel))
+                ok = len(matches) > 0
+                detail = f"found: {matches[0].name}" if ok else f"no match: {rel}"
+            else:
+                target = (ws / rel).resolve()
+                ok = target.exists()
+                detail = f"{'found' if ok else 'missing'}: {rel}"
+            return CriterionResult(criterion=criterion, passed=ok, detail=detail)
 
         # --- auto-check: file contains ---
         if lower.startswith("file contains:"):
             payload = criterion[len("file contains:"):].strip()
-            if ":" in payload:
-                rel, substring = payload.split(":", 1)
-            else:
+            if ":" not in payload:
                 return CriterionResult(criterion=criterion, passed=False, detail="malformed — expected path:substring")
+            rel, substring = payload.split(":", 1)
+            rel, substring = rel.strip(), substring.strip()
             try:
-                content = (ws / rel.strip()).read_text(encoding="utf-8", errors="ignore")
-                ok = substring.strip() in content
+                if "*" in rel or "?" in rel:
+                    matches = list(ws.glob(rel))
+                    if not matches:
+                        return CriterionResult(criterion=criterion, passed=False, detail=f"no match: {rel}")
+                    for match in matches:
+                        content = match.read_text(encoding="utf-8", errors="ignore")
+                        if substring in content:
+                            return CriterionResult(criterion=criterion, passed=True, detail=f"found: '{substring[:60]}' in {match.name}")
+                    return CriterionResult(criterion=criterion, passed=False, detail=f"not found: '{substring[:60]}' in any {rel}")
+                content = (ws / rel).read_text(encoding="utf-8", errors="ignore")
+                ok = substring in content
                 return CriterionResult(criterion=criterion, passed=ok, detail=f"{'found' if ok else 'not found'}: '{substring[:60]}' in {rel}")
             except Exception as exc:
                 return CriterionResult(criterion=criterion, passed=False, detail=f"read error: {exc}")
