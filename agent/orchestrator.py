@@ -578,6 +578,17 @@ class AgentOrchestrator:
                         _failing = [r for r in crit_results if not r.passed]
                         _passed_count = len(crit_results) - len(_failing)
 
+                        # Split failing criteria: auto-checkable (file/command) vs behavioral
+                        # (LLM-evaluated free-text). Only auto-checkable criteria gate fix
+                        # rounds — behavioral criteria are advisory and cannot be verified
+                        # without a live environment (e.g. "when opened in a browser").
+                        _AUTO_PREFIXES = ("file exists:", "file contains:", "command exits 0:")
+                        _auto_failing = [
+                            r for r in _failing
+                            if any(r.criterion.lower().startswith(p) for p in _AUTO_PREFIXES)
+                        ]
+                        _behavioral_failing = [r for r in _failing if r not in _auto_failing]
+
                         async def _run_final_verifier_jid() -> VerifierResult:
                             nonlocal _final_verifier_score
                             _emit("verifying:final")
@@ -593,9 +604,13 @@ class AgentOrchestrator:
                                     pass
                             return _vr
 
-                        if not _failing:
+                        if not _auto_failing:
                             _vr = await _run_final_verifier_jid()
-                            task_summaries.append(f"✅ **All {len(completion_criteria)} criteria satisfied** — score {_vr.score}/10")
+                            _behavioral_note = (
+                                f" ({len(_behavioral_failing)} behavioral criteria not auto-verifiable)"
+                                if _behavioral_failing else ""
+                            )
+                            task_summaries.append(f"✅ **All auto-checkable criteria satisfied**{_behavioral_note} — score {_vr.score}/10")
                             _build_criteria_done = True
                         elif _criterion_fix_count >= _fix_budget:
                             _vr = await _run_final_verifier_jid()
@@ -605,12 +620,12 @@ class AgentOrchestrator:
                             _build_criteria_done = True
                         else:
                             _target = next(
-                                (r for r in _failing if _criterion_attempts.get(r.criterion, 0) < 3),
+                                (r for r in _auto_failing if _criterion_attempts.get(r.criterion, 0) < 3),
                                 None,
                             )
                             if _target is None:
                                 _vr = await _run_final_verifier_jid()
-                                task_summaries.append(f"🔍 All failing criteria abandoned after 3 attempts — score {_vr.score}/10")
+                                task_summaries.append(f"🔍 All auto-checkable failing criteria abandoned after 3 attempts — score {_vr.score}/10")
                                 _build_criteria_done = True
                             else:
                                 _build_criteria_done = False

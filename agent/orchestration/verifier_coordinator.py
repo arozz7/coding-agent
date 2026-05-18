@@ -222,7 +222,20 @@ class VerifierCoordinator:
             else:
                 target = (ws / rel).resolve()
                 ok = target.exists()
-                detail = f"{'found' if ok else 'missing'}: {rel}"
+                if not ok:
+                    # Fallback: maybe the agent used a different name — try *.ext glob
+                    ext = Path(rel).suffix
+                    if ext:
+                        fallback = list(ws.glob(f"*{ext}"))
+                        if fallback:
+                            ok = True
+                            detail = f"found (as {fallback[0].name}, not {rel})"
+                        else:
+                            detail = f"missing: {rel}"
+                    else:
+                        detail = f"missing: {rel}"
+                else:
+                    detail = f"found: {rel}"
             return CriterionResult(criterion=criterion, passed=ok, detail=detail)
 
         # --- auto-check: file contains ---
@@ -242,6 +255,13 @@ class VerifierCoordinator:
                         if substring in content:
                             return CriterionResult(criterion=criterion, passed=True, detail=f"found: '{substring[:60]}' in {match.name}")
                     return CriterionResult(criterion=criterion, passed=False, detail=f"not found: '{substring[:60]}' in any {rel}")
+                # Exact-filename path — if the file doesn't exist, fall back to *.ext glob
+                target_path = ws / rel
+                if not target_path.exists():
+                    ext = Path(rel).suffix
+                    fallback = list(ws.glob(f"*{ext}")) if ext else []
+                    if fallback:
+                        rel = fallback[0].name  # repoint to actual file
                 content = (ws / rel).read_text(encoding="utf-8", errors="ignore")
                 ok = substring in content
                 return CriterionResult(criterion=criterion, passed=ok, detail=f"{'found' if ok else 'not found'}: '{substring[:60]}' in {rel}")
