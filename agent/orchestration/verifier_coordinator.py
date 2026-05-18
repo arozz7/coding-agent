@@ -36,6 +36,28 @@ class CriterionResult:
 logger = structlog.get_logger()
 
 
+# Directories that should never be searched for deliverable files.
+_EXCLUDE_DIRS = frozenset({
+    "node_modules", ".git", ".venv", "venv", "__pycache__",
+    "vendor", "target", "dist", "build", ".next", ".nuxt",
+})
+
+
+def _glob_filtered(ws: Path, pattern: str) -> list[Path]:
+    """Glob `pattern` relative to `ws`, excluding dependency/build directories.
+
+    Results are sorted by path depth (shallowest first) so that project-root
+    files are preferred over deeply nested ones in subdirectories.
+    """
+    matches = [
+        p for p in ws.glob(pattern)
+        if not any(part in _EXCLUDE_DIRS for part in p.parts)
+        and p.is_file()
+    ]
+    matches.sort(key=lambda p: len(p.parts))
+    return matches
+
+
 def _select_primary_file(output_files: list[str]) -> str:
     """Prefer root-level files over subdirectory files; fall back to first."""
     for f in output_files:
@@ -216,22 +238,19 @@ class VerifierCoordinator:
         if lower.startswith("file exists:"):
             rel = criterion[len("file exists:"):].strip()
             if "*" in rel or "?" in rel:
-                matches = list(ws.glob(rel))
+                matches = _glob_filtered(ws, rel)
                 ok = len(matches) > 0
-                detail = f"found: {matches[0].name}" if ok else f"no match: {rel}"
+                detail = f"found: {matches[0].relative_to(ws)}" if ok else f"no match: {rel}"
             else:
                 target = (ws / rel).resolve()
                 ok = target.exists()
                 if not ok:
-                    # Fallback: maybe the agent used a different name — try *.ext glob
+                    # Fallback: agent may have used a different name — search recursively by ext
                     ext = Path(rel).suffix
-                    if ext:
-                        fallback = list(ws.glob(f"*{ext}"))
-                        if fallback:
-                            ok = True
-                            detail = f"found (as {fallback[0].name}, not {rel})"
-                        else:
-                            detail = f"missing: {rel}"
+                    fallback = _glob_filtered(ws, f"**/*{ext}") if ext else []
+                    if fallback:
+                        ok = True
+                        detail = f"found (as {fallback[0].relative_to(ws)}, not {rel})"
                     else:
                         detail = f"missing: {rel}"
                 else:
@@ -247,24 +266,28 @@ class VerifierCoordinator:
             rel, substring = rel.strip(), substring.strip()
             try:
                 if "*" in rel or "?" in rel:
-                    matches = list(ws.glob(rel))
+                    matches = _glob_filtered(ws, rel)
+                    if not matches:
+                        # Try recursive variant if no match at root level
+                        if not rel.startswith("**"):
+                            matches = _glob_filtered(ws, f"**/{rel.lstrip('/')}")
                     if not matches:
                         return CriterionResult(criterion=criterion, passed=False, detail=f"no match: {rel}")
                     for match in matches:
                         content = match.read_text(encoding="utf-8", errors="ignore")
                         if substring in content:
-                            return CriterionResult(criterion=criterion, passed=True, detail=f"found: '{substring[:60]}' in {match.name}")
+                            return CriterionResult(criterion=criterion, passed=True, detail=f"found: '{substring[:60]}' in {match.relative_to(ws)}")
                     return CriterionResult(criterion=criterion, passed=False, detail=f"not found: '{substring[:60]}' in any {rel}")
-                # Exact-filename path — if the file doesn't exist, fall back to *.ext glob
+                # Exact-filename path — if absent, fall back to recursive *.ext search
                 target_path = ws / rel
                 if not target_path.exists():
                     ext = Path(rel).suffix
-                    fallback = list(ws.glob(f"*{ext}")) if ext else []
+                    fallback = _glob_filtered(ws, f"**/*{ext}") if ext else []
                     if fallback:
-                        rel = fallback[0].name  # repoint to actual file
-                content = (ws / rel).read_text(encoding="utf-8", errors="ignore")
+                        target_path = fallback[0]
+                content = target_path.read_text(encoding="utf-8", errors="ignore")
                 ok = substring in content
-                return CriterionResult(criterion=criterion, passed=ok, detail=f"{'found' if ok else 'not found'}: '{substring[:60]}' in {rel}")
+                return CriterionResult(criterion=criterion, passed=ok, detail=f"{'found' if ok else 'not found'}: '{substring[:60]}' in {target_path.relative_to(ws)}")
             except Exception as exc:
                 return CriterionResult(criterion=criterion, passed=False, detail=f"read error: {exc}")
 
