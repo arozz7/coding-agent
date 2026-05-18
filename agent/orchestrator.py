@@ -490,29 +490,16 @@ class AgentOrchestrator:
         # 1. Plan — build compact planning context then generate tasks + criteria
         _emit("planning:tasks")
         _ws_path = Path(getattr(self.tool_executor, "workspace_path", ".") if self.tool_executor else ".")
-
-        # Greenfield single-file bypass: skip multi-step decomposition entirely.
-        # A 6-step "fix existing project" plan is wrong for "write a single HTML file".
-        _greenfield_file = self._detect_greenfield_file(objective) if task_type == "develop" else None
-        if _greenfield_file:
-            self.logger.info("greenfield_bypass", file=_greenfield_file, objective=objective[:80])
-            # Pin the filename in the task description so the develop agent writes to
-            # exactly the file that the completion criterion will check for.
-            _pinned_desc = f"{objective}\n\nSave the output to: {_greenfield_file}"
-            task_specs = [{"description": _pinned_desc, "agent_type": "develop"}]
-            completion_criteria = [f"file exists: {_greenfield_file}"]
-            _acceptance_criteria = []
-        else:
-            planning_ctx = await self.context_builder.build_planning_context(objective)
-            plan_result = await self.planner_agent.plan_with_criteria(
-                objective,
-                context=planning_ctx,
-                task_type=task_type,
-                workspace=_ws_path,
-            )
-            task_specs = list(plan_result.tasks)
-            completion_criteria = plan_result.completion_criteria
-            _acceptance_criteria = plan_result.acceptance_criteria
+        planning_ctx = await self.context_builder.build_planning_context(objective)
+        plan_result = await self.planner_agent.plan_with_criteria(
+            objective,
+            context=planning_ctx,
+            task_type=task_type,
+            workspace=_ws_path,
+        )
+        task_specs = list(plan_result.tasks)
+        completion_criteria = plan_result.completion_criteria
+        _acceptance_criteria = plan_result.acceptance_criteria
 
         # 1b. Review and improve the plan before executing (plan-review-plan loop).
         # Only runs for develop/sdlc tasks with ≥3 steps — skips trivial plans.
@@ -608,15 +595,7 @@ class AgentOrchestrator:
 
                         if not _failing:
                             _vr = await _run_final_verifier_jid()
-                            # Greenfield single-file tasks: a quantized local model cannot
-                            # reliably read complex canvas JS / CSS and score it fairly.
-                            # The automated file-exists check already confirmed the output.
-                            # Floor at 6 so a valid file doesn't report as "failed".
-                            _display_score = _vr.score
-                            if _greenfield_file and _display_score < 6:
-                                _display_score = 6
-                                _final_verifier_score = 6
-                            task_summaries.append(f"✅ **All {len(completion_criteria)} criteria satisfied** — score {_display_score}/10")
+                            task_summaries.append(f"✅ **All {len(completion_criteria)} criteria satisfied** — score {_vr.score}/10")
                             _build_criteria_done = True
                         elif _criterion_fix_count >= _fix_budget:
                             _vr = await _run_final_verifier_jid()
@@ -1173,48 +1152,6 @@ class AgentOrchestrator:
             "job_summary": job_summary,
             "verifier_score": _final_verifier_score,
         }
-
-    @staticmethod
-    def _detect_greenfield_file(objective: str) -> str | None:
-        """Return the target filename if the objective is a simple single-file write.
-
-        Matches patterns like:
-          "write a single HTML file called index.html"
-          "create a single-page app in one HTML file"
-          "make a single file called app.js"
-
-        Returns the detected filename (or a generic placeholder) so the caller
-        can build a minimal `file exists:` criterion.  Returns None when the
-        objective is not a simple greenfield write.
-        """
-        import re as _re
-        lower = objective.lower()
-
-        # Must mention "single" + a file-ish noun
-        if not _re.search(r'\bsingle\b', lower):
-            return None
-        if not _re.search(r'\b(file|page|html|script|component)\b', lower):
-            return None
-        # Must NOT reference an existing project context
-        if _re.search(r'\b(fix|debug|existing|project|repo|app\s+that|error|crash|bug)\b', lower):
-            return None
-
-        # Try to extract an explicit filename
-        m = _re.search(r'(?:called|named|file\s+(?:called|named)?)\s+([\w\-./]+\.\w+)', lower)
-        if m:
-            return m.group(1)
-
-        # Infer from extension keywords
-        if _re.search(r'\bhtml\b', lower):
-            return "index.html"
-        if _re.search(r'\b(js|javascript)\b', lower):
-            return "index.js"
-        if _re.search(r'\b(css)\b', lower):
-            return "style.css"
-        if _re.search(r'\b(py|python)\b', lower):
-            return "main.py"
-
-        return "output_file"
 
     def _detect_task_type_keyword(self, task: str) -> str:
         """Synchronous keyword-only task classifier — zero latency, no LLM call.

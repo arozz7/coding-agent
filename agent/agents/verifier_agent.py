@@ -133,6 +133,22 @@ class VerifierAgent:
             task_type="research",
         )
 
+    # Extensions that indicate a self-contained static deliverable requiring no build/test step.
+    _STATIC_EXTENSIONS = frozenset({".html", ".css", ".svg", ".xml", ".json", ".md", ".txt"})
+
+    @staticmethod
+    def _is_static_deliverable(files_created: List[str], test_output: str) -> bool:
+        """Return True when output is static files with no applicable test runner."""
+        if not files_created:
+            return False
+        from pathlib import Path as _P
+        all_static = all(
+            _P(f).suffix.lower() in VerifierAgent._STATIC_EXTENSIONS
+            for f in files_created
+        )
+        no_tests_ran = not test_output or test_output.startswith("(")
+        return all_static and no_tests_ran
+
     async def verify_code(
         self,
         objective: str,
@@ -147,26 +163,44 @@ class VerifierAgent:
             "You are a strict code reviewer. Focus on correctness and completeness. "
             "Do not accept partial implementations as sufficient."
         )
-        prompt = (
-            f"Original objective:\n{objective}\n\n"
-            f"Agent response (excerpt):\n{response[:3000]}\n\n"
-            f"Files created: {files_created if files_created else ['(none)']}\n\n"
-            f"Test execution output:\n{test_output}\n\n"
-            "Note: 'Test results' scores 0 if any source files are truncated/incomplete "
-            "(e.g. missing </html>, file ending mid-function, or unbalanced braces).\n\n"
-            "Evaluate on these three dimensions and return ONLY valid JSON:\n\n"
-            "1. Requirement fulfilment (0-5): Does the implementation address EVERYTHING "
-            "requested in the objective?\n"
-            "2. Completeness (0-3): Are edge cases, error handling, and all requested "
-            "files/features present?\n"
-            "3. Test results (0-2): 2 if tests pass or if the output is a complete, "
-            "self-contained file (HTML, CSS, script) requiring no build step; "
-            "1 if no tests were requested; 0 if tests exist and are failing.\n\n"
-            'Return: {"score": <sum 0-10>, '
-            '"gaps": ["<specific missing requirement or defect>", ...], '
-            '"feedback": "<one concise sentence>"}\n\n'
-            f"Score >= {PASS_THRESHOLD} is a PASS."
-        )
+
+        if self._is_static_deliverable(files_created, test_output):
+            # Static deliverable (HTML, CSS, SVG, etc.) — no test runner applies.
+            # Use a 2-dimension rubric so missing tests don't distort the score.
+            prompt = (
+                f"Original objective:\n{objective}\n\n"
+                f"Deliverable content:\n{response[:4000]}\n\n"
+                f"Files created: {files_created}\n\n"
+                "Evaluate on these two dimensions and return ONLY valid JSON:\n\n"
+                "1. Requirement fulfilment (0-7): Does the content address EVERYTHING "
+                "requested in the objective? Score 7 only if every named feature/behaviour "
+                "is present. Deduct for each missing or incorrect requirement.\n"
+                "2. Completeness (0-3): Is the file syntactically complete and non-truncated? "
+                "Score 3 if the file has a proper closing tag/brace and no mid-sentence cuts; "
+                "0 if obviously truncated.\n\n"
+                'Return: {"score": <sum 0-10>, '
+                '"gaps": ["<specific missing requirement or defect>", ...], '
+                '"feedback": "<one concise sentence>"}\n\n'
+                f"Score >= {PASS_THRESHOLD} is a PASS."
+            )
+        else:
+            prompt = (
+                f"Original objective:\n{objective}\n\n"
+                f"Agent response (excerpt):\n{response[:3000]}\n\n"
+                f"Files created: {files_created if files_created else ['(none)']}\n\n"
+                f"Test execution output:\n{test_output}\n\n"
+                "Evaluate on these three dimensions and return ONLY valid JSON:\n\n"
+                "1. Requirement fulfilment (0-5): Does the implementation address EVERYTHING "
+                "requested in the objective?\n"
+                "2. Completeness (0-3): Are edge cases, error handling, and all requested "
+                "files/features present?\n"
+                "3. Test results (0-2): 2 if tests pass; 1 if no tests were requested; "
+                "0 if tests exist and are failing.\n\n"
+                'Return: {"score": <sum 0-10>, '
+                '"gaps": ["<specific missing requirement or defect>", ...], '
+                '"feedback": "<one concise sentence>"}\n\n'
+                f"Score >= {PASS_THRESHOLD} is a PASS."
+            )
         raw = await self._call_llm(system, prompt)
         score = max(0, min(10, int(raw.get("score", 5))))
         gaps = [str(g) for g in raw.get("gaps", []) if g]

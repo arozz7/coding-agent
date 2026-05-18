@@ -231,13 +231,22 @@ class PlannerAgent:
             )
         if task_type in ("sdlc", "develop"):
             return (
-                "Strategy for development/debugging objectives:\n"
-                "1. A 'mapper' task to map the project structure (produces ARCHITECTURE.md + STACK.md). Skip if ARCHITECTURE.md already exists.\n"
-                "2. A 'research' task to read key source files identified by the mapper. No code changes.\n"
-                "3. A 'develop' task to run the project entry command (npm start / python app.py / cargo run). Capture the full error output. Do NOT fix anything — only run and report.\n"
-                "4. A 'develop' task to apply all code fixes using REPLACE: blocks (preferred) or EDIT: blocks. Fix every error identified in step 3.\n"
-                "5. A 'develop' task to run the build command (npm run build / tsc / cargo build) to compile and verify there are no remaining type or compile errors. Fix any found.\n"
-                "6. A 'develop' task to run the project entry command again to confirm it starts cleanly. Report success or list any remaining errors.\n"
+                "Choose the strategy that matches the objective — do NOT default to the longest one:\n\n"
+                "CREATION — objective uses words like create/write/build/generate/make and describes "
+                "producing new file(s) with no mention of existing errors or an existing project:\n"
+                "  → 1 task: [develop] Write the complete output directly. "
+                "No mapper, no research, no runtime step. Just create.\n\n"
+                "DEBUGGING — objective uses words like fix/debug/error/crash/broken/failing/not working:\n"
+                "  1. [mapper]  Map the project structure (skip if ARCHITECTURE.md already exists).\n"
+                "  2. [research] Read the source files identified by the mapper.\n"
+                "  3. [develop] Run the entry command. Capture full error output. Do NOT fix yet.\n"
+                "  4. [develop] Apply all fixes.\n"
+                "  5. [develop] Run again to confirm the fix.\n\n"
+                "MODIFICATION — objective uses words like add/extend/update/refactor/improve and "
+                "references existing code:\n"
+                "  1. [research] Read the relevant source files.\n"
+                "  2. [develop] Implement the change.\n"
+                "  3. [develop] Run or test to verify.\n"
             )
         return ""
 
