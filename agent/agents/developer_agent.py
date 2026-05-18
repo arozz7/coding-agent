@@ -224,7 +224,14 @@ Code quality rules (apply to all code you write):
 - Early returns: guard at the top, never nest more than 2 levels deep
 - Named constants: UPPER_CASE for magic numbers/strings (MAX_RETRIES = 3, not if count > 3)
 - One responsibility per function; keep functions under 50 lines
-- No comments that restate the code — only comment the WHY when non-obvious"""
+- No comments that restate the code — only comment the WHY when non-obvious
+
+Canvas/animation rules (apply when writing HTML5 canvas animations):
+- "Moving forward" means background/scenery scrolls LEFT (x decreases each frame, wraps at 0)
+- "Moving backward" means background scrolls RIGHT — only use this when explicitly requested
+- Parallax: far layers scroll slower (small dx), near layers faster (large dx) — never reverse this
+- requestAnimationFrame loop must clear the canvas before each redraw
+- deltaTime = (timestamp - lastTime) / 1000 — use for frame-rate-independent animation"""
 
     async def _run_shell_blocks(
         self, response: str, tool_executor
