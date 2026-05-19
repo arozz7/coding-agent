@@ -295,9 +295,9 @@ class VerifierCoordinator:
         return await self._llm_eval_criterion(criterion, combined_response)
 
     async def _llm_eval_criterion(self, criterion: str, combined_response: str) -> CriterionResult:
-        """Use the LLM to evaluate a behavioral/visual criterion."""
+        """Use a free evaluator model to judge a behavioral/visual criterion."""
         try:
-            model = self.model_router.get_model("coding")
+            model = await self.model_router.get_evaluator_model()
             system = "You are a strict pass/fail evaluator. Answer only with valid JSON."
             excerpt = combined_response[:2000] if combined_response else "(no response available)"
             prompt = (

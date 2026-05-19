@@ -1,8 +1,9 @@
 import os
 import re
+import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from typing import Optional, List, AsyncIterator, Callable
+from typing import Optional, List, AsyncIterator, Callable, Tuple
 from pathlib import Path
 import yaml
 import structlog
@@ -49,6 +50,10 @@ class ModelRouter:
         }
         # Registered callbacks, fired on every model switch (local→fallback).
         self._switch_callbacks: list[Callable[[ModelSwitchEvent], None]] = []
+        # Cache for the dynamically-resolved free evaluator model.
+        # Tuple of (ModelConfig, monotonic timestamp); refreshed every _EVALUATOR_CACHE_TTL seconds.
+        self._evaluator_cache: Optional[Tuple[ModelConfig, float]] = None
+        self._EVALUATOR_CACHE_TTL: float = 3600.0
         self._load_configs(config_path)
 
     def _configure_ollama_endpoint(self, config: ModelConfig) -> None:
@@ -300,6 +305,80 @@ class ModelRouter:
     # that don't support programmatic load.  A 35B model can take 3–8 min to
     # load, so we give 120 s between blind retries.
     _MODEL_RELOAD_WAIT_SECS = 120
+
+    # Families known to follow instructions well enough for structured JSON eval.
+    _EVAL_PREFERRED = ("gemma", "qwen", "llama", "mistral", "phi", "deepseek", "magistral")
+
+    @staticmethod
+    def _score_free_model(entry: dict) -> int:
+        mid = entry.get("id", "").lower()
+        ctx = int(entry.get("context_length") or 0)
+        score = ctx
+        if any(f in mid for f in ModelRouter._EVAL_PREFERRED):
+            score += 1_000_000
+        return score
+
+    async def get_evaluator_model(self) -> ModelConfig:
+        """Return a free OpenRouter model suitable for lightweight pass/fail evaluation.
+
+        Fetches GET /v1/models from OpenRouter, filters for zero-cost models, picks the
+        best candidate by context window + family preference, and caches the result for
+        one hour.  Falls back to the static 'openrouter/free' config entry on any error.
+        """
+        now = time.monotonic()
+        if self._evaluator_cache is not None:
+            cached_config, cached_at = self._evaluator_cache
+            if now - cached_at < self._EVALUATOR_CACHE_TTL:
+                return cached_config
+
+        api_key = os.environ.get("OPENROUTER_API_KEY", "")
+        fallback = self.get_config("openrouter/free") or self.get_model("coding")
+
+        if not api_key:
+            self.logger.warning("evaluator_no_api_key", hint="Set OPENROUTER_API_KEY to enable dynamic free-model selection")
+            return fallback
+
+        try:
+            import httpx
+            async with httpx.AsyncClient(timeout=10.0) as client:
+                resp = await client.get(
+                    "https://openrouter.ai/api/v1/models",
+                    headers={"Authorization": f"Bearer {api_key}"},
+                )
+                resp.raise_for_status()
+                models = resp.json().get("data", [])
+
+            free = [
+                m for m in models
+                if str(m.get("pricing", {}).get("prompt", "1")) == "0"
+                and str(m.get("pricing", {}).get("completion", "1")) == "0"
+                and int(m.get("context_length") or 0) >= 8192
+            ]
+
+            if not free:
+                self.logger.warning("evaluator_no_free_models_found", fallback=fallback.name)
+                return fallback
+
+            best = max(free, key=self._score_free_model)
+            config = ModelConfig(
+                name=best["id"],
+                type="remote",
+                endpoint="https://openrouter.ai/api/v1",
+                api_key=api_key,
+                context_window=int(best.get("context_length") or 32000),
+                rate_limit_rpm=20,
+                recommended_for=["evaluation"],
+                enable_thinking=False,
+                provider="openrouter",
+            )
+            self.rate_limiter.configure(config.name, config.rate_limit_rpm)
+            self._evaluator_cache = (config, now)
+            self.logger.info("evaluator_model_selected", model=config.name, context=config.context_window)
+            return config
+
+        except Exception as exc:
+            self.logger.warning("evaluator_model_fetch_failed", error=str(exc), fallback=fallback.name)
+            return fallback
 
     async def generate(
         self,
