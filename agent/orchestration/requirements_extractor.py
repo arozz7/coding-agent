@@ -51,21 +51,37 @@ class RequirementsExtractor:
 
         system = (
             "You are a strict QA engineer. Given an objective and optional project docs, "
-            "produce 3–7 concrete behavioral acceptance criteria for the RUNNING application. "
-            "Criteria must be observable from a screenshot or terminal output — not just "
-            "'code compiles'. Prefer:\n"
-            '  "command exits 0: <shell command>" for CLI checks\n'
-            '  "file exists: <relative path>" ONLY when the objective explicitly names that file\n'
-            "  plain English for visual/behavioral checks (e.g. 'the canvas shows a moving car')\n\n"
-            "IMPORTANT: Do NOT generate 'file exists' criteria based on naming conventions "
-            "(e.g. do not require index.html unless the objective says to create index.html). "
-            "Focus on what the running app DOES, not what files exist.\n\n"
+            "produce 3–7 acceptance criteria that a separate evaluator model can judge as "
+            "pass or fail from the agent's output, terminal logs, or a screenshot alone.\n\n"
+            "STRUCTURE — every criterion must have three parts:\n"
+            "  1. One measurable end state (what is true when done)\n"
+            "  2. A stated check (how to prove it — the exact command, file path, or visible evidence)\n"
+            "  3. A constraint if relevant (what must NOT change on the way there)\n\n"
+            "FORMATS — pick the most specific one that applies:\n"
+            '  "command exits 0: <exact shell command>" — for any CLI-verifiable outcome\n'
+            '  "file exists: <relative/path>" — ONLY when the objective explicitly names that file\n'
+            '  "file contains: <relative/path> | <substring>" — for generated content checks\n'
+            '  "visual: <precise description of what must be visible in a screenshot or DOM>" '
+            "— for UI checks; be specific enough that a model can give yes/no from one image\n\n"
+            "RULES:\n"
+            "  - Do NOT write vague criteria like 'the app works' or 'no errors'.\n"
+            "  - Do NOT generate 'file exists' from naming conventions — only from the objective.\n"
+            "  - Each criterion must be falsifiable: there must be a concrete observation that "
+            "would make it fail.\n"
+            "  - If the objective has no server/process, omit 'command exits 0' criteria that "
+            "require a running process.\n\n"
+            "EXAMPLES of good criteria:\n"
+            '  "command exits 0: python -m pytest tests/ -q"\n'
+            '  "visual: canvas element is present and shows a car shape moving rightward across '
+            'the frame; background hills scroll leftward"\n'
+            '  "file contains: src/index.html | <canvas id=\\"gameCanvas\\">" — must not remove '
+            'existing canvas element\n\n'
             "Return ONLY a JSON array of strings. No prose, no markdown fences."
         )
         prompt = (
             f"Objective: {objective}\n\n"
             f"{doc_context}\n\n"
-            "Generate 3–7 behavioral acceptance criteria for the running app."
+            "Generate 3–7 acceptance criteria following the structure above."
         )
 
         try:
