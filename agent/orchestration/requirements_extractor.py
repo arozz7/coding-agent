@@ -55,8 +55,11 @@ class RequirementsExtractor:
             "Criteria must be observable from a screenshot or terminal output — not just "
             "'code compiles'. Prefer:\n"
             '  "command exits 0: <shell command>" for CLI checks\n'
-            '  "file exists: <relative path>" for artifact checks\n'
-            "  plain English for visual/behavioral checks\n\n"
+            '  "file exists: <relative path>" ONLY when the objective explicitly names that file\n'
+            "  plain English for visual/behavioral checks (e.g. 'the canvas shows a moving car')\n\n"
+            "IMPORTANT: Do NOT generate 'file exists' criteria based on naming conventions "
+            "(e.g. do not require index.html unless the objective says to create index.html). "
+            "Focus on what the running app DOES, not what files exist.\n\n"
             "Return ONLY a JSON array of strings. No prose, no markdown fences."
         )
         prompt = (

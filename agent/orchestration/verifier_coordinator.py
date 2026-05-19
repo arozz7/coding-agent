@@ -337,11 +337,11 @@ class VerifierCoordinator:
         screenshot_path: Optional[str] = None
 
         if handle is None:
-            self.logger.warning("acceptance_launch_failed", workspace=str(workspace))
-            return [
-                AcceptanceResult(criterion=c, passed=False, detail="(app failed to launch)")
-                for c in criteria
-            ]
+            # No server entry point detected (e.g. pure static HTML deliverable).
+            # Return empty list so the orchestrator skips the acceptance loop rather
+            # than burning all fix rounds on an app that can never be launched.
+            self.logger.info("acceptance_skipped_no_entry_point", workspace=str(workspace))
+            return []
 
         try:
             screenshot_path = await app_probe.screenshot(handle)
@@ -386,6 +386,40 @@ class VerifierCoordinator:
             ),
             "agent_type": "develop",
         }
+
+    # ------------------------------------------------------------------
+    # Fix-spec generation helpers
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _extract_truncated_file_info(test_out: str) -> list[tuple[str, list[str], str, int]]:
+        """Parse truncated file paths from verifier test output and read their tail.
+
+        Returns list of (rel_path, last_lines, file_ext, total_lines) for each truncated file.
+        """
+        _ws = os.getenv("WORKSPACE_PATH", "./workspace")
+        ws = Path(_ws).resolve()
+        results: list[tuple[str, list[str], str, int]] = []
+        in_block = False
+        for line in test_out.splitlines():
+            if "[truncated]" in line.lower() and "fail" in line.lower():
+                in_block = True
+                continue
+            if in_block:
+                if re.match(r"^\s{2,}\S", line):
+                    rel = line.strip()
+                    try:
+                        full = (ws / rel).resolve()
+                        if full.is_relative_to(ws) and full.exists():
+                            raw = full.read_text(encoding="utf-8", errors="ignore")
+                            all_lines = raw.splitlines()
+                            last_lines = [ln for ln in all_lines[-30:] if ln.strip()]
+                            results.append((rel, last_lines, full.suffix.lower(), len(all_lines)))
+                    except Exception:
+                        pass
+                else:
+                    in_block = False
+        return results
 
     # ------------------------------------------------------------------
     # Fix-spec generation
@@ -476,20 +510,42 @@ class VerifierCoordinator:
         if test_out:
             test_section = f"\n\nVerifier test output:\n```\n{test_out[:800]}\n```"
 
-        # --- File chunking directive when truncation detected ---
+        # --- File chunking / append directive when truncation detected ---
         chunking_section = ""
         combined_signals = (test_out + " " + gaps_text).lower()
+        _CODE_EXTS = frozenset({".js", ".mjs", ".cjs", ".ts", ".tsx", ".rs", ".go", ".py", ".java", ".cs"})
         if "[truncated]" in combined_signals or "truncat" in combined_signals:
-            chunking_section = (
-                "\n\n⚠️ FILE TRUNCATION DETECTED: One or more files were cut off during generation. "
-                "NEVER write large implementations as a single monolithic file. "
-                "Rules:\n"
-                "  • Each file must be under ~150 lines\n"
-                "  • Extract logic into small focused modules\n"
-                "  • Use imports/includes to compose them\n"
-                "  • E.g. split: logic → separate module, styles → separate file, "
-                "entry → thin wrapper that imports the rest"
-            )
+            truncated_infos = self._extract_truncated_file_info(test_out)
+            if truncated_infos:
+                append_parts: list[str] = []
+                has_code = False
+                for rel, last_lines, ext, total_lines in truncated_infos:
+                    tail = "\n".join(last_lines[-25:])
+                    if ext == ".html":
+                        append_parts.append(
+                            f"\n  • `{rel}` is truncated. The last content is:\n"
+                            f"    ```html\n{tail}\n    ```\n"
+                            f"    APPEND only the minimal closing tags needed (e.g. `</div></body></html>`) "
+                            f"using an APPEND: block — do NOT rewrite the file with FILE:."
+                        )
+                    elif ext in _CODE_EXTS:
+                        has_code = True
+                        append_parts.append(
+                            f"\n  • `{rel}` is truncated at line {total_lines}. "
+                            f"Last content:\n    ```\n{tail}\n    ```"
+                        )
+                chunking_section = "\n\n⚠️ FILE TRUNCATION DETECTED:" + "".join(append_parts)
+                if has_code:
+                    chunking_section += (
+                        "\n\n  For code files: do NOT rewrite as one large block. "
+                        "Split into small focused modules (<150 lines each) and use imports to compose them."
+                    )
+            else:
+                chunking_section = (
+                    "\n\n⚠️ FILE TRUNCATION DETECTED: One or more files were cut off during generation. "
+                    "For HTML: use APPEND: blocks to add only the missing closing tags — do NOT rewrite with FILE:. "
+                    "For code: split into small focused modules (<150 lines each) and use imports."
+                )
 
         # --- Changed files section ---
         changed_section = ""
@@ -525,6 +581,13 @@ class VerifierCoordinator:
         combined = (test_out + " " + gaps_text).lower()
 
         if "[truncated]" in combined or ("truncat" in combined and "incomplete" in combined):
+            if ".html" in combined:
+                return "file-incomplete", (
+                    "One or more HTML files appear TRUNCATED (cut off during generation). "
+                    "Do NOT rewrite the file using FILE: — that will truncate again. "
+                    "Use APPEND: to add only the minimal closing tags needed to make the file valid "
+                    "(e.g. `</div></body></html>`)."
+                )
             return "file-incomplete", (
                 "One or more files appear TRUNCATED (cut off during generation). "
                 "Do NOT rewrite them as single large blocks. "

@@ -53,6 +53,17 @@ _REPLACE_BLOCK_RE = re.compile(
 
 MAX_FIX_ITERATIONS = int(os.getenv("MAX_FIX_ITERATIONS", "50"))
 
+# APPEND: block — appends content to the END of an existing file without overwriting.
+#
+#   APPEND: path/to/file.ext
+#   ```language
+#   content to add at the end
+#   ```
+_APPEND_BLOCK_RE = re.compile(
+    r'APPEND:\s*(.+?)\n```\w*\n(.*?)```',
+    re.DOTALL,
+)
+
 # SKILL: block — agent-proposed reusable fix recipe (saved to .agent-wiki/skills/)
 _SKILL_BLOCK_RE = re.compile(
     r"SKILL:\s*(?P<title>[^\n]+)\n(?P<body>.*?)(?=\nSKILL:|\nFILE:|\nEDIT:|\nREPLACE:|\Z)",
@@ -176,6 +187,7 @@ editing code, and writing new files.
 Available tools:
 - bash: Execute bash commands
 - write: Create or overwrite an entire file (use FILE: format)
+- append: Add content to the END of an existing file without touching earlier content (use APPEND: format)
 - edit: Make surgical edits to specific regions of a file (use EDIT: format)
 - find_files: Find files by glob pattern (preferred over shell find)
 - grep_code: Search file contents by regex (preferred over shell grep)
@@ -190,6 +202,12 @@ Format for creating or completely rewriting a file:
 FILE: path/to/file.ext
 ```language
 entire file content here
+```
+
+Format for appending to the END of an existing file (preserves all earlier content):
+APPEND: path/to/file.ext
+```language
+new content to add at the very end
 ```
 
 Format for line-number replacements (most reliable when file is shown with line numbers):
@@ -216,7 +234,9 @@ Guidelines:
 - Prefer REPLACE: over EDIT: in fix loops — use the line numbers shown in the file context.
 - Prefer EDIT: over FILE: for bug fixes when line numbers are unavailable.
 - Use FILE: only for new files or when rewriting more than 60% of a file.
+- ⚠️ If your task says "append" or "APPEND ONLY": use APPEND: blocks EXCLUSIVELY. Using FILE: on an append task will destroy all previously written content.
 - Use find_files and grep_code instead of shell find/grep — they work cross-platform.
+- Canvas parallax direction: background objects scroll LEFT (x decreases each frame) when the car drives rightward. Never reverse this.
 - Be concise in your responses.
 
 Code quality rules (apply to all code you write):
@@ -282,6 +302,30 @@ Code quality rules (apply to all code you write):
         pattern = r'FILE:\s*(.+?)\n```\w*\n(.*?)```'
         matches = re.findall(pattern, response, re.DOTALL)
         return [(path.strip(), content.strip()) for path, content in matches]
+
+    def _extract_file_appends(self, response: str) -> List[tuple]:
+        """Extract APPEND: blocks — content to add at the end of existing files."""
+        matches = _APPEND_BLOCK_RE.findall(response)
+        return [(path.strip(), content.strip()) for path, content in matches]
+
+    async def _execute_append(
+        self,
+        file_path: str,
+        content: str,
+        files_created: List[str],
+        tool_executor,
+    ) -> None:
+        """Read the existing file (if any) and write back with content appended."""
+        try:
+            existing = await tool_executor.execute("file_read", {"path": file_path})
+            base = "" if existing.startswith("Error") else existing
+            combined = base.rstrip("\n") + "\n" + content if base else content
+            await tool_executor.execute("file_write", {"path": file_path, "content": combined})
+            if file_path not in files_created:
+                files_created.append(file_path)
+            self.logger.info("file_appended", path=file_path, added_bytes=len(content))
+        except Exception as e:
+            self.logger.error("file_append_failed", path=file_path, error=str(e))
 
     def _extract_file_edits(self, response: str) -> List[tuple]:
         """Extract EDIT: blocks → [(path, old_text, new_text), ...]."""
@@ -382,6 +426,9 @@ Summary: <one sentence>
                 except Exception as e:
                     self.logger.error("file_write_failed", path=file_path, error=str(e))
 
+            for file_path, content in self._extract_file_appends(response):
+                await self._execute_append(file_path, content, files_created, tool_executor)
+
         shell_outputs: list[str] = []
         failed_outputs: list[str] = []
 
@@ -407,10 +454,15 @@ Summary: <one sentence>
             and not self._extract_file_writes(response)
         ):
             read_context = "\n\n".join(shell_outputs[:5])
+            _append_hint = (
+                " If the task says 'append', use APPEND: blocks — do NOT use FILE: as that overwrites."
+                if re.search(r'\bappend\b', task, re.IGNORECASE) else ""
+            )
             write_prompt = (
                 f"Task: {task}\n\n"
                 f"You have read these files:\n\n{read_context[:8000]}\n\n"
-                f"Now write the actual code changes using EDIT: blocks (preferred) or FILE: blocks.\n"
+                f"Now write the actual code changes using EDIT: blocks (preferred), APPEND: blocks "
+                f"(to add to end of a file), or FILE: blocks (new files only).{_append_hint}\n"
                 f"Do NOT run any commands — only output code fixes."
             )
             write_response = await model_router.generate(
@@ -427,6 +479,10 @@ Summary: <one sentence>
                         files_created.append(file_path)
                 except Exception as e:
                     self.logger.error("write_phase_file_write_failed", path=file_path, error=str(e))
+
+            # Apply APPEND: blocks from write phase.
+            for file_path, content in self._extract_file_appends(write_response):
+                await self._execute_append(file_path, content, files_created, tool_executor)
 
             # Apply EDIT: hunks from write phase.
             wp_edits_by_path: dict[str, list[dict]] = {}
