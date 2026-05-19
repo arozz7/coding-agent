@@ -306,9 +306,10 @@ class VerifierCoordinator:
                 'Does the agent output satisfy this criterion? Return ONLY: {"passed": true} or {"passed": false, "detail": "<why not>"}'
             )
             raw = await self.model_router.generate(prompt, model, system_prompt=system, enable_thinking=False)
-            m = re.search(r"\{[\s\S]*\}", raw or "")
-            if m:
-                obj = json.loads(m.group())
+            raw_s = (raw or "").strip()
+            brace = raw_s.find("{")
+            if brace != -1:
+                obj, _ = json.JSONDecoder().raw_decode(raw_s[brace:])
                 passed = bool(obj.get("passed", False))
                 detail = str(obj.get("detail", ""))
                 return CriterionResult(criterion=criterion, passed=passed, detail=detail)

@@ -242,7 +242,9 @@ class PlannerAgent:
                 "      2. [develop] ⚠️ APPEND ONLY — do NOT use FILE:. Use APPEND: <filename> to add the core logic functions (drawing helpers, update functions, scenery generators).\n"
                 "      3. [develop] ⚠️ APPEND ONLY — do NOT use FILE:. Use APPEND: <filename> to add the animation loop, initialization call, and closing </script></body></html> tags.\n"
                 "    CRITICAL: Tasks 2 and 3 MUST start with '⚠️ APPEND ONLY — do NOT use FILE:' "
-                "in their description. Using FILE: on tasks 2+ destroys all earlier content.\n\n"
+                "in their description. Using FILE: on tasks 2+ destroys all earlier content.\n"
+                "    NEVER add a 'verify', 'test', 'review', or 'open in browser' task — "
+                "the orchestrator runs verification automatically after all tasks complete.\n\n"
                 "DEBUGGING — objective uses words like fix/debug/error/crash/broken/failing/not working:\n"
                 "  1. [mapper]  Map the project structure (skip if ARCHITECTURE.md already exists).\n"
                 "  2. [research] Read the source files identified by the mapper.\n"
@@ -253,7 +255,9 @@ class PlannerAgent:
                 "references existing code:\n"
                 "  1. [research] Read the relevant source files.\n"
                 "  2. [develop] Implement the change.\n"
-                "  3. [develop] Run or test to verify.\n"
+                "  3. [develop] Run or test to confirm the change works.\n\n"
+                "ALL STRATEGIES: NEVER add a trailing 'verify', 'test', 'review', or "
+                "'open in browser' task — the orchestrator runs verification automatically.\n"
             )
         return ""
 
@@ -313,10 +317,11 @@ class PlannerAgent:
         )
         try:
             raw = await self.model_router.generate(prompt, model, system_prompt=system, enable_thinking=False)
-            m = _JSON_OBJ_RE.search(raw or "")
-            if not m:
+            raw_s = (raw or "").strip()
+            brace = raw_s.find("{")
+            if brace == -1:
                 return []
-            obj = json.loads(m.group())
+            obj, _ = json.JSONDecoder().raw_decode(raw_s[brace:])
             criteria = [str(c).strip() for c in obj.get("criteria", []) if c]
             self.logger.info("criteria_generated", count=len(criteria), objective=objective[:60])
             return criteria[:5]
