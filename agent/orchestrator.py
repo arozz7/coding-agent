@@ -672,6 +672,11 @@ class AgentOrchestrator:
                             acc_results = await self.verifier_coordinator.run_acceptance_tests(
                                 _acceptance_criteria, _ws_acc, _app_probe, self.acceptance_tester_agent
                             )
+                            # Capture screenshot for fix-loop context and final Discord post
+                            _cap = self.verifier_coordinator.last_screenshot_path
+                            if _cap:
+                                _last_acceptance_screenshot = _cap
+                                screenshot_path = _cap
                             if not acc_results:
                                 # Empty = no server entry point (static deliverable) — skip loop
                                 task_summaries.append("⏭️ Acceptance tests skipped — no server entry point detected")
@@ -905,6 +910,10 @@ class AgentOrchestrator:
                             acc_results2 = await self.verifier_coordinator.run_acceptance_tests(
                                 _acceptance_criteria, _ws_acc2, _app_probe2, self.acceptance_tester_agent
                             )
+                            _cap2 = self.verifier_coordinator.last_screenshot_path
+                            if _cap2:
+                                _last_acceptance_screenshot = _cap2
+                                screenshot_path = _cap2
                             if not acc_results2:
                                 task_summaries.append("⏭️ Acceptance tests skipped — no server entry point detected")
                                 break

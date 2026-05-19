@@ -109,6 +109,8 @@ class VerifierCoordinator:
         self.verifier_agent = verifier_agent
         self.model_router = model_router
         self.logger = logger.bind(component="verifier_coordinator")
+        # Set by run_acceptance_tests(); read by orchestrator to populate the job record.
+        self.last_screenshot_path: Optional[str] = None
 
     # ------------------------------------------------------------------
     # Verification
@@ -338,14 +340,22 @@ class VerifierCoordinator:
         screenshot_path: Optional[str] = None
 
         if handle is None:
-            # No server entry point detected (e.g. pure static HTML deliverable).
-            # Return empty list so the orchestrator skips the acceptance loop rather
-            # than burning all fix rounds on an app that can never be launched.
+            # No server entry point — try to screenshot the largest HTML file directly
+            # via file:// so Discord gets a preview of the static deliverable.
+            html_files = sorted(
+                workspace.glob("*.html"),
+                key=lambda p: p.stat().st_size,
+                reverse=True,
+            )
+            if html_files:
+                screenshot_path = await app_probe.screenshot_file(html_files[0])
+                self.last_screenshot_path = screenshot_path
             self.logger.info("acceptance_skipped_no_entry_point", workspace=str(workspace))
             return []
 
         try:
             screenshot_path = await app_probe.screenshot(handle)
+            self.last_screenshot_path = screenshot_path
             results = await acceptance_tester.run_tests(criteria, workspace, screenshot_path=screenshot_path)
         finally:
             await app_probe.teardown(handle)
