@@ -109,7 +109,8 @@ class WebTool:
             results = await self._search_brave(query, max_results, brave_key)
             if results and "error" not in results[0]:
                 return results
-            self.logger.warning("brave_search_failed_fallback_ddg")
+            err = results[0].get("error", "unknown") if results else "no response"
+            self.logger.warning("brave_search_failed_fallback_ddg", reason=err)
 
         # 2. DuckDuckGo
         results = await self._search_duckduckgo(query, max_results)
@@ -175,10 +176,7 @@ class WebTool:
         try:
             from ddgs import DDGS  # type: ignore
         except ImportError:
-            try:
-                from duckduckgo_search import DDGS  # type: ignore  # legacy name
-            except ImportError:
-                return [{"error": "ddgs not installed — run: pip install ddgs"}]
+            return [{"error": "ddgs not installed — run: pip install ddgs"}]
 
         try:
             n = min(max_results, _MAX_RESULTS)
