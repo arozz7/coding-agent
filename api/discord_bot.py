@@ -663,6 +663,19 @@ async def _submit_task(
     user_id = str(ctx.author.id)
     session_id = bot.user_sessions.get(user_id, user_id)
 
+    # Append any text file attachments to the task so the agent sees their content
+    if ctx.message.attachments:
+        for att in ctx.message.attachments:
+            if att.size < 200_000 and att.filename.rsplit(".", 1)[-1].lower() in (
+                "txt", "md", "json", "yaml", "yml", "toml", "py", "js", "ts", "html", "css", "rs",
+            ):
+                try:
+                    raw = await att.read()
+                    text = raw.decode("utf-8", errors="replace")
+                    task = f"{task}\n\n--- Attachment: {att.filename} ---\n{text}"
+                except Exception as _att_err:
+                    logger.warning("discord_attachment_read_failed", file=att.filename, error=str(_att_err))
+
     status_msg = await ctx.send("Submitting…")
 
     try:

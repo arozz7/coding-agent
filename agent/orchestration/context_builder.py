@@ -14,12 +14,28 @@ Owns:
 from __future__ import annotations
 
 import os
+import re
 import subprocess
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING, Callable, List, Optional
 
 import structlog
+
+# Strips raw FILE:/APPEND: blocks and fenced code from episodic summaries so
+# they don't contaminate the model context with code from unrelated past tasks.
+_EPISODIC_CODE_RE = re.compile(
+    r'(?:FILE:|APPEND:)\s+\S[^\n]*[\s\S]*?(?=\n(?:FILE:|APPEND:|##|\Z)|\Z)'
+    r'|```[\s\S]*?```',
+    re.DOTALL,
+)
+
+
+def _clean_episodic_summary(text: str, max_len: int = 300) -> str:
+    """Remove code blocks and file blocks from an episodic result summary."""
+    cleaned = _EPISODIC_CODE_RE.sub("", text)
+    cleaned = re.sub(r"\n{3,}", "\n\n", cleaned).strip()
+    return cleaned[:max_len]
 
 from agent.workspace_context import get_workspace
 
@@ -413,7 +429,7 @@ class ContextBuilder:
                 for p in past:
                     lines.append(
                         f"- [{p['task_type'] or 'task'}, score {p['score']}/10] "
-                        f"**{p['task_text'][:80]}**\n  {p['result_summary'][:200]}"
+                        f"**{p['task_text'][:80]}**\n  {_clean_episodic_summary(p['result_summary'])}"
                     )
                 _ep_cap = self.char_budget(fraction=0.05, cap=15_000)
                 parts.append("\n".join(lines)[:_ep_cap])
