@@ -378,7 +378,37 @@ class VerifierCoordinator:
         screenshot_path: Optional[str] = None,
     ) -> dict:
         """Return a single fix task spec targeted at one failing criterion."""
-        phase, instruction = self._detect_fix_phase(test_out, failing.detail, round_num)
+        lower_c = failing.criterion.lower()
+
+        # Structural criteria have obvious, deterministic fixes — bypass phase detection.
+        if lower_c.startswith("file contains:"):
+            payload = failing.criterion[len("file contains:"):].strip()
+            if ":" in payload:
+                rel, substring = payload.split(":", 1)
+                rel, substring = rel.strip(), substring.strip()
+                detail_lower = failing.detail.lower()
+                if detail_lower.startswith("read error") or detail_lower.startswith("missing:"):
+                    instruction = (
+                        f"Create the file `{rel}` and ensure it contains the text `{substring}`. "
+                        f"Use a FILE: block with appropriate content."
+                    )
+                else:
+                    instruction = (
+                        f"Read `{rel}` first, then add the text `{substring}` to the file using an "
+                        f"APPEND: block. Do NOT rewrite the file with FILE: — only append the missing content."
+                    )
+                phase = "file-content"
+            else:
+                phase, instruction = self._detect_fix_phase(test_out, failing.detail, round_num)
+
+        elif lower_c.startswith("file exists:"):
+            rel = failing.criterion[len("file exists:"):].strip()
+            instruction = f"Create the missing file `{rel}` with appropriate content for the project."
+            phase = "file-missing"
+
+        else:
+            phase, instruction = self._detect_fix_phase(test_out, failing.detail, round_num)
+
         detail_block = f"\n\nWhy it failed: {failing.detail}" if failing.detail else ""
         test_block = f"\n\nVerifier output:\n```\n{test_out[:600]}\n```" if test_out else ""
         shot_block = (

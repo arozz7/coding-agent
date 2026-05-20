@@ -60,12 +60,16 @@ class RequirementsExtractor:
             "FORMATS — pick the most specific one that applies:\n"
             '  "command exits 0: <exact shell command>" — for any CLI-verifiable outcome\n'
             '  "file exists: <relative/path>" — ONLY when the objective explicitly names that file\n'
-            '  "file contains: <relative/path> | <substring>" — for generated content checks\n'
+            '  "file contains: <relative/path>:<substring>" — use a colon (:) separator; '
+            "for generated source/config file content checks\n"
             '  "visual: <precise description of what must be visible in a screenshot or DOM>" '
             "— for UI checks; be specific enough that a model can give yes/no from one image\n\n"
             "RULES:\n"
             "  - Do NOT write vague criteria like 'the app works' or 'no errors'.\n"
-            "  - Do NOT generate 'file exists' from naming conventions — only from the objective.\n"
+            "  - Do NOT generate 'file exists' or 'file contains' from naming conventions.\n"
+            "  - Do NOT generate 'file contains' against planning/documentation files such as "
+            "PROJECT_PLAN.md, README.md, CHANGELOG.md, ARCHITECTURE.md, or STACK.md — those are "
+            "artifacts, not acceptance criteria for the running application.\n"
             "  - Each criterion must be falsifiable: there must be a concrete observation that "
             "would make it fail.\n"
             "  - If the objective has no server/process, omit 'command exits 0' criteria that "
@@ -74,8 +78,7 @@ class RequirementsExtractor:
             '  "command exits 0: python -m pytest tests/ -q"\n'
             '  "visual: canvas element is present and shows a car shape moving rightward across '
             'the frame; background hills scroll leftward"\n'
-            '  "file contains: src/index.html | <canvas id=\\"gameCanvas\\">" — must not remove '
-            'existing canvas element\n\n'
+            '  "file contains: src/index.html:<canvas id=\\"gameCanvas\\">"\n\n'
             "Return ONLY a JSON array of strings. No prose, no markdown fences."
         )
         prompt = (
