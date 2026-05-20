@@ -23,7 +23,7 @@ An autonomous coding agent with LLM integration, multi-agent orchestration, SDLC
 - **Interactive CLI Testing** — `interactive_shell` tool spawns any process and drives it via `expect`/`send`/`wait` scripts (REPLs, text adventures, wizard prompts); cross-platform asyncio subprocess
 - **Browser Interaction** — `browser_interact` tool drives Playwright (Chromium) to `navigate`, `click`, `fill`, `press`, `screenshot`, and read `text` on any web app; cross-platform (Windows/macOS/Linux)
 - **Surgical Multi-Hunk Edits** — `EDIT:` block syntax for precise, multi-region file updates; matches against original file content, rejects overlapping edits; `REPLACE: file.ts 10-14` line-number blocks used in fix loops for zero-mismatch patching
-- **Native Search Tools** — Python-native `find_files` (glob) and `grep_code` (regex) tools; cross-platform, sandboxed to workspace, and automatically skip noisy dirs like `node_modules` and `.git`
+- **Native Search Tools** — Python-native `find_files` (glob) and `grep_code` (regex) tools; cross-platform, sandboxed to workspace, and automatically skip noisy dirs like `node_modules` and `.git`; web search via Brave (primary) with `ddgs` fallback
 - **Windows Process-Tree Recovery** — Supervisor and shell tools use `taskkill /F /T` on Windows to ensure timed-out child process trees (daemons, build servers) are fully purged
 - **CRLF & BOM Preservation** — Detects and preserves original line endings and Byte Order Marks during file writes, preventing silent file corruption in Windows or legacy environments
 - **Workspace Scoping** — `PROJECT_DIR` env var focuses all file operations on an active project subdirectory; no path double-nesting
@@ -32,9 +32,13 @@ An autonomous coding agent with LLM integration, multi-agent orchestration, SDLC
 - **RAG Memory** — Codebase indexed in ChromaDB; retrieved context injected into every task. Searches are project-scoped — Chroma queries include a `project_id` filter, eliminating cross-project content contamination.
 - **Write-path Quality Gate** — Wiki-compile (post-task knowledge extraction) only runs when the verifier scores the output ≥ 7/10. Below-threshold outputs are silently skipped, keeping the wiki free of incomplete or low-quality entries.
 - **Code-Graph Context (MemoryWiki)** — For developer, reviewer, and tester tasks, the orchestrator builds a live AST-based dependency graph from workspace Python files and injects matching nodes (functions, classes, import chains) as context before each task.
-- **Episodic Memory** — High-scoring past task results (verifier score ≥ 7) are persisted in SQLite. Before each task the orchestrator retrieves keyword-matched similar work and injects it as context, enabling the agent to reuse proven approaches across sessions.
-- **Goal-Driven Planning** — For every `develop`/`sdlc` task the planner generates 3–5 testable *completion criteria* alongside the task list (e.g. `"command exits 0: npm test"`, `"file exists: src/app.js"`, plain-English behavioral checks). Pre-planning context enrichment injects a compact tech-stack fingerprint and top matching episodic memories into the planner before it generates tasks, giving it project-specific awareness on the first pass.
-- **Criterion-Driven Fix Loop** — Instead of holistic score oscillation, each fix task targets exactly one failing criterion. The orchestrator evaluates all criteria each round, injects a single targeted fix task for the first unresolved criterion, and breaks when all pass or the fix budget is exhausted. Per-criterion stuck protection abandons a criterion after 3 consecutive failures to prevent infinite loops. Set `FIX_BUDGET` env var (default 20) to cap total fix tasks.
+- **Episodic Memory** — High-scoring past task results (verifier score ≥ 7) are persisted in SQLite. Before each task the orchestrator retrieves keyword-matched similar work and injects it as context, enabling the agent to reuse proven approaches across sessions. `FILE:`/`APPEND:` blocks and fenced code are stripped from episodic summaries before injection, preventing a prior task's output code from contaminating an unrelated task's context.
+- **Goal-Driven Planning** — For every `develop`/`sdlc` task the planner generates 3–5 testable *completion criteria* alongside the task list. Each criterion follows a three-part structure: one measurable end state, a stated check, and an optional constraint. UI checks use a `visual:` prefix so the evaluator can answer yes/no from a screenshot. Pre-planning context enrichment injects a compact tech-stack fingerprint and top matching episodic memories into the planner before it generates tasks, giving it project-specific awareness on the first pass.
+- **Criterion-Driven Fix Loop** — Instead of holistic score oscillation, each fix task targets exactly one failing criterion. The orchestrator evaluates all criteria each round, injects a single targeted fix task for the first unresolved criterion, and breaks when all pass or the fix budget is exhausted. Fix budget per criterion is determined by `CriterionScoreStore` — Bayesian confidence scoring `(successes+1)/(attempts+2)` over historical outcomes, persisted in `data/criterion_scores.json`, returning 1–4 attempts based on fix rate by criterion pattern type (`file_exists`, `file_contains`, `command_exits_0`, `behavioral`). Set `FIX_BUDGET` env var (default 20) to cap total fix tasks.
+- **Dynamic Free Evaluator Model** — The model that writes code is never used to judge whether it passes acceptance criteria. `ModelRouter.get_evaluator_model()` queries the OpenRouter `/v1/models` endpoint, filters for free models (pricing `"0"`, context ≥ 8192), ranks by context window and family preference (gemma/qwen/llama/mistral/phi/deepseek), and caches the winner for 1 hour. Falls back to the static `openrouter/free` config entry on any fetch failure.
+- **APPEND: Block Support** — For large deliverables (>150 lines), the planner generates a 3-task chunked plan where tasks 2+ use `APPEND: filename` blocks instead of `FILE:` blocks, preventing tasks from overwriting each other's output. The developer agent reads existing file content, concatenates the new chunk, and writes the combined result.
+- **Discord File Attachments** — `!dev` and `!ask` commands now read attached text files (txt/md/json/yaml/yml/toml/py/js/ts/html/css/rs, up to 200 KB) and append their content to the task string before submission, so requirements pasted as attachments are never silently dropped.
+- **Static HTML Screenshots to Discord** — For canvas animations, games, and other static HTML deliverables (no server), `AppProbe.screenshot_file()` opens the file via `file://` URL in Playwright, waits 2 seconds for JS to render a first frame, and captures a PNG. The screenshot is posted to Discord alongside the task completion message, giving the user a visual preview without running a dev server.
 - **Verifier / Critic Agent** — After each develop or research job, a dedicated `VerifierAgent` scores the output 0–10 against the original objective. Scores below 7 trigger a targeted fix task and re-run (max 2 rounds). Research rubric checks coverage, depth, format compliance, and actionability; code rubric checks requirement fulfilment, completeness, correctness, and test results (runs pytest when available).
 - **Deep Research Mode** — Research agent decomposes into up to 8 sub-questions, runs up to 4 follow-up gap-fill passes, and performs up to 3 coverage-check rounds to ensure no topic is missed. Content budget is 28 k chars. When "capture to markdown files" is requested, the synthesis is split by section into individual `.md` files under `research-output/`.
 - **Project Lifecycle Management** — Full project delete via API (`DELETE /projects/{name}`) and Discord (`!project delete <name> confirm`). Dry-run preview shows artifact counts before deletion. Removes Chroma chunks, SQLite sessions/jobs/tasks, and `.agent-wiki/`. Workspace containment guard prevents deleting outside `WORKSPACE_PATH`.
@@ -304,10 +308,13 @@ coding-agent/
 │   │   ├── plan_agent.py          # Implementation planning
 │   │   └── chat_agent.py          # Conversational responses
 │   ├── orchestration/
-│   │   ├── __init__.py            # Re-exports ContextBuilder, TaskRouter, VerifierCoordinator
-│   │   ├── context_builder.py     # Enriched prompt context: wiki-query, RAG, env, code-graph, episodic memory
+│   │   ├── __init__.py            # Re-exports ContextBuilder, TaskRouter, VerifierCoordinator, CriterionScoreStore
+│   │   ├── context_builder.py     # Enriched prompt context: wiki-query, RAG, env, code-graph, episodic memory (strips code from episodic summaries)
 │   │   ├── task_router.py         # Task-type classification (keyword fast-path + LLM fallback)
-│   │   └── verifier_coordinator.py # Runs verifier rubrics, builds fix-task specs
+│   │   ├── verifier_coordinator.py # Runs verifier rubrics, builds fix-task specs, screenshots, dynamic evaluator model
+│   │   ├── requirements_extractor.py # Extracts /goal-style acceptance criteria from task description
+│   │   ├── criterion_score_store.py  # Bayesian fix-budget tracking per criterion pattern type
+│   │   └── app_probe.py           # Launches dev server, polls for readiness, captures screenshots (static + server)
 │   ├── memory/
 │   │   ├── session_memory.py      # SQLite conversation history + episodic memory table
 │   │   ├── codebase_memory.py     # ChromaDB vector store (RAG)
@@ -335,7 +342,7 @@ coding-agent/
 │   ├── task_store.py              # SQLite task store
 │   └── discord_bot.py             # Discord bot, commands, polling, _safe_edit
 ├── llm/
-│   ├── model_router.py            # Routing, fallback chain, load/unload, switch notifications, timeout fail-fast
+│   ├── model_router.py            # Routing, fallback chain, load/unload, switch notifications, dynamic free evaluator model
 │   ├── ollama_client.py           # LM Studio / Ollama client (load, unload, poll, list_all_models)
 │   ├── cloud_api_client.py        # OpenRouter / OpenAI-compatible client
 │   ├── config.py                  # ModelConfig dataclass
@@ -357,7 +364,7 @@ coding-agent/
 ├── tests/
 │   ├── unit/                      # Unit tests
 │   └── integration/               # Integration tests
-└── aiChangeLog/                   # Per-phase change logs (phase-03 through phase-20)
+└── aiChangeLog/                   # Per-phase change logs (phase-03 through phase-31)
 ```
 
 ---
