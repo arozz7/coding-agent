@@ -33,7 +33,7 @@ from agent.chain_runner import ChainRunner
 from agent.skills.skill_loader import SkillManager
 from agent.skills.wiki_manager import WikiManager
 from agent.skills.skill_executor import SkillExecutor
-from agent.orchestration import ContextBuilder, TaskRouter, VerifierCoordinator
+from agent.orchestration import ContextBuilder, CriterionScoreStore, TaskRouter, VerifierCoordinator
 from agent.orchestration.requirements_extractor import RequirementsExtractor
 from agent.orchestration.app_probe import AppProbe
 from observability.logging import AgentLogger
@@ -151,6 +151,7 @@ class AgentOrchestrator:
             skill_router=self.task_router,
         )
         self.verifier_coordinator = VerifierCoordinator(self.verifier_agent, model_router)
+        self.criterion_score_store = CriterionScoreStore()
 
         # Collect model-switch notices emitted by the router during task execution.
         # Drained at each task-loop boundary and surfaced in job phase + response text.
@@ -489,8 +490,8 @@ class AgentOrchestrator:
 
         # 1. Plan — build compact planning context then generate tasks + criteria
         _emit("planning:tasks")
-        planning_ctx = await self.context_builder.build_planning_context(objective)
         _ws_path = Path(getattr(self.tool_executor, "workspace_path", ".") if self.tool_executor else ".")
+        planning_ctx = await self.context_builder.build_planning_context(objective)
         plan_result = await self.planner_agent.plan_with_criteria(
             objective,
             context=planning_ctx,
@@ -578,6 +579,17 @@ class AgentOrchestrator:
                         _failing = [r for r in crit_results if not r.passed]
                         _passed_count = len(crit_results) - len(_failing)
 
+                        # Split failing criteria: auto-checkable (file/command) vs behavioral
+                        # (LLM-evaluated free-text). Only auto-checkable criteria gate fix
+                        # rounds — behavioral criteria are advisory and cannot be verified
+                        # without a live environment (e.g. "when opened in a browser").
+                        _AUTO_PREFIXES = ("file exists:", "file contains:", "command exits 0:")
+                        _auto_failing = [
+                            r for r in _failing
+                            if any(r.criterion.lower().startswith(p) for p in _AUTO_PREFIXES)
+                        ]
+                        _behavioral_failing = [r for r in _failing if r not in _auto_failing]
+
                         async def _run_final_verifier_jid() -> VerifierResult:
                             nonlocal _final_verifier_score
                             _emit("verifying:final")
@@ -593,24 +605,37 @@ class AgentOrchestrator:
                                     pass
                             return _vr
 
-                        if not _failing:
+                        if not _auto_failing:
                             _vr = await _run_final_verifier_jid()
-                            task_summaries.append(f"✅ **All {len(completion_criteria)} criteria satisfied** — score {_vr.score}/10")
+                            _behavioral_note = (
+                                f" ({len(_behavioral_failing)} behavioral criteria not auto-verifiable)"
+                                if _behavioral_failing else ""
+                            )
+                            task_summaries.append(f"✅ **All auto-checkable criteria satisfied**{_behavioral_note} — score {_vr.score}/10")
+                            for _c in _criterion_attempts:
+                                self.criterion_score_store.record(_c, succeeded=True)
                             _build_criteria_done = True
                         elif _criterion_fix_count >= _fix_budget:
                             _vr = await _run_final_verifier_jid()
                             task_summaries.append(
                                 f"🎯 Fix budget ({_fix_budget}) exhausted — {_passed_count}/{len(completion_criteria)} criteria passing — score {_vr.score}/10"
                             )
+                            _still_failing = {r.criterion for r in _auto_failing}
+                            for _c in _criterion_attempts:
+                                self.criterion_score_store.record(_c, succeeded=_c not in _still_failing)
                             _build_criteria_done = True
                         else:
                             _target = next(
-                                (r for r in _failing if _criterion_attempts.get(r.criterion, 0) < 3),
+                                (r for r in _auto_failing
+                                 if _criterion_attempts.get(r.criterion, 0) < self.criterion_score_store.attempt_budget(r.criterion)),
                                 None,
                             )
                             if _target is None:
                                 _vr = await _run_final_verifier_jid()
-                                task_summaries.append(f"🔍 All failing criteria abandoned after 3 attempts — score {_vr.score}/10")
+                                task_summaries.append(f"🔍 All auto-checkable failing criteria abandoned — score {_vr.score}/10")
+                                _still_failing = {r.criterion for r in _auto_failing}
+                                for _c in _criterion_attempts:
+                                    self.criterion_score_store.record(_c, succeeded=_c not in _still_failing)
                                 _build_criteria_done = True
                             else:
                                 _build_criteria_done = False
@@ -647,6 +672,16 @@ class AgentOrchestrator:
                             acc_results = await self.verifier_coordinator.run_acceptance_tests(
                                 _acceptance_criteria, _ws_acc, _app_probe, self.acceptance_tester_agent
                             )
+                            # Capture screenshot for fix-loop context and final Discord post
+                            _cap = self.verifier_coordinator.last_screenshot_path
+                            if _cap:
+                                _last_acceptance_screenshot = _cap
+                                screenshot_path = _cap
+                            if not acc_results:
+                                # Empty = no server entry point (static deliverable) — skip loop
+                                task_summaries.append("⏭️ Acceptance tests skipped — no server entry point detected")
+                                break
+
                             _acc_failing = [r for r in acc_results if not r.passed]
                             _acc_passed = len(acc_results) - len(_acc_failing)
 
@@ -815,21 +850,30 @@ class AgentOrchestrator:
                         if not _failing2:
                             _vr2 = await _run_final_verifier_np()
                             task_summaries.append(f"✅ **All {len(completion_criteria)} criteria satisfied** — score {_vr2.score}/10")
+                            for _c2 in _criterion_attempts:
+                                self.criterion_score_store.record(_c2, succeeded=True)
                             _build_criteria_done2 = True
                         elif _criterion_fix_count >= _fix_budget:
                             _vr2 = await _run_final_verifier_np()
                             task_summaries.append(
                                 f"🎯 Fix budget ({_fix_budget}) exhausted — {_passed_count2}/{len(completion_criteria)} criteria passing — score {_vr2.score}/10"
                             )
+                            _still_failing2 = {r.criterion for r in _failing2}
+                            for _c2 in _criterion_attempts:
+                                self.criterion_score_store.record(_c2, succeeded=_c2 not in _still_failing2)
                             _build_criteria_done2 = True
                         else:
                             _target2 = next(
-                                (r for r in _failing2 if _criterion_attempts.get(r.criterion, 0) < 3),
+                                (r for r in _failing2
+                                 if _criterion_attempts.get(r.criterion, 0) < self.criterion_score_store.attempt_budget(r.criterion)),
                                 None,
                             )
                             if _target2 is None:
                                 _vr2 = await _run_final_verifier_np()
-                                task_summaries.append(f"🔍 All failing criteria abandoned after 3 attempts — score {_vr2.score}/10")
+                                task_summaries.append(f"🔍 All failing criteria abandoned — score {_vr2.score}/10")
+                                _still_failing2 = {r.criterion for r in _failing2}
+                                for _c2 in _criterion_attempts:
+                                    self.criterion_score_store.record(_c2, succeeded=_c2 not in _still_failing2)
                                 _build_criteria_done2 = True
                             else:
                                 _build_criteria_done2 = False
@@ -866,6 +910,14 @@ class AgentOrchestrator:
                             acc_results2 = await self.verifier_coordinator.run_acceptance_tests(
                                 _acceptance_criteria, _ws_acc2, _app_probe2, self.acceptance_tester_agent
                             )
+                            _cap2 = self.verifier_coordinator.last_screenshot_path
+                            if _cap2:
+                                _last_acceptance_screenshot = _cap2
+                                screenshot_path = _cap2
+                            if not acc_results2:
+                                task_summaries.append("⏭️ Acceptance tests skipped — no server entry point detected")
+                                break
+
                             _acc_failing2 = [r for r in acc_results2 if not r.passed]
                             _acc_passed2 = len(acc_results2) - len(_acc_failing2)
 

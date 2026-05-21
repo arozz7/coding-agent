@@ -3,6 +3,7 @@ from .git_tool import GitTool, GitError
 from .test_runner_tool import PytestTool, TestRunnerError
 from .code_analysis_tool import CodeAnalyzer, CodeAnalysisError, FunctionInfo, ClassInfo
 from .code_chunker import CodeChunker, chunk_file_by_extension, get_language_from_extension
+from .code_review_tool import CodeReviewTool
 
 __all__ = [
     "FileSystemTool",
@@ -19,4 +20,5 @@ __all__ = [
     "CodeChunker",
     "chunk_file_by_extension",
     "get_language_from_extension",
+    "CodeReviewTool",
 ]

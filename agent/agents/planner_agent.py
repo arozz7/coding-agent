@@ -231,13 +231,33 @@ class PlannerAgent:
             )
         if task_type in ("sdlc", "develop"):
             return (
-                "Strategy for development/debugging objectives:\n"
-                "1. A 'mapper' task to map the project structure (produces ARCHITECTURE.md + STACK.md). Skip if ARCHITECTURE.md already exists.\n"
-                "2. A 'research' task to read key source files identified by the mapper. No code changes.\n"
-                "3. A 'develop' task to run the project entry command (npm start / python app.py / cargo run). Capture the full error output. Do NOT fix anything — only run and report.\n"
-                "4. A 'develop' task to apply all code fixes using REPLACE: blocks (preferred) or EDIT: blocks. Fix every error identified in step 3.\n"
-                "5. A 'develop' task to run the build command (npm run build / tsc / cargo build) to compile and verify there are no remaining type or compile errors. Fix any found.\n"
-                "6. A 'develop' task to run the project entry command again to confirm it starts cleanly. Report success or list any remaining errors.\n"
+                "Choose the strategy that matches the objective — do NOT default to the longest one:\n\n"
+                "CREATION — objective uses words like create/write/build/generate/make and describes "
+                "producing new file(s) with no mention of existing errors or an existing project:\n"
+                "  Simple output (plain HTML page, short script, config file, < ~150 lines):\n"
+                "    → 1 task: [develop] Write the complete FILE: block directly.\n"
+                "  Complex output (canvas animation, game, simulation, multi-section document, > ~150 lines):\n"
+                "    → 2–3 tasks: split into logical chunks, each under 150 lines:\n"
+                "      1. [develop] Write FILE: <filename> — HTML skeleton, CSS, opening <script>, constants, config. End at the opening brace of the first function.\n"
+                "      2. [develop] ⚠️ APPEND ONLY — do NOT use FILE:. Use APPEND: <filename> to add the core logic functions (drawing helpers, update functions, scenery generators).\n"
+                "      3. [develop] ⚠️ APPEND ONLY — do NOT use FILE:. Use APPEND: <filename> to add the animation loop, initialization call, and closing </script></body></html> tags.\n"
+                "    CRITICAL: Tasks 2 and 3 MUST start with '⚠️ APPEND ONLY — do NOT use FILE:' "
+                "in their description. Using FILE: on tasks 2+ destroys all earlier content.\n"
+                "    NEVER add a 'verify', 'test', 'review', or 'open in browser' task — "
+                "the orchestrator runs verification automatically after all tasks complete.\n\n"
+                "DEBUGGING — objective uses words like fix/debug/error/crash/broken/failing/not working:\n"
+                "  1. [mapper]  Map the project structure (skip if ARCHITECTURE.md already exists).\n"
+                "  2. [research] Read the source files identified by the mapper.\n"
+                "  3. [develop] Run the entry command. Capture full error output. Do NOT fix yet.\n"
+                "  4. [develop] Apply all fixes.\n"
+                "  5. [develop] Run again to confirm the fix.\n\n"
+                "MODIFICATION — objective uses words like add/extend/update/refactor/improve and "
+                "references existing code:\n"
+                "  1. [research] Read the relevant source files.\n"
+                "  2. [develop] Implement the change.\n"
+                "  3. [develop] Run or test to confirm the change works.\n\n"
+                "ALL STRATEGIES: NEVER add a trailing 'verify', 'test', 'review', or "
+                "'open in browser' task — the orchestrator runs verification automatically.\n"
             )
         return ""
 
@@ -276,10 +296,16 @@ class PlannerAgent:
             "criteria for the objective. Be concrete and verifiable — a CI system "
             "should be able to check each one automatically or a reviewer should be "
             "able to tick it off in under 10 seconds.\n\n"
-            "Prefer these auto-checkable formats when applicable:\n"
-            '  "command exits 0: <shell command>"  — runs the command, expects exit 0\n'
-            '  "file exists: <relative path>"      — checks path is present\n'
-            '  "file contains: <path>:<substring>" — checks file includes the text\n'
+            "Prefer these auto-checkable formats in priority order:\n"
+            '  "file exists: <path>"        — checks path is present. '
+            "Use a glob pattern (e.g. *.html, src/*.js) when the task does NOT specify an exact filename. "
+            "Only use a literal filename (e.g. index.html) when the objective explicitly names that file.\n"
+            '  "file contains: <path>:<substring>" — checks file includes exact text. '
+            "Path may be a glob (e.g. *.html:<canvas) when no exact filename is given.\n"
+            '  "command exits 0: <shell command>"  — runs a BUILD or TEST command (e.g. npm run build, cargo check, python -m pytest). '
+            "Use ONLY for build/test verification, NEVER for checking file contents. "
+            "NEVER use grep, sed, awk, find, cat, ls, or any Unix-only utility in this field — "
+            "they do not exist on Windows and will always fail.\n"
             "For behavioral/visual criteria use plain English.\n\n"
             'Return ONLY valid JSON: {"criteria": ["<criterion 1>", ...]}'
         )
@@ -291,10 +317,11 @@ class PlannerAgent:
         )
         try:
             raw = await self.model_router.generate(prompt, model, system_prompt=system, enable_thinking=False)
-            m = _JSON_OBJ_RE.search(raw or "")
-            if not m:
+            raw_s = (raw or "").strip()
+            brace = raw_s.find("{")
+            if brace == -1:
                 return []
-            obj = json.loads(m.group())
+            obj, _ = json.JSONDecoder().raw_decode(raw_s[brace:])
             criteria = [str(c).strip() for c in obj.get("criteria", []) if c]
             self.logger.info("criteria_generated", count=len(criteria), objective=objective[:60])
             return criteria[:5]

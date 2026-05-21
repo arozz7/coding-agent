@@ -162,6 +162,28 @@ class AppProbe:
 
         return None
 
+    async def screenshot_file(self, html_path: Path) -> Optional[str]:
+        """Take a Playwright screenshot of a static HTML file via file:// URL.
+
+        Waits 2 s after load so JS animations have time to render a first frame.
+        """
+        screenshot_dir = self.workspace / ".screenshots"
+        screenshot_dir.mkdir(parents=True, exist_ok=True)
+        shot_path = screenshot_dir / f"static_{int(time.time())}.png"
+        url = html_path.as_uri()
+        try:
+            cmd = (
+                f'npx playwright screenshot --browser chromium '
+                f'--wait-for-timeout 2000 "{url}" "{shot_path}"'
+            )
+            await self.shell_fn(cmd)
+            if shot_path.exists():
+                self.logger.info("app_probe_static_screenshot", path=str(shot_path), html=html_path.name)
+                return str(shot_path)
+        except Exception as exc:
+            self.logger.warning("app_probe_static_screenshot_failed", error=str(exc))
+        return None
+
     async def teardown(self, handle: Optional[AppHandle]) -> None:
         """Kill the app process tree."""
         if handle is None or handle.process is None:

@@ -110,6 +110,14 @@ class VerifierAgent:
                 gaps.append("Required output files were not created")
 
         files_ok = not any("file" in g.lower() for g in gaps if "Required output" in g)
+
+        # Structural coherence: penalise documents with duplicate headings — a sign
+        # that fix rounds appended content that already existed.
+        dup_penalty = self._duplicate_heading_penalty(response, files_created)
+        if dup_penalty > 0:
+            gaps.insert(0, f"Document contains duplicate sections (structural redundancy detected)")
+            score = max(0, score - dup_penalty)
+
         report = self._format_research_report(coverage, depth, files_ok, score, gaps)
         self.logger.info(
             "verify_research_complete",
@@ -125,6 +133,22 @@ class VerifierAgent:
             task_type="research",
         )
 
+    # Extensions that indicate a self-contained static deliverable requiring no build/test step.
+    _STATIC_EXTENSIONS = frozenset({".html", ".css", ".svg", ".xml", ".json", ".md", ".txt"})
+
+    @staticmethod
+    def _is_static_deliverable(files_created: List[str], test_output: str) -> bool:
+        """Return True when output is static files with no applicable test runner."""
+        if not files_created:
+            return False
+        from pathlib import Path as _P
+        all_static = all(
+            _P(f).suffix.lower() in VerifierAgent._STATIC_EXTENSIONS
+            for f in files_created
+        )
+        no_tests_ran = not test_output or test_output.startswith("(")
+        return all_static and no_tests_ran
+
     async def verify_code(
         self,
         objective: str,
@@ -139,25 +163,44 @@ class VerifierAgent:
             "You are a strict code reviewer. Focus on correctness and completeness. "
             "Do not accept partial implementations as sufficient."
         )
-        prompt = (
-            f"Original objective:\n{objective}\n\n"
-            f"Agent response (excerpt):\n{response[:3000]}\n\n"
-            f"Files created: {files_created if files_created else ['(none)']}\n\n"
-            f"Test execution output:\n{test_output}\n\n"
-            "Note: 'Test results' scores 0 if any source files are truncated/incomplete "
-            "(e.g. missing </html>, file ending mid-function, or unbalanced braces).\n\n"
-            "Evaluate on these three dimensions and return ONLY valid JSON:\n\n"
-            "1. Requirement fulfilment (0-5): Does the implementation address EVERYTHING "
-            "requested in the objective?\n"
-            "2. Completeness (0-3): Are edge cases, error handling, and all requested "
-            "files/features present?\n"
-            "3. Test results (0-2): 2 if tests pass; 1 if no tests were requested; "
-            "0 if tests exist and are failing or if a web game cannot be served.\n\n"
-            'Return: {"score": <sum 0-10>, '
-            '"gaps": ["<specific missing requirement or defect>", ...], '
-            '"feedback": "<one concise sentence>"}\n\n'
-            f"Score >= {PASS_THRESHOLD} is a PASS."
-        )
+
+        if self._is_static_deliverable(files_created, test_output):
+            # Static deliverable (HTML, CSS, SVG, etc.) — no test runner applies.
+            # Use a 2-dimension rubric so missing tests don't distort the score.
+            prompt = (
+                f"Original objective:\n{objective}\n\n"
+                f"Deliverable content:\n{response[:4000]}\n\n"
+                f"Files created: {files_created}\n\n"
+                "Evaluate on these two dimensions and return ONLY valid JSON:\n\n"
+                "1. Requirement fulfilment (0-7): Does the content address EVERYTHING "
+                "requested in the objective? Score 7 only if every named feature/behaviour "
+                "is present. Deduct for each missing or incorrect requirement.\n"
+                "2. Completeness (0-3): Is the file syntactically complete and non-truncated? "
+                "Score 3 if the file has a proper closing tag/brace and no mid-sentence cuts; "
+                "0 if obviously truncated.\n\n"
+                'Return: {"score": <sum 0-10>, '
+                '"gaps": ["<specific missing requirement or defect>", ...], '
+                '"feedback": "<one concise sentence>"}\n\n'
+                f"Score >= {PASS_THRESHOLD} is a PASS."
+            )
+        else:
+            prompt = (
+                f"Original objective:\n{objective}\n\n"
+                f"Agent response (excerpt):\n{response[:3000]}\n\n"
+                f"Files created: {files_created if files_created else ['(none)']}\n\n"
+                f"Test execution output:\n{test_output}\n\n"
+                "Evaluate on these three dimensions and return ONLY valid JSON:\n\n"
+                "1. Requirement fulfilment (0-5): Does the implementation address EVERYTHING "
+                "requested in the objective?\n"
+                "2. Completeness (0-3): Are edge cases, error handling, and all requested "
+                "files/features present?\n"
+                "3. Test results (0-2): 2 if tests pass; 1 if no tests were requested; "
+                "0 if tests exist and are failing.\n\n"
+                'Return: {"score": <sum 0-10>, '
+                '"gaps": ["<specific missing requirement or defect>", ...], '
+                '"feedback": "<one concise sentence>"}\n\n'
+                f"Score >= {PASS_THRESHOLD} is a PASS."
+            )
         raw = await self._call_llm(system, prompt)
         score = max(0, min(10, int(raw.get("score", 5))))
         gaps = [str(g) for g in raw.get("gaps", []) if g]
@@ -374,6 +417,44 @@ class VerifierAgent:
         except Exception as exc:
             self.logger.warning("verifier_llm_error", error=str(exc))
             return {}
+
+    def _duplicate_heading_penalty(self, response: str, files_created: List[str]) -> int:
+        """Return a score penalty (0-2) if output files contain duplicate H2/H3 headings.
+
+        Reads the primary output file directly so we inspect the actual written
+        content, not just the agent's response excerpt.
+        """
+        import os
+        from pathlib import Path as _Path
+
+        texts_to_check: list[str] = []
+
+        if files_created:
+            _ws = os.getenv("WORKSPACE_PATH", "./workspace")
+            _ws_base = _Path(_ws).resolve()
+            for fp in files_created[:3]:
+                try:
+                    full = (_ws_base / fp).resolve()
+                    if full.is_relative_to(_ws_base) and full.exists() and full.suffix in (".md", ".txt"):
+                        texts_to_check.append(full.read_text(encoding="utf-8", errors="ignore"))
+                except Exception:
+                    pass
+
+        if not texts_to_check:
+            texts_to_check = [response]
+
+        for text in texts_to_check:
+            headings = [
+                ln.strip().lower()
+                for ln in text.splitlines()
+                if re.match(r"^#{2,3}\s", ln)
+            ]
+            if len(headings) != len(set(headings)):
+                dup_count = len(headings) - len(set(headings))
+                self.logger.warning("verifier_duplicate_headings", count=dup_count)
+                return 2
+
+        return 0
 
     def _format_research_report(
         self, coverage: int, depth: int, files_ok: bool, score: int, gaps: List[str]

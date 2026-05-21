@@ -36,12 +36,70 @@ class CriterionResult:
 logger = structlog.get_logger()
 
 
+# Directories that should never be searched for deliverable files.
+_EXCLUDE_DIRS = frozenset({
+    "node_modules", ".git", ".venv", "venv", "__pycache__",
+    "vendor", "target", "dist", "build", ".next", ".nuxt",
+})
+
+
+def _glob_filtered(ws: Path, pattern: str) -> list[Path]:
+    """Glob `pattern` relative to `ws`, excluding dependency/build directories.
+
+    Results are sorted by path depth (shallowest first) so that project-root
+    files are preferred over deeply nested ones in subdirectories.
+    """
+    matches = [
+        p for p in ws.glob(pattern)
+        if not any(part in _EXCLUDE_DIRS for part in p.parts)
+        and p.is_file()
+    ]
+    matches.sort(key=lambda p: len(p.parts))
+    return matches
+
+
 def _select_primary_file(output_files: list[str]) -> str:
     """Prefer root-level files over subdirectory files; fall back to first."""
     for f in output_files:
         if "/" not in f.replace("\\", "/").lstrip("/"):
             return f
     return output_files[0]
+
+
+def _summarize_existing_sections(text: str, max_chars: int = 3000) -> str:
+    """Return a compact map of heading + first 150 chars of each section body.
+
+    This gives the documenter enough context to know what each section already
+    covers without sending the full file, preventing it from generating content
+    that duplicates existing sections under different headings.
+    """
+    lines = text.splitlines()
+    sections: list[str] = []
+    current_heading = ""
+    body_lines: list[str] = []
+
+    def _flush():
+        if not current_heading:
+            return
+        body = " ".join(body_lines).strip()
+        snippet = body[:150].rstrip()
+        if len(body) > 150:
+            snippet += "…"
+        sections.append(f"{current_heading}  →  {snippet}" if snippet else current_heading)
+
+    for line in lines:
+        if line.startswith("#"):
+            _flush()
+            current_heading = line.strip()
+            body_lines = []
+        else:
+            stripped = line.strip()
+            if stripped and not stripped.startswith("|") and len(body_lines) < 4:
+                body_lines.append(stripped)
+    _flush()
+
+    result = "\n".join(sections)
+    return result[:max_chars]
 
 
 class VerifierCoordinator:
@@ -51,6 +109,8 @@ class VerifierCoordinator:
         self.verifier_agent = verifier_agent
         self.model_router = model_router
         self.logger = logger.bind(component="verifier_coordinator")
+        # Set by run_acceptance_tests(); read by orchestrator to populate the job record.
+        self.last_screenshot_path: Optional[str] = None
 
     # ------------------------------------------------------------------
     # Verification
@@ -91,7 +151,24 @@ class VerifierCoordinator:
                     objective, excerpt, files_created
                 )
             else:
-                if len(combined_response) > 4500:
+                # For code tasks, prefer reading actual files over agent dialogue text.
+                # The dialogue is often shell commands / fix-round noise that confuses
+                # the scoring LLM and produces 0/10 even when the file is valid.
+                _ws = os.getenv("WORKSPACE_PATH", "./workspace")
+                _ws_base = Path(_ws).resolve()
+                _per_file = char_budget(self.model_router, fraction=0.08, cap=16_000)
+                file_excerpts: list[str] = []
+                for fp in files_created[:4]:
+                    try:
+                        full = (_ws_base / fp).resolve()
+                        if full.is_relative_to(_ws_base) and full.exists():
+                            content = full.read_text(encoding="utf-8", errors="ignore")
+                            file_excerpts.append(f"### File: {fp}\n\n{content[:_per_file]}")
+                    except Exception:
+                        pass
+                if file_excerpts:
+                    excerpt = "\n\n".join(file_excerpts)
+                elif len(combined_response) > 4500:
                     excerpt = combined_response[:1000] + "\n[...]\n" + combined_response[-3500:]
                 else:
                     excerpt = combined_response
@@ -162,21 +239,60 @@ class VerifierCoordinator:
         # --- auto-check: file exists ---
         if lower.startswith("file exists:"):
             rel = criterion[len("file exists:"):].strip()
-            target = (ws / rel).resolve()
-            ok = target.exists()
-            return CriterionResult(criterion=criterion, passed=ok, detail=f"{'found' if ok else 'missing'}: {rel}")
+            if "*" in rel or "?" in rel:
+                matches = _glob_filtered(ws, rel)
+                if not matches and not rel.startswith("**/"):
+                    # Root-level glob found nothing; try recursive search.
+                    matches = _glob_filtered(ws, f"**/{rel.lstrip('/')}")
+                ok = len(matches) > 0
+                detail = f"found: {matches[0].relative_to(ws)}" if ok else f"no match: {rel}"
+            else:
+                target = (ws / rel).resolve()
+                ok = target.exists()
+                if not ok:
+                    # Fallback: agent may have used a different name — search recursively by ext
+                    ext = Path(rel).suffix
+                    fallback = _glob_filtered(ws, f"**/*{ext}") if ext else []
+                    if fallback:
+                        ok = True
+                        detail = f"found (as {fallback[0].relative_to(ws)}, not {rel})"
+                    else:
+                        detail = f"missing: {rel}"
+                else:
+                    detail = f"found: {rel}"
+            return CriterionResult(criterion=criterion, passed=ok, detail=detail)
 
         # --- auto-check: file contains ---
         if lower.startswith("file contains:"):
             payload = criterion[len("file contains:"):].strip()
-            if ":" in payload:
-                rel, substring = payload.split(":", 1)
-            else:
+            if ":" not in payload:
                 return CriterionResult(criterion=criterion, passed=False, detail="malformed — expected path:substring")
+            rel, substring = payload.split(":", 1)
+            rel, substring = rel.strip(), substring.strip()
             try:
-                content = (ws / rel.strip()).read_text(encoding="utf-8", errors="ignore")
-                ok = substring.strip() in content
-                return CriterionResult(criterion=criterion, passed=ok, detail=f"{'found' if ok else 'not found'}: '{substring[:60]}' in {rel}")
+                if "*" in rel or "?" in rel:
+                    matches = _glob_filtered(ws, rel)
+                    if not matches:
+                        # Try recursive variant if no match at root level
+                        if not rel.startswith("**"):
+                            matches = _glob_filtered(ws, f"**/{rel.lstrip('/')}")
+                    if not matches:
+                        return CriterionResult(criterion=criterion, passed=False, detail=f"no match: {rel}")
+                    for match in matches:
+                        content = match.read_text(encoding="utf-8", errors="ignore")
+                        if substring in content:
+                            return CriterionResult(criterion=criterion, passed=True, detail=f"found: '{substring[:60]}' in {match.relative_to(ws)}")
+                    return CriterionResult(criterion=criterion, passed=False, detail=f"not found: '{substring[:60]}' in any {rel}")
+                # Exact-filename path — if absent, fall back to recursive *.ext search
+                target_path = ws / rel
+                if not target_path.exists():
+                    ext = Path(rel).suffix
+                    fallback = _glob_filtered(ws, f"**/*{ext}") if ext else []
+                    if fallback:
+                        target_path = fallback[0]
+                content = target_path.read_text(encoding="utf-8", errors="ignore")
+                ok = substring in content
+                return CriterionResult(criterion=criterion, passed=ok, detail=f"{'found' if ok else 'not found'}: '{substring[:60]}' in {target_path.relative_to(ws)}")
             except Exception as exc:
                 return CriterionResult(criterion=criterion, passed=False, detail=f"read error: {exc}")
 
@@ -184,9 +300,9 @@ class VerifierCoordinator:
         return await self._llm_eval_criterion(criterion, combined_response)
 
     async def _llm_eval_criterion(self, criterion: str, combined_response: str) -> CriterionResult:
-        """Use the LLM to evaluate a behavioral/visual criterion."""
+        """Use a free evaluator model to judge a behavioral/visual criterion."""
         try:
-            model = self.model_router.get_model("coding")
+            model = await self.model_router.get_evaluator_model()
             system = "You are a strict pass/fail evaluator. Answer only with valid JSON."
             excerpt = combined_response[:2000] if combined_response else "(no response available)"
             prompt = (
@@ -195,9 +311,10 @@ class VerifierCoordinator:
                 'Does the agent output satisfy this criterion? Return ONLY: {"passed": true} or {"passed": false, "detail": "<why not>"}'
             )
             raw = await self.model_router.generate(prompt, model, system_prompt=system, enable_thinking=False)
-            m = re.search(r"\{[\s\S]*\}", raw or "")
-            if m:
-                obj = json.loads(m.group())
+            raw_s = (raw or "").strip()
+            brace = raw_s.find("{")
+            if brace != -1:
+                obj, _ = json.JSONDecoder().raw_decode(raw_s[brace:])
                 passed = bool(obj.get("passed", False))
                 detail = str(obj.get("detail", ""))
                 return CriterionResult(criterion=criterion, passed=passed, detail=detail)
@@ -226,14 +343,22 @@ class VerifierCoordinator:
         screenshot_path: Optional[str] = None
 
         if handle is None:
-            self.logger.warning("acceptance_launch_failed", workspace=str(workspace))
-            return [
-                AcceptanceResult(criterion=c, passed=False, detail="(app failed to launch)")
-                for c in criteria
-            ]
+            # No server entry point — try to screenshot the largest HTML file directly
+            # via file:// so Discord gets a preview of the static deliverable.
+            html_files = sorted(
+                workspace.glob("*.html"),
+                key=lambda p: p.stat().st_size,
+                reverse=True,
+            )
+            if html_files:
+                screenshot_path = await app_probe.screenshot_file(html_files[0])
+                self.last_screenshot_path = screenshot_path
+            self.logger.info("acceptance_skipped_no_entry_point", workspace=str(workspace))
+            return []
 
         try:
             screenshot_path = await app_probe.screenshot(handle)
+            self.last_screenshot_path = screenshot_path
             results = await acceptance_tester.run_tests(criteria, workspace, screenshot_path=screenshot_path)
         finally:
             await app_probe.teardown(handle)
@@ -256,7 +381,47 @@ class VerifierCoordinator:
         screenshot_path: Optional[str] = None,
     ) -> dict:
         """Return a single fix task spec targeted at one failing criterion."""
-        phase, instruction = self._detect_fix_phase(test_out, failing.detail, round_num)
+        lower_c = failing.criterion.lower()
+
+        # Structural criteria have obvious, deterministic fixes — bypass phase detection.
+        if lower_c.startswith("file contains:"):
+            payload = failing.criterion[len("file contains:"):].strip()
+            if ":" in payload:
+                rel, substring = payload.split(":", 1)
+                rel, substring = rel.strip(), substring.strip()
+                detail_lower = failing.detail.lower()
+                if detail_lower.startswith("read error") or detail_lower.startswith("missing:"):
+                    instruction = (
+                        f"Create the file `{rel}` and ensure it contains the text `{substring}`. "
+                        f"Use a FILE: block with appropriate content."
+                    )
+                else:
+                    instruction = (
+                        f"Read `{rel}` first, then add the text `{substring}` to the file using an "
+                        f"APPEND: block. Do NOT rewrite the file with FILE: — only append the missing content."
+                    )
+                phase = "file-content"
+            else:
+                phase, instruction = self._detect_fix_phase(test_out, failing.detail, round_num)
+
+        elif lower_c.startswith("file exists:"):
+            rel = failing.criterion[len("file exists:"):].strip()
+            if "*" in rel or "?" in rel:
+                # Give the agent a concrete filename — seeing a glob wildcard as a filename is confusing.
+                example = re.sub(r"[*?]+", "COMPLETE", rel)
+                instruction = (
+                    f"Create a file matching the pattern `{rel}` at the project root. "
+                    f"Use a concrete name such as `{example}` and fill it with appropriate content "
+                    f"(a summary of what was built, next steps, etc.). "
+                    f"Place the file directly in the workspace root, not in a subdirectory."
+                )
+            else:
+                instruction = f"Create the missing file `{rel}` at the project root with appropriate content."
+            phase = "file-missing"
+
+        else:
+            phase, instruction = self._detect_fix_phase(test_out, failing.detail, round_num)
+
         detail_block = f"\n\nWhy it failed: {failing.detail}" if failing.detail else ""
         test_block = f"\n\nVerifier output:\n```\n{test_out[:600]}\n```" if test_out else ""
         shot_block = (
@@ -275,6 +440,40 @@ class VerifierCoordinator:
             ),
             "agent_type": "develop",
         }
+
+    # ------------------------------------------------------------------
+    # Fix-spec generation helpers
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _extract_truncated_file_info(test_out: str) -> list[tuple[str, list[str], str, int]]:
+        """Parse truncated file paths from verifier test output and read their tail.
+
+        Returns list of (rel_path, last_lines, file_ext, total_lines) for each truncated file.
+        """
+        _ws = os.getenv("WORKSPACE_PATH", "./workspace")
+        ws = Path(_ws).resolve()
+        results: list[tuple[str, list[str], str, int]] = []
+        in_block = False
+        for line in test_out.splitlines():
+            if "[truncated]" in line.lower() and "fail" in line.lower():
+                in_block = True
+                continue
+            if in_block:
+                if re.match(r"^\s{2,}\S", line):
+                    rel = line.strip()
+                    try:
+                        full = (ws / rel).resolve()
+                        if full.is_relative_to(ws) and full.exists():
+                            raw = full.read_text(encoding="utf-8", errors="ignore")
+                            all_lines = raw.splitlines()
+                            last_lines = [ln for ln in all_lines[-30:] if ln.strip()]
+                            results.append((rel, last_lines, full.suffix.lower(), len(all_lines)))
+                    except Exception:
+                        pass
+                else:
+                    in_block = False
+        return results
 
     # ------------------------------------------------------------------
     # Fix-spec generation
@@ -314,22 +513,20 @@ class VerifierCoordinator:
                     ),
                     "agent_type": "research",
                 })
-            existing_headings = ""
+            existing_coverage = ""
             try:
                 _ws = os.getenv("WORKSPACE_PATH", "./workspace")
                 _ws_base = Path(_ws).resolve()
                 _fp = (_ws_base / file_ref).resolve()
                 if _fp.is_relative_to(_ws_base) and _fp.exists():
                     raw = _fp.read_text(encoding="utf-8", errors="ignore")
-                    existing_headings = "\n".join(
-                        line for line in raw.splitlines() if line.startswith("#")
-                    )
+                    existing_coverage = _summarize_existing_sections(raw, max_chars=3000)
             except Exception:
                 pass
             gaps_text = "; ".join(gaps[:3])
             headings_block = (
-                f"\n\nExisting sections (do not repeat these):\n{existing_headings[:2000]}"
-                if existing_headings else ""
+                f"\n\nExisting file structure (do not repeat any of this):\n{existing_coverage}"
+                if existing_coverage else ""
             )
             specs.append({
                 "description": (
@@ -367,20 +564,42 @@ class VerifierCoordinator:
         if test_out:
             test_section = f"\n\nVerifier test output:\n```\n{test_out[:800]}\n```"
 
-        # --- File chunking directive when truncation detected ---
+        # --- File chunking / append directive when truncation detected ---
         chunking_section = ""
         combined_signals = (test_out + " " + gaps_text).lower()
+        _CODE_EXTS = frozenset({".js", ".mjs", ".cjs", ".ts", ".tsx", ".rs", ".go", ".py", ".java", ".cs"})
         if "[truncated]" in combined_signals or "truncat" in combined_signals:
-            chunking_section = (
-                "\n\n⚠️ FILE TRUNCATION DETECTED: One or more files were cut off during generation. "
-                "NEVER write large implementations as a single monolithic file. "
-                "Rules:\n"
-                "  • Each file must be under ~150 lines\n"
-                "  • Extract logic into small focused modules\n"
-                "  • Use imports/includes to compose them\n"
-                "  • E.g. split: logic → separate module, styles → separate file, "
-                "entry → thin wrapper that imports the rest"
-            )
+            truncated_infos = self._extract_truncated_file_info(test_out)
+            if truncated_infos:
+                append_parts: list[str] = []
+                has_code = False
+                for rel, last_lines, ext, total_lines in truncated_infos:
+                    tail = "\n".join(last_lines[-25:])
+                    if ext == ".html":
+                        append_parts.append(
+                            f"\n  • `{rel}` is truncated. The last content is:\n"
+                            f"    ```html\n{tail}\n    ```\n"
+                            f"    APPEND only the minimal closing tags needed (e.g. `</div></body></html>`) "
+                            f"using an APPEND: block — do NOT rewrite the file with FILE:."
+                        )
+                    elif ext in _CODE_EXTS:
+                        has_code = True
+                        append_parts.append(
+                            f"\n  • `{rel}` is truncated at line {total_lines}. "
+                            f"Last content:\n    ```\n{tail}\n    ```"
+                        )
+                chunking_section = "\n\n⚠️ FILE TRUNCATION DETECTED:" + "".join(append_parts)
+                if has_code:
+                    chunking_section += (
+                        "\n\n  For code files: do NOT rewrite as one large block. "
+                        "Split into small focused modules (<150 lines each) and use imports to compose them."
+                    )
+            else:
+                chunking_section = (
+                    "\n\n⚠️ FILE TRUNCATION DETECTED: One or more files were cut off during generation. "
+                    "For HTML: use APPEND: blocks to add only the missing closing tags — do NOT rewrite with FILE:. "
+                    "For code: split into small focused modules (<150 lines each) and use imports."
+                )
 
         # --- Changed files section ---
         changed_section = ""
@@ -416,6 +635,13 @@ class VerifierCoordinator:
         combined = (test_out + " " + gaps_text).lower()
 
         if "[truncated]" in combined or ("truncat" in combined and "incomplete" in combined):
+            if ".html" in combined:
+                return "file-incomplete", (
+                    "One or more HTML files appear TRUNCATED (cut off during generation). "
+                    "Do NOT rewrite the file using FILE: — that will truncate again. "
+                    "Use APPEND: to add only the minimal closing tags needed to make the file valid "
+                    "(e.g. `</div></body></html>`)."
+                )
             return "file-incomplete", (
                 "One or more files appear TRUNCATED (cut off during generation). "
                 "Do NOT rewrite them as single large blocks. "

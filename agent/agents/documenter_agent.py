@@ -114,11 +114,21 @@ class DocumenterRole:
             enriched = preamble + "\n\n" + research
         else:
             enriched = enriched_full[:_max_input_chars]
+        _is_append_task = any(
+            kw in task.lower()
+            for kw in ("add new sections", "append", "add sections to", "add missing sections")
+        )
+        _block_instruction = (
+            "using APPEND: blocks that add ONLY the missing sections — "
+            "do NOT rewrite or repeat any content that already exists in the file"
+            if _is_append_task else
+            "with FILE: blocks"
+        )
         prompt = (
             f"{enriched}\n\n"
             f"## Documentation Task\n{task}\n\n"
-            f"Using the research findings above, write comprehensive documentation "
-            f"with FILE: blocks. Include specific facts, names, comparisons, and "
+            f"Using the research findings above, write the required documentation "
+            f"{_block_instruction}. Include specific facts, names, comparisons, and "
             f"recommendations from the research — do not summarize or compress."
         )
 
