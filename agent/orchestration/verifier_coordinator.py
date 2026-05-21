@@ -241,6 +241,9 @@ class VerifierCoordinator:
             rel = criterion[len("file exists:"):].strip()
             if "*" in rel or "?" in rel:
                 matches = _glob_filtered(ws, rel)
+                if not matches and not rel.startswith("**/"):
+                    # Root-level glob found nothing; try recursive search.
+                    matches = _glob_filtered(ws, f"**/{rel.lstrip('/')}")
                 ok = len(matches) > 0
                 detail = f"found: {matches[0].relative_to(ws)}" if ok else f"no match: {rel}"
             else:
@@ -403,7 +406,17 @@ class VerifierCoordinator:
 
         elif lower_c.startswith("file exists:"):
             rel = failing.criterion[len("file exists:"):].strip()
-            instruction = f"Create the missing file `{rel}` with appropriate content for the project."
+            if "*" in rel or "?" in rel:
+                # Give the agent a concrete filename — seeing a glob wildcard as a filename is confusing.
+                example = re.sub(r"[*?]+", "COMPLETE", rel)
+                instruction = (
+                    f"Create a file matching the pattern `{rel}` at the project root. "
+                    f"Use a concrete name such as `{example}` and fill it with appropriate content "
+                    f"(a summary of what was built, next steps, etc.). "
+                    f"Place the file directly in the workspace root, not in a subdirectory."
+                )
+            else:
+                instruction = f"Create the missing file `{rel}` at the project root with appropriate content."
             phase = "file-missing"
 
         else:
