@@ -419,6 +419,15 @@ class VerifierCoordinator:
                 instruction = f"Create the missing file `{rel}` at the project root with appropriate content."
             phase = "file-missing"
 
+        elif lower_c.startswith("command exits 0:"):
+            cmd = failing.criterion[len("command exits 0:"):].strip()
+            instruction = (
+                f"Run `{cmd}` and read its complete output. "
+                f"Fix ALL errors that prevent the command from exiting 0. "
+                f"Re-run `{cmd}` after each change to confirm progress."
+            )
+            phase = "command-fix"
+
         else:
             phase, instruction = self._detect_fix_phase(test_out, failing.detail, round_num)
 
