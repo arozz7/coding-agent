@@ -204,7 +204,7 @@ FILE: path/to/file.ext
 entire file content here
 ```
 
-IMPORTANT: FILE: and APPEND: paths must ALWAYS be relative to the workspace root (e.g. `src/App.tsx`, `package.json`). Never use absolute paths like `C:\Users\...` or `J:\Projects\...` — the system resolves them from the workspace root automatically.
+IMPORTANT: FILE: and APPEND: paths must ALWAYS be relative to the workspace root (e.g. `src/App.tsx`, `package.json`). Never use absolute paths like `C:\\Users\\...` or `J:\\Projects\\...` — the system resolves them from the workspace root automatically.
 
 Format for appending to the END of an existing file (preserves all earlier content):
 APPEND: path/to/file.ext
