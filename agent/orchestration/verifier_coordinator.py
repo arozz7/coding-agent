@@ -395,6 +395,15 @@ class VerifierCoordinator:
                         f"Create the file `{rel}` and ensure it contains the text `{substring}`. "
                         f"Use a FILE: block with appropriate content."
                     )
+                elif substring.strip() == "[x]":
+                    # Checkbox-completion criterion — appending [x] is wrong; checkboxes must be
+                    # edited in-place.  Using FILE: risks destroying co-located content (e.g. a
+                    # "Next Steps" section), causing oscillation with other criteria.
+                    instruction = (
+                        f"Read `{rel}` first. Use REPLACE: or EDIT: blocks to mark all incomplete "
+                        f"task checkboxes as done by changing `- [ ]` to `- [x]`. "
+                        f"Do NOT use FILE: — it will overwrite sections needed by other criteria."
+                    )
                 else:
                     instruction = (
                         f"Read `{rel}` first, then add the text `{substring}` to the file using an "
