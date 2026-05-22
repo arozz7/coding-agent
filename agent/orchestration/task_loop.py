@@ -302,6 +302,7 @@ class TaskLoop:
                                 last_screenshot=_last_acceptance_screenshot,
                                 screenshot_path=screenshot_path,
                                 shell_fn=_shell,
+                                combined_response="\n\n---\n\n".join(all_responses),
                             )
                         if not acc_done:
                             continue
@@ -567,6 +568,7 @@ class TaskLoop:
         last_screenshot: Optional[str],
         screenshot_path: Optional[str],
         shell_fn: Callable,
+        combined_response: str = "",
     ) -> tuple[bool, int, Optional[str], Optional[str]]:
         """Run one acceptance-test iteration.
 
@@ -577,14 +579,31 @@ class TaskLoop:
 
         d = self._d
         ws_acc = Path(getattr(d.tool_executor, "workspace_path", ".") if d.tool_executor else ".")
-        app_probe = AppProbe(ws_acc, shell_fn=shell_fn)
-        acc_results = await d.verifier_coordinator.run_acceptance_tests(
-            acceptance_criteria, ws_acc, app_probe, d.acceptance_tester_agent
-        )
-        cap = d.verifier_coordinator.last_screenshot_path
-        if cap:
-            last_screenshot = cap
-            screenshot_path = cap
+
+        # Auto-checkable criteria must be evaluated via filesystem/shell — not via
+        # LLM/screenshot.  Planners sometimes misplace these in acceptance_criteria;
+        # evaluating them here prevents spurious "file not found" failures that each
+        # trigger a fix task and corrupt the workspace.
+        auto_crit = [c for c in acceptance_criteria if any(c.lower().startswith(p) for p in _AUTO_PREFIXES)]
+        visual_crit = [c for c in acceptance_criteria if c not in set(auto_crit)]
+
+        auto_results: list = []
+        if auto_crit:
+            auto_results = await d.verifier_coordinator.evaluate_criteria(auto_crit, ws_acc, shell_fn)
+
+        visual_results: list = []
+        if visual_crit:
+            app_probe = AppProbe(ws_acc, shell_fn=shell_fn)
+            visual_results = await d.verifier_coordinator.run_acceptance_tests(
+                visual_crit, ws_acc, app_probe, d.acceptance_tester_agent,
+                agent_output=combined_response,
+            )
+            cap = d.verifier_coordinator.last_screenshot_path
+            if cap:
+                last_screenshot = cap
+                screenshot_path = cap
+
+        acc_results = auto_results + visual_results
 
         if not acc_results:
             task_summaries.append("⏭️ Acceptance tests skipped — no server entry point detected")

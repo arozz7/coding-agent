@@ -328,6 +328,7 @@ class VerifierCoordinator:
         workspace: Path,
         app_probe: "AppProbe",
         acceptance_tester: "AcceptanceTesterAgent",
+        agent_output: str = "",
     ) -> List["AcceptanceResult"]:
         """Launch the app, screenshot it, evaluate acceptance criteria, teardown.
 
@@ -359,7 +360,9 @@ class VerifierCoordinator:
         try:
             screenshot_path = await app_probe.screenshot(handle)
             self.last_screenshot_path = screenshot_path
-            results = await acceptance_tester.run_tests(criteria, workspace, screenshot_path=screenshot_path)
+            results = await acceptance_tester.run_tests(
+                criteria, workspace, screenshot_path=screenshot_path, agent_output=agent_output
+            )
         finally:
             await app_probe.teardown(handle)
 
