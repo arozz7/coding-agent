@@ -67,7 +67,13 @@ _LOCAL_TASK_RE = re.compile(
     r"last\s+(failed\s+)?(job|error|run|task|build)|"
     r"(?:find|show|check|look\s+at)\s+(?:the\s+)?(?:errors?|bugs?|issues?|logs?|output|files?)|"
     r"what\s+(?:is|was|went)\s+wrong|"
-    r"why\s+(?:is|did|does)\s+it\s+fail"
+    r"why\s+(?:is|did|does)\s+it\s+fail|"
+    # Local project documentation signals — planner sub-tasks often reference these
+    # without using "workspace/codebase" phrasing, but they are clearly about local files.
+    r"phase\s+\d+|"
+    r"(the|our|current|existing)\s+(docs?|documentation|plans?|impl(?:ementation)?\s+plan|change.?log)|"
+    r"(across|in|from)\s+(the\s+)?(docs?|documents?|plans?|files?)|"
+    r"aiChangeLog|agent.wiki|implementation\s+plan"
     r")\b",
     re.IGNORECASE,
 )
