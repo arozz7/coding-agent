@@ -61,20 +61,37 @@ _FILE_WRITE_RE = re.compile(
 
 # Patterns that indicate the task is about local workspace content — no web
 # search needed even if no specific file names are mentioned.
+#
+# IMPORTANT: the routing default is web search; only LOCAL signals can suppress it.
+# Each branch uses its own word-boundary markers because some patterns (src/, dist/)
+# end on non-word characters and cannot use a trailing \b.
 _LOCAL_TASK_RE = re.compile(
-    r"\b("
-    r"in\s+the\s+(workspace|project|codebase|repo(?:sitory)?)|"
-    r"last\s+(failed\s+)?(job|error|run|task|build)|"
-    r"(?:find|show|check|look\s+at)\s+(?:the\s+)?(?:errors?|bugs?|issues?|logs?|output|files?)|"
-    r"what\s+(?:is|was|went)\s+wrong|"
-    r"why\s+(?:is|did|does)\s+it\s+fail|"
-    # Local project documentation signals — planner sub-tasks often reference these
-    # without using "workspace/codebase" phrasing, but they are clearly about local files.
-    r"phase\s+\d+|"
-    r"(the|our|current|existing)\s+(docs?|documentation|plans?|impl(?:ementation)?\s+plan|change.?log)|"
-    r"(across|in|from)\s+(the\s+)?(docs?|documents?|plans?|files?)|"
-    r"aiChangeLog|agent.wiki|implementation\s+plan"
-    r")\b",
+    r"("
+    # Workspace / codebase explicit references
+    r"\bin\s+the\s+(workspace|project|codebase|repo(?:sitory)?)\b|"
+    r"\blast\s+(failed\s+)?(job|error|run|task|build)\b|"
+    r"\b(?:find|show|check|look\s+at)\s+(?:the\s+)?(?:errors?|bugs?|issues?|logs?|output|files?)\b|"
+    r"\bwhat\s+(?:is|was|went)\s+wrong\b|"
+    r"\bwhy\s+(?:is|did|does)\s+it\s+fail\b|"
+    # Phase / documentation / plan references (with or without space/underscore — covers filenames like PHASE1.md)
+    r"\bphase[\s_\-]?\d+\b|"
+    r"\b(the|our|current|existing)\s+(docs?|documentation|plans?|impl(?:ementation)?\s+plan|change.?log)\b|"
+    r"\b(across|in|from)\s+(the\s+)?(docs?|documents?|plans?|files?)\b|"
+    r"\baiChangeLog\b|\bagent.wiki\b|\bimplementation\s+plan\b|"
+    # Any filename with a recognisable extension — these are always local workspace files
+    r"\b[\w][\w\-\.]*\.(json|yaml|yml|toml|md|ts|tsx|js|jsx|py|rs|go|java|cs|css|scss|html?|env|lock|config|ini|cfg|sh|ps1|sql|txt|log)\b|"
+    # Directory path fragments (no trailing \b — / is not a word char)
+    r"\bsrc/|\bdist/|\blib/|\bpublic/|\bassets/|\btests?/|\bnode_modules/|"
+    # Git operations — always about the local repo
+    r"\bgit\s+(status|log|diff|branch|commit|push|pull|blame|show|stash|merge|rebase)\b|"
+    # Package manager operations — always local project context
+    r"\bnpm\s+(run|install|build|test|start|ci|update|uninstall)\b|"
+    r"\byarn\s+(run|install|build|test|start|add|remove)\b|"
+    r"\bpnpm\s+(run|install|build|test|start|add|remove)\b|"
+    r"\bcargo\s+(build|run|test|check|clippy|fmt)\b|"
+    # Structure / layout requests — always local
+    r"\b(directory|file|project)\s+structure\b"
+    r")",
     re.IGNORECASE,
 )
 
