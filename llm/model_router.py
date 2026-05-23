@@ -10,7 +10,7 @@ import structlog
 
 from .config import ModelConfig
 from .ollama_client import OllamaClient, ModelNotReadyError
-from .cloud_api_client import CloudAPIClient, _OpenRouterRateLimitError
+from .cloud_api_client import CloudAPIClient, _OpenRouterRateLimitError, _OpenRouterPaymentRequiredError
 from .cost_tracker import CostTracker
 from .rate_limiter import RateLimiter, RateLimitExceeded
 from .health import HealthChecker
@@ -54,6 +54,7 @@ class ModelRouter:
         # Tuple of (ModelConfig, monotonic timestamp); refreshed every _EVALUATOR_CACHE_TTL seconds.
         self._evaluator_cache: Optional[Tuple[ModelConfig, float]] = None
         self._EVALUATOR_CACHE_TTL: float = 3600.0
+        self._evaluator_blacklist: set[str] = set()  # models that returned 402; excluded from selection
         self._load_configs(config_path)
 
     def _configure_ollama_endpoint(self, config: ModelConfig) -> None:
@@ -353,6 +354,7 @@ class ModelRouter:
                 if str(m.get("pricing", {}).get("prompt", "1")) == "0"
                 and str(m.get("pricing", {}).get("completion", "1")) == "0"
                 and int(m.get("context_length") or 0) >= 8192
+                and m.get("id", "") not in self._evaluator_blacklist
             ]
 
             if not free:
@@ -533,6 +535,27 @@ class ModelRouter:
                         system_prompt=system_prompt,
                     )
                 raise
+
+            except _OpenRouterPaymentRequiredError:
+                # 402 means this model's free-tier credits are exhausted.
+                # Blacklist it so get_evaluator_model() skips it on re-selection,
+                # then fall back immediately — no retry makes sense here.
+                self._evaluator_blacklist.add(config.name)
+                self._evaluator_cache = None  # force re-selection next call
+                self.logger.warning("openrouter_payment_required", model=config.name)
+                if not _is_fallback:
+                    return await self._run_fallback_chain(
+                        prompt=prompt,
+                        exclude=config.name,
+                        reason="payment_required",
+                        chain=_fallback_chain,
+                        max_retries=max_retries,
+                        timeout=timeout,
+                        enable_thinking=enable_thinking,
+                        original_error=None,
+                        system_prompt=system_prompt,
+                    )
+                raise LLMError(f"OpenRouter model {config.name!r} is out of free credits and no fallback available") from None
 
             except _OpenRouterRateLimitError as e:
                 self.logger.warning(

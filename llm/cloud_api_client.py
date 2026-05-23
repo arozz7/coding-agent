@@ -21,6 +21,11 @@ class _OpenRouterRateLimitError(Exception):
         super().__init__(f"429 Too Many Requests (retry after {retry_after}s)")
 
 
+class _OpenRouterPaymentRequiredError(Exception):
+    """Raised when OpenRouter responds with 402 — model is out of free credits."""
+    pass
+
+
 class CloudAPIClient:
     def __init__(self):
         self.logger = logger.bind(component="cloud_api_client")
@@ -202,6 +207,8 @@ class CloudAPIClient:
             if response.status_code == 429:
                 retry_after = int(response.headers.get("retry-after", 0))
                 raise _OpenRouterRateLimitError(retry_after=retry_after)
+            if response.status_code == 402:
+                raise _OpenRouterPaymentRequiredError(f"Model {config.name!r} returned 402 — out of free credits")
             response.raise_for_status()
             data = response.json()
             return data["choices"][0]["message"]["content"]
