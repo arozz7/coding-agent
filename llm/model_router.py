@@ -54,7 +54,10 @@ class ModelRouter:
         # Tuple of (ModelConfig, monotonic timestamp); refreshed every _EVALUATOR_CACHE_TTL seconds.
         self._evaluator_cache: Optional[Tuple[ModelConfig, float]] = None
         self._EVALUATOR_CACHE_TTL: float = 3600.0
-        self._evaluator_blacklist: set[str] = set()  # models that returned 402; excluded from selection
+        # Models that returned 402 are blacklisted for _EVALUATOR_BLACKLIST_TTL seconds.
+        # OpenRouter free-tier limits reset daily, so 24 h is a safe expiry.
+        self._evaluator_blacklist: dict[str, float] = {}  # model_name -> blacklisted_at (monotonic)
+        self._EVALUATOR_BLACKLIST_TTL: float = 86400.0
         self._load_configs(config_path)
 
     def _configure_ollama_endpoint(self, config: ModelConfig) -> None:
@@ -349,6 +352,12 @@ class ModelRouter:
                 resp.raise_for_status()
                 models = resp.json().get("data", [])
 
+            _now = time.monotonic()
+            # Expire stale blacklist entries before filtering.
+            self._evaluator_blacklist = {
+                k: v for k, v in self._evaluator_blacklist.items()
+                if _now - v < self._EVALUATOR_BLACKLIST_TTL
+            }
             free = [
                 m for m in models
                 if str(m.get("pricing", {}).get("prompt", "1")) == "0"
@@ -538,11 +547,15 @@ class ModelRouter:
 
             except _OpenRouterPaymentRequiredError:
                 # 402 means this model's free-tier credits are exhausted.
-                # Blacklist it so get_evaluator_model() skips it on re-selection,
-                # then fall back immediately — no retry makes sense here.
-                self._evaluator_blacklist.add(config.name)
+                # Blacklist it for 24 h (daily reset) so get_evaluator_model()
+                # skips it on re-selection, then fall back immediately.
+                self._evaluator_blacklist[config.name] = time.monotonic()
                 self._evaluator_cache = None  # force re-selection next call
-                self.logger.warning("openrouter_payment_required", model=config.name)
+                self.logger.warning(
+                    "openrouter_payment_required",
+                    model=config.name,
+                    blacklisted_for_hours=self._EVALUATOR_BLACKLIST_TTL / 3600,
+                )
                 if not _is_fallback:
                     return await self._run_fallback_chain(
                         prompt=prompt,
