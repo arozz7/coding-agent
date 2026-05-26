@@ -223,6 +223,14 @@ class VerifierCoordinator:
         # --- auto-check: command exits 0 ---
         if lower.startswith("command exits 0:"):
             cmd = criterion[len("command exits 0:"):].strip()
+            # Strip prose suffixes the LLM sometimes appends after the shell command,
+            # e.g. "| End state: ..." or "| Constraint: ...". These are not shell syntax
+            # and would cause the shell to pipe to a nonexistent program.
+            for _prose_sep in (" | end state:", " | constraint:", " |end state:", " |constraint:"):
+                _idx = cmd.lower().find(_prose_sep)
+                if _idx != -1:
+                    cmd = cmd[:_idx].strip()
+                    break
             # Guard against long-running server commands
             _BLOCKING = ("npm start", "flask run", "uvicorn", "gunicorn", "python -m http.server", "serve")
             if any(b in cmd.lower() for b in _BLOCKING):
@@ -433,6 +441,11 @@ class VerifierCoordinator:
 
         elif lower_c.startswith("command exits 0:"):
             cmd = failing.criterion[len("command exits 0:"):].strip()
+            for _prose_sep in (" | end state:", " | constraint:", " |end state:", " |constraint:"):
+                _idx = cmd.lower().find(_prose_sep)
+                if _idx != -1:
+                    cmd = cmd[:_idx].strip()
+                    break
             instruction = (
                 f"Run `{cmd}` and read its complete output. "
                 f"Fix ALL errors that prevent the command from exiting 0. "
