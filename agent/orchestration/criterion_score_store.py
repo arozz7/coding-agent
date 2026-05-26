@@ -98,7 +98,7 @@ class CriterionScoreStore:
             return 3
         conf = self.get_confidence(criterion)
         if conf < self._SKIP_THRESHOLD:
-            return 1
+            return 2  # minimum 2 — never give up after just 1 attempt
         if conf < 0.50:
             return 2
         if conf >= 0.70:
