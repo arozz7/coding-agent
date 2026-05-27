@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import os
+import platform
 import re
 import subprocess
 from dataclasses import dataclass
@@ -236,7 +237,8 @@ class VerifierCoordinator:
             if any(b in cmd.lower() for b in _BLOCKING):
                 return CriterionResult(criterion=criterion, passed=True, detail="(server command skipped)")
             try:
-                out = await shell_fn(f"{cmd}; echo __EXIT__$?")
+                _sep = " & echo __EXIT__%ERRORLEVEL%" if platform.system() == "Windows" else "; echo __EXIT__$?"
+                out = await shell_fn(f"{cmd}{_sep}")
                 m = re.search(r"__EXIT__(\d+)", out or "")
                 if m and m.group(1) == "0":
                     return CriterionResult(criterion=criterion, passed=True, detail=f"exit 0: {cmd}")
