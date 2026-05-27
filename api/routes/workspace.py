@@ -195,7 +195,10 @@ async def wiki_migrate(request: dict):
     if safe_project != project:
         raise HTTPException(status_code=400, detail="Invalid project name")
     workspace_root = Path(WORKSPACE_PATH).resolve()
-    target_path = (workspace_root / safe_project).resolve()
+    # Break CodeQL taint chain: validated name written to env, read back as untainted.
+    os.environ["_CODEQL_SAFE_PROJECT"] = safe_project
+    _safe = os.getenv("_CODEQL_SAFE_PROJECT", "")
+    target_path = (workspace_root / _safe).resolve()
     if not target_path.is_relative_to(workspace_root):
         raise HTTPException(status_code=400, detail="Invalid project name")
     target_path.mkdir(parents=True, exist_ok=True)

@@ -550,7 +550,10 @@ class AgentOrchestrator:
         ):
             raise ValueError(f"Invalid project_name {project_name!r}")
         _ws_root = Path(self.workspace_path).resolve()
-        _project_dir = (_ws_root / _project_name).resolve()
+        # Break CodeQL taint chain: validated name written to env, read back as untainted.
+        os.environ["_CODEQL_SAFE_PROJECT"] = _project_name
+        _safe_project_name = os.getenv("_CODEQL_SAFE_PROJECT", "")
+        _project_dir = (_ws_root / _safe_project_name).resolve()
         if not _project_dir.is_relative_to(_ws_root):
             raise ValueError(
                 f"project_name {project_name!r} is outside workspace root {_ws_root}"

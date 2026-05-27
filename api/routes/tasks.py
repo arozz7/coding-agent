@@ -154,8 +154,8 @@ async def run_task_stream(request: TaskRequest):
                 include_history=request.include_history,
             ):
                 yield f"data: {json.dumps(chunk)}\n\n"
-        except Exception as e:
-            yield f"data: {json.dumps({'error': str(e)})}\n\n"
+        except Exception:
+            yield f"data: {json.dumps({'error': 'Task execution failed'})}\n\n"
 
     return StreamingResponse(event_generator(), media_type="text/event-stream")
 
