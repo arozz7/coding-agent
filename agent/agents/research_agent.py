@@ -90,7 +90,18 @@ _LOCAL_TASK_RE = re.compile(
     r"\bpnpm\s+(run|install|build|test|start|add|remove)\b|"
     r"\bcargo\s+(build|run|test|check|clippy|fmt)\b|"
     # Structure / layout requests — always local
-    r"\b(directory|file|project)\s+structure\b"
+    r"\b(directory|file|project)\s+structure\b|"
+    # Diagnostic / output analysis tasks — always about local workspace state
+    r"\bterminal\s+(output|log)\b|"
+    r"\bcompilation\s+(error|failure|output|log)\b|"
+    r"\bbuild\s+(error|failure|output|log)\b|"
+    r"\berror\s+log\b|"
+    r"\broot\s+cause\b|"
+    r"\bstep\s+\d+\b|"
+    r"\bread\s+(any\s+)?(source\s+)?(files?|logs?|output)\b|"
+    r"\bfailed\s+to\s+(build|compile|run|start|launch)\b|"
+    r"\banalyze\b.*\b(output|log|error|file|build|crash|failure)\b|"
+    r"\b(output|log|error|file|build|crash|failure)\b.*\banalyze\b"
     r")",
     re.IGNORECASE,
 )
