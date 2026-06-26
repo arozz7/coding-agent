@@ -401,6 +401,7 @@ class ModelRouter:
         timeout: float = 600.0,
         enable_thinking: bool | None = None,
         system_prompt: Optional[str] = None,
+        messages: Optional[List[dict]] = None,
     ) -> str:
         """Generate a completion.
 
@@ -452,6 +453,7 @@ class ModelRouter:
                         system_prompt=system_prompt,
                         enable_thinking=effective_thinking,
                         timeout=timeout,
+                        messages=messages,
                     )
                 else:
                     result = await self.cloud.generate(prompt, config, system_prompt=system_prompt)
@@ -517,6 +519,7 @@ class ModelRouter:
                     enable_thinking=enable_thinking,
                     original_error=e,
                     system_prompt=system_prompt,
+                    messages=messages,
                 )
 
             except RateLimitExceeded as e:
@@ -542,6 +545,7 @@ class ModelRouter:
                         enable_thinking=enable_thinking,
                         original_error=None,
                         system_prompt=system_prompt,
+                        messages=messages,
                     )
                 raise
 
@@ -567,6 +571,7 @@ class ModelRouter:
                         enable_thinking=enable_thinking,
                         original_error=None,
                         system_prompt=system_prompt,
+                        messages=messages,
                     )
                 raise LLMError(f"OpenRouter model {config.name!r} is out of free credits and no fallback available") from None
 
@@ -610,6 +615,7 @@ class ModelRouter:
                         enable_thinking=enable_thinking,
                         original_error=e,
                         system_prompt=system_prompt,
+                        messages=messages,
                     )
 
                 self.logger.error(
@@ -641,6 +647,7 @@ class ModelRouter:
         enable_thinking: Optional[bool],
         original_error: Optional[Exception],
         system_prompt: Optional[str] = None,
+        messages: Optional[List[dict]] = None,
     ) -> str:
         """Try each model in the fallback chain in order.
 
@@ -683,6 +690,7 @@ class ModelRouter:
             timeout=timeout,
             enable_thinking=enable_thinking,
             system_prompt=system_prompt,
+            messages=messages,
         )
 
     async def generate_stream(
@@ -690,11 +698,12 @@ class ModelRouter:
         prompt: str,
         config: ModelConfig,
         system_prompt: Optional[str] = None,
+        messages: Optional[List[dict]] = None,
     ) -> AsyncIterator[str]:
         await self.rate_limiter.acquire(config.name)
 
         if config.type == "local":
-            async for chunk in self.ollama.stream_generate(prompt, config.name, system_prompt):
+            async for chunk in self.ollama.stream_generate(prompt, config.name, system_prompt, messages):
                 yield chunk
         else:
             async for chunk in self.cloud.stream_generate(prompt, config, system_prompt):

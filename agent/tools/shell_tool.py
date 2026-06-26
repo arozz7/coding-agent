@@ -144,6 +144,57 @@ _BLOCKED_PATTERNS = [
     re.compile(r"export\s+PATH\s*=\s*/tmp", re.IGNORECASE),        # PATH hijack to /tmp
 ]
 
+# Shell commands the LLM commonly hallucinates that don't exist as executables.
+_HALLUCINATED_COMMANDS = frozenset([
+    "find_files", "search_files", "list_files", "read_file", "write_file",
+    "create_file", "delete_file", "copy_file", "move_file",
+])
+
+# Python syntax tokens that are unambiguously not shell commands.
+_PYTHON_FRAGMENT_PATTERNS = [
+    re.compile(r"^import\s+\w"),               # import os, sys
+    re.compile(r"^from\s+\w+\s+import\b"),     # from pathlib import Path
+    re.compile(r"^def\s+\w+\s*\("),            # def my_func(
+    re.compile(r"^class\s+\w+[\s:(]"),         # class Foo:
+    re.compile(r"^print\s*\("),                # print(...)  — distinct from CMD's `print`
+    re.compile(r"^with\s+open\s*\("),          # with open(path, ...):
+    re.compile(r"^return\s+"),                 # return value  (top-level = always Python)
+]
+
+_PYTHON_FRAGMENT_HINT = (
+    "Python code fragment detected — this cannot run as a shell command.\n"
+    "Write the code to a file first, then execute it:\n"
+    "  Step 1: file_write(\"script.py\", \"<your full script>\")\n"
+    "  Step 2: shell(\"python script.py\")"
+)
+
+
+def _detect_code_fragment(command: str) -> Optional[str]:
+    """Return an error string when the command is code, not a runnable command.
+
+    Catches two classes of model errors:
+      1. Hallucinated tool names (find_files, read_file, etc.)
+      2. Python code fragments submitted as shell commands
+    """
+    stripped = command.strip()
+    first_token = stripped.split()[0] if stripped.split() else ""
+
+    if first_token.lower() in _HALLUCINATED_COMMANDS:
+        return (
+            f"'{first_token}' is not a shell command.\n"
+            "To search for files use:\n"
+            "  Windows: dir /s /b \"*.ts\"\n"
+            "  Windows (PowerShell): Get-ChildItem -Recurse -Filter \"*.ts\"\n"
+            "  Unix: find . -name \"*.ts\""
+        )
+
+    for pattern in _PYTHON_FRAGMENT_PATTERNS:
+        if pattern.match(stripped):
+            return _PYTHON_FRAGMENT_HINT
+
+    return None
+
+
 # Windows shell built-ins that cannot run without shell=True.
 _WINDOWS_BUILTINS = frozenset([
     "dir", "type", "del", "copy", "move", "mkdir", "rmdir", "rd",
@@ -294,6 +345,11 @@ class ShellTool:
         """
         cmd = command.strip()
 
+        fragment_error = _detect_code_fragment(cmd)
+        if fragment_error:
+            self.logger.warning("shell_code_fragment_rejected", command=command[:120])
+            return {"success": False, "error": fragment_error}
+
         # Validate the ORIGINAL command before translation so Unix-form patterns
         # (e.g. `rm -rf /`) are caught even when running on Windows.
         try:
@@ -377,6 +433,11 @@ class ShellTool:
         Returns the same dict shape as :meth:`run`.
         """
         cmd = command.strip()
+
+        fragment_error = _detect_code_fragment(cmd)
+        if fragment_error:
+            self.logger.warning("shell_code_fragment_rejected", command=command[:120])
+            return {"success": False, "error": fragment_error}
 
         # Validate original form first, then the translated form.
         try:

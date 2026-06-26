@@ -74,7 +74,9 @@ class CloudAPIClient:
             "messages": [{"role": "user", "content": prompt}],
         }
         if system_prompt:
-            payload["system"] = system_prompt
+            payload["system"] = [
+                {"type": "text", "text": system_prompt, "cache_control": {"type": "ephemeral"}}
+            ]
 
         async with httpx.AsyncClient(timeout=120.0) as client:
             response = await client.post(
@@ -101,7 +103,9 @@ class CloudAPIClient:
             "stream": True,
         }
         if system_prompt:
-            payload["system"] = system_prompt
+            payload["system"] = [
+                {"type": "text", "text": system_prompt, "cache_control": {"type": "ephemeral"}}
+            ]
 
         async with httpx.AsyncClient(timeout=120.0) as client:
             async with client.stream(

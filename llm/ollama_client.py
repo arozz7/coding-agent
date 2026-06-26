@@ -53,6 +53,7 @@ class OllamaClient:
         system_prompt: Optional[str] = None,
         enable_thinking: Optional[bool] = None,
         timeout: float = 600.0,
+        messages: Optional[list[dict]] = None,
     ) -> str:
         """Generate a completion.
 
@@ -86,7 +87,7 @@ class OllamaClient:
         # hangs.  asyncio.wait_for cancels the coroutine at the deadline regardless.
         try:
             return await asyncio.wait_for(
-                self._do_generate(url, model, prompt, system_prompt, enable_thinking, timeout),
+                self._do_generate(url, model, prompt, system_prompt, enable_thinking, timeout, messages),
                 timeout=timeout,
             )
         except asyncio.TimeoutError:
@@ -101,6 +102,7 @@ class OllamaClient:
         system_prompt: Optional[str],
         enable_thinking: Optional[bool],
         timeout: float,
+        messages: Optional[list[dict]] = None,
     ) -> str:
         """Inner coroutine — executed inside asyncio.wait_for by generate().
 
@@ -116,12 +118,16 @@ class OllamaClient:
         """
         payload: dict[str, Any] = {
             "model": model,
-            "messages": [],
             "max_tokens": 8192,
         }
-        if system_prompt:
-            payload["messages"].append({"role": "system", "content": system_prompt})
-        payload["messages"].append({"role": "user", "content": prompt})
+        if messages is not None:
+            payload["messages"] = messages
+        else:
+            msgs: list[dict] = []
+            if system_prompt:
+                msgs.append({"role": "system", "content": system_prompt})
+            msgs.append({"role": "user", "content": prompt})
+            payload["messages"] = msgs
         if enable_thinking is False:
             # LM Studio / vLLM Qwen3 extension — disables the <think> phase
             # so the model always returns a direct content response.
@@ -199,12 +205,19 @@ class OllamaClient:
         return content
 
     async def stream_generate(
-        self, prompt: str, model: str, system_prompt: Optional[str] = None
+        self,
+        prompt: str,
+        model: str,
+        system_prompt: Optional[str] = None,
+        messages: Optional[list[dict]] = None,
     ) -> AsyncIterator[str]:
-        messages = []
-        if system_prompt:
-            messages.append({"role": "system", "content": system_prompt})
-        messages.append({"role": "user", "content": prompt})
+        if messages is not None:
+            msgs = messages
+        else:
+            msgs = []
+            if system_prompt:
+                msgs.append({"role": "system", "content": system_prompt})
+            msgs.append({"role": "user", "content": prompt})
 
         async with httpx.AsyncClient(timeout=600.0) as client:
             async with client.stream(
@@ -212,7 +225,7 @@ class OllamaClient:
                 self._get_chat_endpoint(),
                 json={
                     "model": model,
-                    "messages": messages,
+                    "messages": msgs,
                     "max_tokens": 8192,
                     "stream": True,
                 },

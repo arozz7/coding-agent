@@ -207,6 +207,7 @@ class TaskLoop:
         _criterion_attempts: dict[str, int] = {}
         _acceptance_budget = max(1, int(os.getenv("ACCEPTANCE_BUDGET", "5")))
         _acceptance_fix_count = 0
+        _acc_criterion_attempts: dict[str, int] = {}
         _last_acceptance_screenshot: Optional[str] = None
 
         if task_type in ("develop", "sdlc"):
@@ -297,6 +298,7 @@ class TaskLoop:
                                 acceptance_criteria=acceptance_criteria,
                                 acceptance_fix_count=_acceptance_fix_count,
                                 acceptance_budget=_acceptance_budget,
+                                acc_criterion_attempts=_acc_criterion_attempts,
                                 objective=objective,
                                 task_summaries=task_summaries,
                                 last_screenshot=_last_acceptance_screenshot,
@@ -563,6 +565,7 @@ class TaskLoop:
         acceptance_criteria: list[str],
         acceptance_fix_count: int,
         acceptance_budget: int,
+        acc_criterion_attempts: dict[str, int],
         objective: str,
         task_summaries: list[str],
         last_screenshot: Optional[str],
@@ -622,8 +625,26 @@ class TaskLoop:
             )
             return True, acceptance_fix_count, last_screenshot, screenshot_path
 
+        # Filter out criteria that have exhausted their per-criterion budget.
+        # This prevents the acceptance loop from retrying a consistently-failing
+        # criterion (e.g. cargo check) more times than confidence warrants.
+        actionable_failing = [
+            r for r in acc_failing
+            if acc_criterion_attempts.get(r.criterion, 0) < d.criterion_score_store.attempt_budget(r.criterion)
+        ]
+        if not actionable_failing:
+            # Record abandoned criteria as failures so the store learns.
+            for r in acc_failing:
+                d.criterion_score_store.record(r.criterion, succeeded=False)
+            task_summaries.append(
+                f"🎯 All failing acceptance criteria exhausted their per-criterion budget — "
+                f"{acc_passed}/{len(acceptance_criteria)} passing"
+            )
+            return True, acceptance_fix_count, last_screenshot, screenshot_path
+
         acceptance_fix_count += 1
-        acc_target = acc_failing[0]
+        acc_target = actionable_failing[0]
+        acc_criterion_attempts[acc_target.criterion] = acc_criterion_attempts.get(acc_target.criterion, 0) + 1
         acc_fix_spec = d.verifier_coordinator.make_targeted_fix_spec(
             type("CR", (), {"criterion": acc_target.criterion, "passed": False, "detail": acc_target.detail})(),
             objective,
@@ -634,7 +655,12 @@ class TaskLoop:
         task_summaries.append(
             f"🖼️ **Acceptance fix** ({acceptance_fix_count}/{acceptance_budget}) — {acc_target.criterion[:60]}"
         )
-        self.logger.info("acceptance_fix_injected", criterion=acc_target.criterion[:60], fix_num=acceptance_fix_count)
+        self.logger.info(
+            "acceptance_fix_injected",
+            criterion=acc_target.criterion[:60],
+            fix_num=acceptance_fix_count,
+            attempt=acc_criterion_attempts[acc_target.criterion],
+        )
         return False, acceptance_fix_count, last_screenshot, screenshot_path
 
     # ------------------------------------------------------------------
