@@ -582,6 +582,12 @@ class ModelRouter:
                     retry_after=e.retry_after,
                 )
                 self.health_checker.record_rate_limit(config.name)
+                # Blacklist this evaluator model for the retry_after window so
+                # get_evaluator_model() picks a different free model next call
+                # instead of returning the same cached rate-limited one.
+                blacklist_ttl = max(e.retry_after, 120)
+                self._evaluator_blacklist[config.name] = time.monotonic() - (self._EVALUATOR_BLACKLIST_TTL - blacklist_ttl)
+                self._evaluator_cache = None
                 if not _is_fallback:
                     return await self._run_fallback_chain(
                         prompt=prompt,

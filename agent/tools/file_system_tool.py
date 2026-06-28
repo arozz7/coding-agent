@@ -136,7 +136,7 @@ class FileSystemTool:
         # a single word (e.g. "reading") into package.json or tsconfig.json.
         if validated.suffix.lower() == ".json" and content.strip():
             try:
-                json.loads(content)
+                parsed = json.loads(content)
             except json.JSONDecodeError as exc:
                 msg = (
                     f"Refusing to write invalid JSON to {file_path!r}: {exc}. "
@@ -149,6 +149,23 @@ class FileSystemTool:
                     content_preview=content[:60],
                 )
                 raise FileOperationError(msg) from exc
+
+            # package.json with no name/version is functionally broken — npm
+            # and node refuse to run scripts from an empty object.
+            if validated.name == "package.json" and isinstance(parsed, dict):
+                missing = [f for f in ("name", "version") if f not in parsed]
+                if missing:
+                    msg = (
+                        f"Refusing to write package.json missing required fields: {missing}. "
+                        "A valid package.json must have at least 'name' and 'version'. "
+                        "Read the current file first, then write a complete replacement."
+                    )
+                    self.logger.warning(
+                        "file_write_incomplete_package_json_rejected",
+                        path=file_path,
+                        missing_fields=missing,
+                    )
+                    raise FileOperationError(msg)
 
         try:
             validated.parent.mkdir(parents=True, exist_ok=True)
