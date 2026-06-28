@@ -620,6 +620,9 @@ class TaskLoop:
             return True, acceptance_fix_count, last_screenshot, screenshot_path
 
         if acceptance_fix_count >= acceptance_budget - 1:
+            # Record still-failing criteria so the store learns from this session.
+            for r in acc_failing:
+                d.criterion_score_store.record(r.criterion, succeeded=False)
             task_summaries.append(
                 f"🎯 Acceptance budget ({acceptance_budget}) exhausted — {acc_passed}/{len(acceptance_criteria)} passing"
             )

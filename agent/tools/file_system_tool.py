@@ -1,3 +1,5 @@
+import json
+import re
 from pathlib import Path
 from typing import List, Optional
 import os
@@ -109,8 +111,44 @@ class FileSystemTool:
                 f"Permission denied reading: {file_path}"
             ) from e
 
+    # Prose path detection: a valid file path never contains apostrophes, question
+    # marks, or looks like a complete English sentence (multiple words, no extension).
+    _PROSE_PATH_RE = re.compile(
+        r"['\?]|"                          # apostrophe or question mark in path
+        r"\b(won't|can't|let me|first to|notation)\b",  # English clause fragments
+        re.IGNORECASE,
+    )
+
     def write_file(self, file_path: str, content: str) -> None:
+        # Reject paths that look like model chain-of-thought leaking into the argument.
+        if len(file_path) > 200 or self._PROSE_PATH_RE.search(file_path):
+            msg = (
+                f"Invalid file path — looks like prose, not a path: {file_path[:80]!r}. "
+                "Use file_write with a real relative path like 'src/main.py'."
+            )
+            self.logger.warning("file_write_prose_path_rejected", path=file_path[:120])
+            raise InvalidPathError(msg)
+
         validated = self._validate_path(file_path)
+
+        # For JSON files, validate that content is actually valid JSON before
+        # overwriting the file.  This prevents the model from writing prose or
+        # a single word (e.g. "reading") into package.json or tsconfig.json.
+        if validated.suffix.lower() == ".json" and content.strip():
+            try:
+                json.loads(content)
+            except json.JSONDecodeError as exc:
+                msg = (
+                    f"Refusing to write invalid JSON to {file_path!r}: {exc}. "
+                    "Content must be valid JSON. Read the current file first, "
+                    "then write the full corrected JSON."
+                )
+                self.logger.warning(
+                    "file_write_invalid_json_rejected",
+                    path=file_path,
+                    content_preview=content[:60],
+                )
+                raise FileOperationError(msg) from exc
 
         try:
             validated.parent.mkdir(parents=True, exist_ok=True)
