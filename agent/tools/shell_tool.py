@@ -217,6 +217,31 @@ def _is_windows_builtin(cmd: str) -> bool:
     return first_token in _WINDOWS_BUILTINS
 
 
+# Characters that only mean "shell operator" to cmd.exe when they appear
+# outside of quotes (redirection, piping, chaining). If any of these appear
+# unquoted, the command MUST run with shell=True — otherwise subprocess.Popen
+# passes them as literal argv tokens to the resolved executable (e.g. cargo.exe
+# receives literal "2>&1" "||" "true" as arguments instead of having the shell
+# interpret them), producing a bogus failure on every run regardless of the
+# command's real outcome.
+_SHELL_OPERATOR_CHARS = frozenset("&|><")
+
+
+def _has_unquoted_shell_operators(cmd: str) -> bool:
+    """Return True if cmd contains &, |, >, or < outside of quotes."""
+    quote = None
+    for ch in cmd:
+        if quote:
+            if ch == quote:
+                quote = None
+            continue
+        if ch in ("'", '"'):
+            quote = ch
+        elif ch in _SHELL_OPERATOR_CHARS:
+            return True
+    return False
+
+
 def _kill_process_tree(pid: int) -> None:
     """Kill a process and all its children.
 
@@ -317,7 +342,7 @@ class ShellTool:
     def _resolve_args(self, cmd: str) -> tuple:
         """Resolve (args, use_shell) for subprocess from the translated command string."""
         if IS_WINDOWS:
-            if _is_windows_builtin(cmd):
+            if _is_windows_builtin(cmd) or _has_unquoted_shell_operators(cmd):
                 return cmd, True
             try:
                 parsed = shlex.split(cmd, posix=False)
