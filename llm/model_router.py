@@ -58,6 +58,18 @@ class ModelRouter:
         # OpenRouter free-tier limits reset daily, so 24 h is a safe expiry.
         self._evaluator_blacklist: dict[str, float] = {}  # model_name -> blacklisted_at (monotonic)
         self._EVALUATOR_BLACKLIST_TTL: float = 86400.0
+        # Account-level circuit breaker for OpenRouter's free-tier rate limit.
+        # The free tier shares ONE rate-limit bucket across all `:free` models,
+        # so per-model blacklisting just cycles to a different model ID that
+        # hits the same wall (observed: qwen3-coder:free -> gemma:free ->
+        # qwen3-coder:free, 429 every time). After repeated hits in a short
+        # window, stop attempting remote evaluator models entirely for a
+        # cooldown period and go straight to the local fallback.
+        self._openrouter_rate_limit_hits: list[float] = []  # monotonic timestamps
+        self._OPENROUTER_BREAKER_WINDOW: float = 600.0       # look back 10 min
+        self._OPENROUTER_BREAKER_THRESHOLD: int = 2          # hits within window to trip
+        self._openrouter_cooldown_until: float = 0.0         # monotonic; 0 = not tripped
+        self._OPENROUTER_BREAKER_COOLDOWN: float = 1800.0    # 30 min cooldown
         self._load_configs(config_path)
 
     def _configure_ollama_endpoint(self, config: ModelConfig) -> None:
@@ -221,6 +233,32 @@ class ModelRouter:
             except Exception as e:
                 self.logger.warning("switch_callback_error", error=str(e))
 
+    def _record_openrouter_rate_limit(self) -> None:
+        """Record a 429 from OpenRouter and trip the breaker if it recurs.
+
+        Called on every OpenRouter rate-limit response, not just the evaluator
+        path, since the underlying quota is shared account-wide.
+        """
+        now = time.monotonic()
+        self._openrouter_rate_limit_hits = [
+            t for t in self._openrouter_rate_limit_hits if now - t < self._OPENROUTER_BREAKER_WINDOW
+        ]
+        self._openrouter_rate_limit_hits.append(now)
+        if (
+            len(self._openrouter_rate_limit_hits) >= self._OPENROUTER_BREAKER_THRESHOLD
+            and now >= self._openrouter_cooldown_until
+        ):
+            self._openrouter_cooldown_until = now + self._OPENROUTER_BREAKER_COOLDOWN
+            self.logger.warning(
+                "openrouter_free_tier_circuit_tripped",
+                hits=len(self._openrouter_rate_limit_hits),
+                window_secs=self._OPENROUTER_BREAKER_WINDOW,
+                cooldown_secs=self._OPENROUTER_BREAKER_COOLDOWN,
+            )
+
+    def _openrouter_cooldown_active(self) -> bool:
+        return time.monotonic() < self._openrouter_cooldown_until
+
     def _get_fallback_chain(self, exclude_name: str) -> list[ModelConfig]:
         """Return ordered fallback candidates: other locals first, then remotes.
 
@@ -340,6 +378,14 @@ class ModelRouter:
 
         if not api_key:
             self.logger.warning("evaluator_no_api_key", hint="Set OPENROUTER_API_KEY to enable dynamic free-model selection")
+            return fallback
+
+        if self._openrouter_cooldown_active():
+            self.logger.info(
+                "evaluator_openrouter_cooldown_active",
+                remaining_secs=round(self._openrouter_cooldown_until - time.monotonic()),
+                fallback=fallback.name,
+            )
             return fallback
 
         try:
@@ -582,6 +628,7 @@ class ModelRouter:
                     retry_after=e.retry_after,
                 )
                 self.health_checker.record_rate_limit(config.name)
+                self._record_openrouter_rate_limit()
                 # Blacklist this evaluator model for the retry_after window so
                 # get_evaluator_model() picks a different free model next call
                 # instead of returning the same cached rate-limited one.

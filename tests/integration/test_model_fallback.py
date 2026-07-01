@@ -8,6 +8,8 @@ Tests:
   - Task type keyword classifier (pure unit, lives here for proximity to router tests)
 """
 
+import time
+
 import pytest
 from unittest.mock import AsyncMock, MagicMock, patch, call
 
@@ -30,6 +32,15 @@ def _make_router_with_configs(configs: list[ModelConfig]) -> ModelRouter:
     router._local_runtime = {}
     router._active_model_name = None
     router._switch_callbacks = []
+    router._evaluator_cache = None
+    router._EVALUATOR_CACHE_TTL = 3600.0
+    router._evaluator_blacklist = {}
+    router._EVALUATOR_BLACKLIST_TTL = 86400.0
+    router._openrouter_rate_limit_hits = []
+    router._OPENROUTER_BREAKER_WINDOW = 600.0
+    router._OPENROUTER_BREAKER_THRESHOLD = 2
+    router._openrouter_cooldown_until = 0.0
+    router._OPENROUTER_BREAKER_COOLDOWN = 1800.0
     router.logger = MagicMock()
     router.ollama = MagicMock()
     router.cloud = MagicMock()
@@ -152,6 +163,43 @@ class TestOpenRouterRateLimitFallback:
 
         await router.generate("hello", cloud, max_retries=1)
         router.health_checker.record_rate_limit.assert_called_with(cloud.name)
+
+
+# ---------------------------------------------------------------------------
+# Account-level circuit breaker for OpenRouter's shared free-tier rate limit
+# ---------------------------------------------------------------------------
+
+class TestOpenRouterAccountBreaker:
+    @pytest.mark.asyncio
+    async def test_breaker_trips_after_threshold_hits(self):
+        """Repeated 429s across different model IDs should trip the breaker
+        (the free tier shares one bucket, so cycling model IDs doesn't help)."""
+        local = _local_config("qwen")
+        cloud1 = _cloud_config("model-a:free", "https://openrouter.ai/api/v1")
+        cloud2 = _cloud_config("model-b:free", "https://openrouter.ai/api/v1")
+        router = _make_router_with_configs([local, cloud1, cloud2])
+
+        router.cloud.generate = AsyncMock(side_effect=_OpenRouterRateLimitError(retry_after=0))
+        router.ollama.generate = AsyncMock(return_value="local response")
+
+        assert not router._openrouter_cooldown_active()
+        await router.generate("hello", cloud1, max_retries=1)
+        assert not router._openrouter_cooldown_active()  # 1 hit — not tripped yet
+        await router.generate("hello", cloud2, max_retries=1)
+        assert router._openrouter_cooldown_active()  # 2nd hit within window trips it
+
+    @pytest.mark.asyncio
+    async def test_evaluator_model_skips_remote_during_cooldown(self):
+        router = _make_router_with_configs([_local_config("qwen")])
+        router._openrouter_cooldown_until = time.monotonic() + 900
+        fallback_config = _cloud_config("openrouter/free", "https://openrouter.ai/api/v1")
+        router.get_config = MagicMock(return_value=fallback_config)
+
+        with patch.dict("os.environ", {"OPENROUTER_API_KEY": "test-key"}):
+            result = await router.get_evaluator_model()
+
+        assert result is fallback_config
+        router.cloud.generate.assert_not_called()
 
 
 # ---------------------------------------------------------------------------
