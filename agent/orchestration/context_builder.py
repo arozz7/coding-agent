@@ -16,11 +16,12 @@ from __future__ import annotations
 import os
 import re
 import subprocess
-from datetime import datetime, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING, Callable, List, Optional
 
 import structlog
+
+from agent.session_id import new_session_id as _make_session_id
 
 # Strips raw FILE:/APPEND: blocks and fenced code from episodic summaries so
 # they don't contaminate the model context with code from unrelated past tasks.
@@ -208,7 +209,7 @@ class ContextBuilder:
         config = self.model_router.get_model("coding")
         bridge_text = await self.model_router.generate(prompt, config)
 
-        new_session_id = f"session_{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S')}_bridge"
+        new_session_id = _make_session_id("session") + "_bridge"
         self.session_memory.get_or_create_session(new_session_id, workspace_path)
         self.session_memory.save_message(
             new_session_id,

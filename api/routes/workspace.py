@@ -34,23 +34,22 @@ async def set_workspace(request: dict):
 
     workspace_root = Path(WORKSPACE_PATH).resolve()
 
-    # Env-var-only pattern: break taint on new_path before path construction.
-    os.environ["_CODEQL_SAFE_PATH"] = new_path
-    path = (workspace_root / os.getenv("_CODEQL_SAFE_PATH", "")).resolve()
+    path = (workspace_root / new_path).resolve()
     if not path.is_relative_to(workspace_root):
         raise HTTPException(status_code=403, detail="Cannot set workspace outside configured root")
     if not _is_path_allowed(str(path)):
         raise HTTPException(status_code=403, detail="Cannot set workspace to system folder")
-
-    # Env-var-only pattern: write validated path to env BEFORE any filesystem sink.
-    os.environ["AGENT_EFFECTIVE_WORKSPACE"] = str(path)
-    _safe = Path(os.getenv("AGENT_EFFECTIVE_WORKSPACE", WORKSPACE_PATH))
-    if not _safe.exists():
+    if not path.exists():
         raise HTTPException(status_code=404, detail="Path does not exist")
-    if not _safe.is_dir():
+    if not path.is_dir():
         raise HTTPException(status_code=400, detail="Path is not a directory")
 
-    app_state.current_workspace = str(_safe)
+    # AGENT_EFFECTIVE_WORKSPACE is the cross-process source of truth for the
+    # active workspace (read by agent/workspace_context.py, git_tool.py,
+    # mcp/server.py, ...) — set it for those consumers, but use the
+    # already-validated `path` object here rather than reading it back.
+    os.environ["AGENT_EFFECTIVE_WORKSPACE"] = str(path)
+    app_state.current_workspace = str(path)
     _project_rel = (
         str(Path(app_state.current_workspace).relative_to(workspace_root))
         if Path(app_state.current_workspace) != workspace_root
@@ -68,12 +67,8 @@ async def set_workspace(request: dict):
 async def read_workspace_file(path: str):
     """Read a file from the workspace by relative path."""
     _ws_root = Path(os.getenv("WORKSPACE_PATH", "./workspace")).resolve()
-    # Env-var-only pattern: break taint on 'path' before path construction so that
-    # all downstream filesystem ops see only env-var-sourced (untainted) data.
-    os.environ["_CODEQL_SAFE_PATH"] = path
-    _safe_rel = os.getenv("_CODEQL_SAFE_PATH", "")
     try:
-        target = (_ws_root / _safe_rel).resolve()
+        target = (_ws_root / path).resolve()
     except Exception:
         logger.warning("workspace_file_path_error", path=path)
         raise HTTPException(status_code=400, detail="Invalid path")
@@ -141,9 +136,7 @@ async def set_project(request: dict):
         parts = Path(raw_name).parts
         if any(part in ("", ".", "..") for part in parts):
             raise HTTPException(status_code=400, detail="Invalid project name")
-        # Env-var-only pattern: break taint on raw_name before path construction.
-        os.environ["_CODEQL_SAFE_PATH"] = raw_name
-        resolved_target = (workspace_root / os.getenv("_CODEQL_SAFE_PATH", "")).resolve()
+        resolved_target = (workspace_root / raw_name).resolve()
         if not resolved_target.is_relative_to(workspace_root):
             raise HTTPException(status_code=403, detail="Path not allowed")
     else:
@@ -152,11 +145,12 @@ async def set_project(request: dict):
     if not _is_path_allowed(str(resolved_target)):
         raise HTTPException(status_code=403, detail="Path not allowed")
 
-    # Env-var-only pattern: write validated path to env BEFORE any filesystem sink.
+    # AGENT_EFFECTIVE_WORKSPACE is the cross-process source of truth for the
+    # active workspace — set it for downstream consumers, but use the
+    # already-validated `resolved_target` object here rather than reading it back.
     os.environ["AGENT_EFFECTIVE_WORKSPACE"] = str(resolved_target)
-    _safe_target = Path(os.getenv("AGENT_EFFECTIVE_WORKSPACE", WORKSPACE_PATH))
-    _safe_target.mkdir(parents=True, exist_ok=True)
-    app_state.current_workspace = str(_safe_target)
+    resolved_target.mkdir(parents=True, exist_ok=True)
+    app_state.current_workspace = str(resolved_target)
     save_persisted_project(raw_name)
 
     from local_coding_agent import create_agent
@@ -195,10 +189,7 @@ async def wiki_migrate(request: dict):
     if safe_project != project:
         raise HTTPException(status_code=400, detail="Invalid project name")
     workspace_root = Path(WORKSPACE_PATH).resolve()
-    # Break CodeQL taint chain: validated name written to env, read back as untainted.
-    os.environ["_CODEQL_SAFE_PROJECT"] = safe_project
-    _safe = os.getenv("_CODEQL_SAFE_PROJECT", "")
-    target_path = (workspace_root / _safe).resolve()
+    target_path = (workspace_root / safe_project).resolve()
     if not target_path.is_relative_to(workspace_root):
         raise HTTPException(status_code=400, detail="Invalid project name")
     target_path.mkdir(parents=True, exist_ok=True)
@@ -231,9 +222,7 @@ async def take_screenshot(request: dict):
 
     raw_workspace = request.get("workspace")
     if raw_workspace:
-        # Env-var-only pattern: break taint on raw_workspace before path construction.
-        os.environ["_CODEQL_SAFE_PATH"] = raw_workspace
-        candidate = (workspace_root / os.getenv("_CODEQL_SAFE_PATH", "")).resolve()
+        candidate = (workspace_root / raw_workspace).resolve()
         if not candidate.is_relative_to(workspace_root):
             raise HTTPException(status_code=403, detail="Workspace path is outside the allowed workspace root")
         if not _is_path_allowed(str(candidate)):

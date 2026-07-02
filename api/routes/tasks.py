@@ -4,13 +4,13 @@ from __future__ import annotations
 import asyncio
 import os
 import uuid
-from datetime import datetime, timezone
 from typing import Optional
 
 import structlog
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
 
+from agent.session_id import new_session_id
 from api.deps import app_state, job_store, task_store, require_api_key, summarize_response
 
 logger = structlog.get_logger()
@@ -61,7 +61,7 @@ async def start_task_background(request: TaskRequest):
         raise HTTPException(status_code=503, detail="Agent not initialized")
 
     job_id = f"job_{uuid.uuid4().hex[:12]}"
-    session_id = request.session_id or f"session_{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S')}"
+    session_id = request.session_id or new_session_id()
 
     if request.force_task_type:
         task_type = request.force_task_type

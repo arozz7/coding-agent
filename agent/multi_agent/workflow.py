@@ -299,11 +299,11 @@ class MultiAgentOrchestrator:
         self.logger = logger.bind(component="multi_agent_orchestrator")
 
     async def run_task(self, task: str, session_id: Optional[str] = None) -> dict:
-        from datetime import datetime
-        
+        from agent.session_id import new_session_id
+
         if not session_id:
-            session_id = f"multi_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
-        
+            session_id = new_session_id("multi")
+
         return await self.workflow.run(task, session_id)
 
     def get_session_history(self, session_id: str) -> List[dict]:

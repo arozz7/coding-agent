@@ -1,5 +1,4 @@
 from typing import TypedDict, List, Optional, Callable
-from datetime import datetime, timezone
 from pathlib import Path
 import os
 import re
@@ -7,6 +6,7 @@ import structlog
 
 _PROJECT_NAME_RE = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9_.\-]*$")
 from agent.security.prompt_guard import guard_task
+from agent.session_id import new_session_id
 from agent.workspace_context import get_workspace
 from llm import ModelRouter
 from agent.memory import SessionMemory, CodebaseMemory
@@ -42,34 +42,39 @@ class AgentOrchestrator:
     ):
         # Env-var-only pattern: workspace comes from trusted env vars, not the
         # HTTP-tainted workspace_path parameter — breaks the CodeQL taint chain.
+        # Every tool/manager below is built from this same resolved value (`_ws`),
+        # never from the raw `workspace_path` parameter, so there is exactly one
+        # source of truth for "where is this orchestrator's workspace" — a prior
+        # version built self.workspace_path from `_ws` but the tools from the
+        # ignored parameter, which could silently diverge if the two ever disagreed.
         _effective = os.getenv("AGENT_EFFECTIVE_WORKSPACE", "").strip()
         _ws = _effective if _effective else os.getenv("WORKSPACE_PATH", "./workspace")
         self.workspace_path = _ws
         self.model_router = model_router
         self.session_memory = SessionMemory(session_db_path)
         self.codebase_memory = CodebaseMemory(chroma_path)
-        self.fs_tool = FileSystemTool(workspace_path)
-        self.pytest_tool = PytestTool(workspace_path)
+        self.fs_tool = FileSystemTool(_ws)
+        self.pytest_tool = PytestTool(_ws)
         self.code_analyzer = CodeAnalyzer()
         from agent.tools.shell_tool import ShellTool
         from agent.tools.browser_tool import BrowserTool
         from agent.tools.tool_executor import ToolExecutor, EventEmittingExecutor
         self._EventEmittingExecutor = EventEmittingExecutor
-        self.shell_tool = ShellTool(workspace_path)
-        self.browser_tool = BrowserTool(workspace_path)
-        self.tool_executor = ToolExecutor(workspace_path, self.code_analyzer, self.pytest_tool)
+        self.shell_tool = ShellTool(_ws)
+        self.browser_tool = BrowserTool(_ws)
+        self.tool_executor = ToolExecutor(_ws, self.code_analyzer, self.pytest_tool)
         self.skill_manager = SkillManager("skills")
         _ws_root = os.getenv("WORKSPACE_PATH", "./workspace")
         _ws_root_resolved = str(Path(_ws_root).resolve())
         _ws_resolved = str(Path(_ws).resolve())
         _project_name = Path(_ws).name if _ws_resolved != _ws_root_resolved else ""
-        self.wiki_manager = WikiManager(workspace_path, project_name=_project_name)
+        self.wiki_manager = WikiManager(_ws, project_name=_project_name)
         self.wiki_manager._ensure_dirs()
         self.skill_executor = SkillExecutor(self.wiki_manager, self.skill_manager)
-        self.memory_wiki = MemoryWiki(project_id=Path(workspace_path).name)
+        self.memory_wiki = MemoryWiki(project_id=Path(_ws).name)
 
         from mcp.server import create_mcp_server
-        self.mcp_server = create_mcp_server(workspace_path)
+        self.mcp_server = create_mcp_server(_ws)
 
         self.logger = logger.bind(component="agent_orchestrator")
         self.agent_logger = AgentLogger("orchestrator")
@@ -298,7 +303,7 @@ class AgentOrchestrator:
                     pass
 
         if not session_id:
-            session_id = f"session_{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S')}"
+            session_id = new_session_id()
 
         try:
             task = guard_task(task)
@@ -504,7 +509,7 @@ class AgentOrchestrator:
             return
 
         if not session_id:
-            session_id = f"session_{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S')}"
+            session_id = new_session_id()
 
         self.session_memory.get_or_create_session(session_id, self.workspace_path)
         self.session_memory.save_message(session_id, "user", task)
@@ -550,10 +555,7 @@ class AgentOrchestrator:
         ):
             raise ValueError(f"Invalid project_name {project_name!r}")
         _ws_root = Path(self.workspace_path).resolve()
-        # Break CodeQL taint chain: validated name written to env, read back as untainted.
-        os.environ["_CODEQL_SAFE_PROJECT"] = _project_name
-        _safe_project_name = os.getenv("_CODEQL_SAFE_PROJECT", "")
-        _project_dir = (_ws_root / _safe_project_name).resolve()
+        _project_dir = (_ws_root / _project_name).resolve()
         if not _project_dir.is_relative_to(_ws_root):
             raise ValueError(
                 f"project_name {project_name!r} is outside workspace root {_ws_root}"
