@@ -1,14 +1,14 @@
 import os
-import re
 import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Optional, List, AsyncIterator, Callable, Tuple
 from pathlib import Path
-import yaml
 import structlog
 
 from .config import ModelConfig
+from .config_loader import build_model_config, load_config_file
+from .evaluator_selector import EvaluatorSelectorMixin
 from .ollama_client import OllamaClient, ModelNotReadyError
 from .cloud_api_client import CloudAPIClient, _OpenRouterRateLimitError, _OpenRouterPaymentRequiredError
 from .cost_tracker import CostTracker
@@ -29,7 +29,7 @@ class ModelSwitchEvent:
     timestamp: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
 
 
-class ModelRouter:
+class ModelRouter(EvaluatorSelectorMixin):
     def __init__(self, config_path: str = "config/models.yaml"):
         self.configs: List[ModelConfig] = []
         self.config_by_name: dict[str, ModelConfig] = {}
@@ -81,41 +81,10 @@ class ModelRouter:
                 url=config.endpoint,
             )
 
-    @staticmethod
-    def _expand_env(value: Optional[str]) -> Optional[str]:
-        """Expand ${VAR} and ${VAR:-default} references using os.environ.
-
-        Syntax:
-          ${VAR}          — replaced by env value; left as-is if unset
-          ${VAR:-default} — replaced by env value; falls back to *default* if unset
-
-        Using ${VAR:-default} in config files means the system works with no
-        .env file — the explicit default is used and no URL stays unexpanded.
-        """
-        if not value or "${" not in value:
-            return value
-
-        def _replacer(m: re.Match) -> str:
-            spec = m.group(1)
-            if ":-" in spec:
-                var, default = spec.split(":-", 1)
-                return os.environ.get(var.strip(), default)
-            return os.environ.get(spec, m.group(0))  # leave placeholder if unset
-
-        return re.sub(r"\$\{([^}]+)\}", _replacer, value)
-
     def _load_configs(self, path: str) -> None:
-        config_file = Path(path)
-        if not config_file.exists():
-            self.logger.error(
-                "config_not_found",
-                path=str(config_file.resolve()),
-                hint="Check that config/models.yaml exists at the project root",
-            )
+        data = load_config_file(path)
+        if data is None:
             return
-
-        with open(config_file) as f:
-            data = yaml.safe_load(f)
 
         self._defaults = data.get("defaults", {})
         # Merge local_runtime overrides from YAML (nested under defaults)
@@ -125,17 +94,10 @@ class ModelRouter:
 
         for m in data.get("models", []):
             try:
-                # Expand ${ENV_VAR} references before constructing the config
-                m_expanded = {
-                    k: (self._expand_env(v) if isinstance(v, str) else v)
-                    for k, v in m.items()
-                }
-                config = ModelConfig(**m_expanded)
+                config = build_model_config(m)
             except Exception as e:
                 self.logger.error("model_config_invalid", entry=m, error=str(e))
                 continue
-            if config.api_key_env:
-                config.api_key = os.environ.get(config.api_key_env)
             self.configs.append(config)
             self.config_by_name[config.name] = config
             self.rate_limiter.configure(config.name, config.rate_limit_rpm)
@@ -154,7 +116,7 @@ class ModelRouter:
             "configs_loaded",
             count=len(self.configs),
             active=self._active_model_name,
-            path=str(config_file.resolve()),
+            path=str(Path(path).resolve()),
         )
 
     def get_model(self, purpose: str = "general") -> Optional[ModelConfig]:
@@ -232,32 +194,6 @@ class ModelRouter:
                 fn(event)
             except Exception as e:
                 self.logger.warning("switch_callback_error", error=str(e))
-
-    def _record_openrouter_rate_limit(self) -> None:
-        """Record a 429 from OpenRouter and trip the breaker if it recurs.
-
-        Called on every OpenRouter rate-limit response, not just the evaluator
-        path, since the underlying quota is shared account-wide.
-        """
-        now = time.monotonic()
-        self._openrouter_rate_limit_hits = [
-            t for t in self._openrouter_rate_limit_hits if now - t < self._OPENROUTER_BREAKER_WINDOW
-        ]
-        self._openrouter_rate_limit_hits.append(now)
-        if (
-            len(self._openrouter_rate_limit_hits) >= self._OPENROUTER_BREAKER_THRESHOLD
-            and now >= self._openrouter_cooldown_until
-        ):
-            self._openrouter_cooldown_until = now + self._OPENROUTER_BREAKER_COOLDOWN
-            self.logger.warning(
-                "openrouter_free_tier_circuit_tripped",
-                hits=len(self._openrouter_rate_limit_hits),
-                window_secs=self._OPENROUTER_BREAKER_WINDOW,
-                cooldown_secs=self._OPENROUTER_BREAKER_COOLDOWN,
-            )
-
-    def _openrouter_cooldown_active(self) -> bool:
-        return time.monotonic() < self._openrouter_cooldown_until
 
     def _get_fallback_chain(self, exclude_name: str) -> list[ModelConfig]:
         """Return ordered fallback candidates: other locals first, then remotes.
@@ -337,105 +273,10 @@ class ModelRouter:
         except Exception:
             return True  # other errors (timeout, non-200) still mean TQL is up
 
-    @staticmethod
-    def _is_rate_limit_error(exc: Exception) -> bool:
-        """Return True if *exc* is a 429 response from a remote API."""
-        msg = str(exc)
-        return "429" in msg and ("Too Many Requests" in msg or "rate" in msg.lower())
-
     # Fallback wait used for non-LM Studio local backends (ollama, llama_cpp)
     # that don't support programmatic load.  A 35B model can take 3–8 min to
     # load, so we give 120 s between blind retries.
     _MODEL_RELOAD_WAIT_SECS = 120
-
-    # Families known to follow instructions well enough for structured JSON eval.
-    _EVAL_PREFERRED = ("gemma", "qwen", "llama", "mistral", "phi", "deepseek", "magistral")
-
-    @staticmethod
-    def _score_free_model(entry: dict) -> int:
-        mid = entry.get("id", "").lower()
-        ctx = int(entry.get("context_length") or 0)
-        score = ctx
-        if any(f in mid for f in ModelRouter._EVAL_PREFERRED):
-            score += 1_000_000
-        return score
-
-    async def get_evaluator_model(self) -> ModelConfig:
-        """Return a free OpenRouter model suitable for lightweight pass/fail evaluation.
-
-        Fetches GET /v1/models from OpenRouter, filters for zero-cost models, picks the
-        best candidate by context window + family preference, and caches the result for
-        one hour.  Falls back to the static 'openrouter/free' config entry on any error.
-        """
-        now = time.monotonic()
-        if self._evaluator_cache is not None:
-            cached_config, cached_at = self._evaluator_cache
-            if now - cached_at < self._EVALUATOR_CACHE_TTL:
-                return cached_config
-
-        api_key = os.environ.get("OPENROUTER_API_KEY", "")
-        fallback = self.get_config("openrouter/free") or self.get_model("coding")
-
-        if not api_key:
-            self.logger.warning("evaluator_no_api_key", hint="Set OPENROUTER_API_KEY to enable dynamic free-model selection")
-            return fallback
-
-        if self._openrouter_cooldown_active():
-            self.logger.info(
-                "evaluator_openrouter_cooldown_active",
-                remaining_secs=round(self._openrouter_cooldown_until - time.monotonic()),
-                fallback=fallback.name,
-            )
-            return fallback
-
-        try:
-            import httpx
-            async with httpx.AsyncClient(timeout=10.0) as client:
-                resp = await client.get(
-                    "https://openrouter.ai/api/v1/models",
-                    headers={"Authorization": f"Bearer {api_key}"},
-                )
-                resp.raise_for_status()
-                models = resp.json().get("data", [])
-
-            _now = time.monotonic()
-            # Expire stale blacklist entries before filtering.
-            self._evaluator_blacklist = {
-                k: v for k, v in self._evaluator_blacklist.items()
-                if _now - v < self._EVALUATOR_BLACKLIST_TTL
-            }
-            free = [
-                m for m in models
-                if str(m.get("pricing", {}).get("prompt", "1")) == "0"
-                and str(m.get("pricing", {}).get("completion", "1")) == "0"
-                and int(m.get("context_length") or 0) >= 8192
-                and m.get("id", "") not in self._evaluator_blacklist
-            ]
-
-            if not free:
-                self.logger.warning("evaluator_no_free_models_found", fallback=fallback.name)
-                return fallback
-
-            best = max(free, key=self._score_free_model)
-            config = ModelConfig(
-                name=best["id"],
-                type="remote",
-                endpoint="https://openrouter.ai/api/v1",
-                api_key=api_key,
-                context_window=int(best.get("context_length") or 32000),
-                rate_limit_rpm=20,
-                recommended_for=["evaluation"],
-                enable_thinking=False,
-                provider="openrouter",
-            )
-            self.rate_limiter.configure(config.name, config.rate_limit_rpm)
-            self._evaluator_cache = (config, now)
-            self.logger.info("evaluator_model_selected", model=config.name, context=config.context_window)
-            return config
-
-        except Exception as exc:
-            self.logger.warning("evaluator_model_fetch_failed", error=str(exc), fallback=fallback.name)
-            return fallback
 
     async def generate(
         self,
