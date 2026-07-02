@@ -1,10 +1,12 @@
-from typing import TypedDict, List, Optional, Callable
+from typing import TYPE_CHECKING, TypedDict, List, Optional, Callable
 from pathlib import Path
 import os
 import re
 import structlog
 
-_PROJECT_NAME_RE = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9_.\-]*$")
+if TYPE_CHECKING:
+    from agent.tools.tool_executor import EventEmittingExecutor
+
 from agent.security.prompt_guard import guard_task
 from agent.session_id import new_session_id
 from agent.workspace_context import get_workspace
@@ -24,6 +26,8 @@ from agent.orchestration.task_loop import TaskLoop, TaskLoopDeps
 from observability.logging import AgentLogger
 
 logger = structlog.get_logger()
+
+_PROJECT_NAME_RE = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9_.\-]*$")
 
 
 class AgentState(TypedDict):
@@ -324,11 +328,11 @@ class AgentOrchestrator:
             _emit_phase("handover")
             self.logger.info("context_bridge_triggered", session_id=session_id)
             try:
-                bridge_text, new_session_id = await self.context_builder.build_handover(
+                bridge_text, bridge_session_id = await self.context_builder.build_handover(
                     session_id, task, self.workspace_path
                 )
                 original_session_id = session_id
-                session_id = new_session_id
+                session_id = bridge_session_id
                 handover_triggered = True
                 handover_bridge = bridge_text
                 self.logger.info("session_swapped", new_session_id=session_id)

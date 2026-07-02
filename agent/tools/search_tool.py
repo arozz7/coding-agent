@@ -11,15 +11,12 @@ Benefits over shell equivalents:
 - Structured output for reliable LLM consumption.
 """
 
-import os
 import re
 from dataclasses import dataclass
 from pathlib import Path
-from typing import List, Optional
 
 import structlog
 
-from agent.security.paths import PathTraversalError
 
 logger = structlog.get_logger()
 

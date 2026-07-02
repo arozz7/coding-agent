@@ -56,3 +56,50 @@ class TestHealthChecker:
         checker = HealthChecker(MockRouter())
         assert checker is not None
         assert checker.statuses == {}
+
+    @pytest.mark.asyncio
+    async def test_check_reports_unavailable_when_health_check_returns_false(self):
+        """health_check() can return False without raising (model not loaded,
+        endpoint reachable but unhealthy) -- check() must treat that as a
+        failure, not silently report the model as available."""
+        from unittest.mock import AsyncMock, MagicMock
+        from llm.health import HealthChecker
+
+        class MockRouter:
+            ollama = MagicMock()
+            cloud = MagicMock()
+
+        router = MockRouter()
+        router.ollama.health_check = AsyncMock(return_value=False)
+        checker = HealthChecker(router)
+
+        config = MagicMock()
+        config.name = "local-model"
+        config.type = "local"
+
+        result = await checker.check(config)
+
+        assert result is False
+        assert checker.statuses["local-model"].available is False
+
+    @pytest.mark.asyncio
+    async def test_check_reports_available_when_health_check_returns_true(self):
+        from unittest.mock import AsyncMock, MagicMock
+        from llm.health import HealthChecker
+
+        class MockRouter:
+            ollama = MagicMock()
+            cloud = MagicMock()
+
+        router = MockRouter()
+        router.ollama.health_check = AsyncMock(return_value=True)
+        checker = HealthChecker(router)
+
+        config = MagicMock()
+        config.name = "local-model"
+        config.type = "local"
+
+        result = await checker.check(config)
+
+        assert result is True
+        assert checker.statuses["local-model"].available is True

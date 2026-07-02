@@ -38,7 +38,6 @@ Guidelines:
 
     async def execute(self, context: Dict[str, Any]) -> Dict[str, Any]:
         task = context.get("task", "")
-        tool_executor = context.get("tool_executor")
         model_router = context.get("model_router")
         enriched_context = context.get("enriched_context", "")
 

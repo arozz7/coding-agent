@@ -294,8 +294,8 @@ class WikiManager:
             return {"total": 0, "by_category": {}, "by_project": {}, "wiki_root": str(self.wiki_root)}
 
         try:
-            lines = [l for l in index_path.read_text(encoding="utf-8").splitlines()
-                     if l.startswith("|") and ".md" in l and "Path" not in l]
+            lines = [ln for ln in index_path.read_text(encoding="utf-8").splitlines()
+                     if ln.startswith("|") and ".md" in ln and "Path" not in ln]
         except OSError:
             lines = []
 
@@ -316,7 +316,7 @@ class WikiManager:
         log_path = self.wiki_root / "log.md"
         if log_path.exists():
             try:
-                log_lines = [l for l in log_path.read_text(encoding="utf-8").splitlines() if l.startswith("- ")]
+                log_lines = [ln for ln in log_path.read_text(encoding="utf-8").splitlines() if ln.startswith("- ")]
                 last_log = log_lines[-1][2:] if log_lines else ""
             except OSError:
                 pass
@@ -367,7 +367,7 @@ class WikiManager:
             index_path.write_text("".join(kept_lines), encoding="utf-8")
             self._append_log(f"clean: removed {removed} out-of-scope entries — {datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')}")
 
-        return {"removed": removed, "kept": sum(1 for l in kept_lines if l.startswith("|") and ".md" in l and "Path" not in l)}
+        return {"removed": removed, "kept": sum(1 for ln in kept_lines if ln.startswith("|") and ".md" in ln and "Path" not in ln)}
 
     # ------------------------------------------------------------------
     # Migrate (move entries to a project's own wiki)

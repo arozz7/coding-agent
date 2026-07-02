@@ -1,10 +1,10 @@
-from typing import TypedDict, Annotated, List, Optional
+from typing import TypedDict, List, Optional
 from dataclasses import dataclass
 from enum import Enum
 import structlog
 
-from llm import ModelRouter, ModelConfig
-from agent.tools import FileSystemTool, GitTool, PytestTool, CodeAnalyzer
+from llm import ModelRouter
+from agent.tools import FileSystemTool, PytestTool, CodeAnalyzer
 from agent.memory import SessionMemory
 
 logger = structlog.get_logger()

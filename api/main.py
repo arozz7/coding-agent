@@ -3,7 +3,6 @@ from __future__ import annotations
 
 import asyncio
 import os
-import time as _time
 from pathlib import Path
 
 import structlog

@@ -2,7 +2,7 @@ import asyncio
 import re
 from datetime import date
 from pathlib import Path
-from typing import Dict, Any, List, Optional
+from typing import Dict, Any, List
 from agent.agents.base_agent import AgentRole
 from agent.tools.web_tool import extract_urls
 

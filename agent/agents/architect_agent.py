@@ -1,5 +1,5 @@
 import re as _re
-from typing import Dict, Any, List, Optional
+from typing import Dict, Any, List
 from agent.agents.base_agent import AgentRole
 
 _SAFE_PATH_RE = _re.compile(r"[^A-Za-z0-9_./ -]")

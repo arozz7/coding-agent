@@ -1,7 +1,6 @@
 """Admin/utility commands: !jobs, !skills, !wiki, !restart, !helpme."""
 from __future__ import annotations
 
-import asyncio
 
 from discord.ext import commands
 

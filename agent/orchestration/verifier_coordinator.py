@@ -10,7 +10,6 @@ import json
 import os
 import platform
 import re
-import subprocess
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Callable, Coroutine, List, Optional
@@ -345,7 +344,6 @@ class VerifierCoordinator:
         Returns one AcceptanceResult per criterion.  On any launch failure all
         criteria are returned as failed so the fix loop gets signal.
         """
-        from agent.agents.acceptance_tester_agent import AcceptanceResult
 
         if not criteria:
             return []

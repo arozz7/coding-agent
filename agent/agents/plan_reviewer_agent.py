@@ -10,7 +10,6 @@ returned unchanged.
 """
 
 import json
-import re
 from typing import Dict, List
 
 import structlog

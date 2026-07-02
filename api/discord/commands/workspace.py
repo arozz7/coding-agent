@@ -1,9 +1,7 @@
 """Workspace and session commands: !show, !history, !sessions, !clear, !session, !workspace, !project."""
 from __future__ import annotations
 
-import asyncio
 import io
-from typing import Optional
 
 import httpx
 from discord import File
@@ -13,7 +11,6 @@ from api.discord.bot_instance import bot
 from api.discord.helpers import (
     _BINARY_EXTENSIONS,
     _MAX_ATTACHMENT_BYTES,
-    _chunk,
     strip_code_blocks,
 )
 from api.discord.poller import _safe_edit

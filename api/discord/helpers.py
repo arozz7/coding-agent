@@ -1,11 +1,9 @@
 """Text formatting helpers and Discord attachment utilities."""
 from __future__ import annotations
 
-import io
 import pathlib
 import re
 
-import discord
 from discord import File
 from discord.ext import commands
 

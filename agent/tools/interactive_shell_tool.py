@@ -10,7 +10,6 @@ behave correctly via pipes because they can't detect terminal capabilities.
 For those, consider wrapping them in a web interface and using BrowserTool.
 """
 import asyncio
-import os
 import platform
 import re
 import shlex

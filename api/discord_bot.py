@@ -4,7 +4,7 @@ from __future__ import annotations
 import asyncio
 import os
 
-from api.discord.bot_instance import bot, _start_bot
+from api.discord.bot_instance import _start_bot
 from api.discord.client import API_URL
 
 # Importing these modules triggers @bot.command() registration at import time.

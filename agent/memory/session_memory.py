@@ -1,7 +1,6 @@
 import sqlite3
 import json
 import threading
-from datetime import datetime, timezone
 from typing import List, Optional
 from pathlib import Path
 import structlog

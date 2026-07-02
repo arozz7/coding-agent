@@ -48,7 +48,6 @@ class CodeReviewTool:
         Returns:
             Dict with 'success', 'review' (normalized), and 'output' (rendered string)
         """
-        from .file_system_tool import FileSystemTool
         from agent.workspace_context import get_workspace
         from pathlib import Path
 

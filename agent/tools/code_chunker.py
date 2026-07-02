@@ -1,5 +1,5 @@
 from pathlib import Path
-from typing import List, Dict, Optional, Tuple
+from typing import List, Dict, Optional
 import re
 import structlog
 
@@ -98,8 +98,6 @@ class CodeChunker:
         current_chunk_lines = []
         current_size = 0
         in_function = False
-        in_class = False
-        indent_stack = [0]
 
         for i, line in enumerate(lines):
             stripped = line.strip()

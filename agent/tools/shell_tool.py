@@ -482,11 +482,6 @@ class ShellTool:
         if args is None:
             return {"success": False, "error": f"Could not parse command: {cmd!r}"}
 
-        create_flags = 0
-        if IS_WINDOWS:
-            CREATE_NEW_PROCESS_GROUP = 0x00000200
-            create_flags = CREATE_NEW_PROCESS_GROUP
-
         try:
             proc = await asyncio.create_subprocess_exec(
                 *(args if isinstance(args, list) else [args]),

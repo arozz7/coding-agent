@@ -1,4 +1,4 @@
-from typing import Dict, Any, Optional, List
+from typing import Dict, Any, List
 import os
 import re
 from agent.agents.base_agent import AgentRole
@@ -756,7 +756,7 @@ Summary: <one sentence>
                     if second != -1:
                         response = (
                             response[:first]
-                            + f"\n\n*(earlier fix attempts omitted)*"
+                            + "\n\n*(earlier fix attempts omitted)*"
                             + response[second:]
                         )
                     response += f"\n\n**Fix attempt {_attempt + 1}:**\n" + fix_response
@@ -789,7 +789,7 @@ Summary: <one sentence>
                                 ]
                                 self.logger.info("fix_loop_no_progress_retry", attempt=1)
                                 continue
-                            response += f"\n\n*(Fix loop aborted: The model did not modify any files to address the failure)*"
+                            response += "\n\n*(Fix loop aborted: The model did not modify any files to address the failure)*"
                             self.logger.info("fix_loop_aborted_no_progress", attempt=_attempt + 1)
                             break
 

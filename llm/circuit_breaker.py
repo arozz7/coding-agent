@@ -1,5 +1,5 @@
 from enum import Enum
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timezone
 from typing import Optional
 import time
 import structlog
@@ -62,12 +62,11 @@ class CircuitBreaker:
             result = func(*args, **kwargs)
             self._on_success()
             return result
-        except Exception as e:
+        except Exception:
             self._on_failure()
             raise
     
     async def call_async(self, func, *args, **kwargs):
-        import asyncio
         
         if self.state == CircuitState.OPEN:
             raise CircuitBreakerError(f"Circuit {self.name} is OPEN")
@@ -76,7 +75,7 @@ class CircuitBreaker:
             result = await func(*args, **kwargs)
             self._on_success()
             return result
-        except Exception as e:
+        except Exception:
             self._on_failure()
             raise
     

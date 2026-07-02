@@ -1,11 +1,8 @@
 import subprocess
-import json
-import os
 from pathlib import Path
-from typing import Optional, List, Dict
+from typing import Optional, List
 import structlog
 
-from agent.security.paths import PathTraversalError
 
 logger = structlog.get_logger()
 

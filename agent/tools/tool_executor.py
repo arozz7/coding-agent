@@ -18,6 +18,7 @@ import inspect
 import re
 from pathlib import Path
 from typing import Any, Callable, Dict, Optional
+from urllib.parse import urlparse
 import structlog
 
 logger = structlog.get_logger()
@@ -217,7 +218,11 @@ class ToolExecutor:
         """Take a screenshot."""
         url = input.get("url", "http://localhost:8080")
         try:
-            result = await self.browser_tool.run_and_screenshot()
+            port = urlparse(url).port or 8080
+        except ValueError:
+            port = 8080
+        try:
+            result = await self.browser_tool.run_and_screenshot(port=port)
             if result.get("success"):
                 return f"Screenshot saved to: {result.get('path')}"
             return f"Screenshot failed: {result.get('error')}"

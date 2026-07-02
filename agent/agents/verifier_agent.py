@@ -12,7 +12,7 @@ import json
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Callable, Coroutine, List, Optional
+from typing import Callable, Coroutine, List
 import structlog
 
 PASS_THRESHOLD = 7
@@ -115,10 +115,10 @@ class VerifierAgent:
         # that fix rounds appended content that already existed.
         dup_penalty = self._duplicate_heading_penalty(response, files_created)
         if dup_penalty > 0:
-            gaps.insert(0, f"Document contains duplicate sections (structural redundancy detected)")
+            gaps.insert(0, "Document contains duplicate sections (structural redundancy detected)")
             score = max(0, score - dup_penalty)
 
-        report = self._format_research_report(coverage, depth, files_ok, score, gaps)
+        report = self._format_research_report(coverage, depth, files_ok, score, gaps, feedback)
         self.logger.info(
             "verify_research_complete",
             score=score,
@@ -457,13 +457,16 @@ class VerifierAgent:
         return 0
 
     def _format_research_report(
-        self, coverage: int, depth: int, files_ok: bool, score: int, gaps: List[str]
+        self, coverage: int, depth: int, files_ok: bool, score: int, gaps: List[str],
+        feedback: str = "",
     ) -> str:
         cov_line = f"Coverage : {'PASS' if coverage >= 3 else 'FAIL'} ({coverage}/5)"
         dep_line = f"Depth    : {'PASS' if depth >= 3 else 'FAIL'} ({depth}/5)"
         fmt_line = f"Format   : {'PASS' if files_ok else 'FAIL'}"
         overall  = f"Overall  : {'PASS' if score >= PASS_THRESHOLD else 'FAIL'} ({score}/10)"
         lines = ["RESEARCH QUALITY", "=" * 16, cov_line, dep_line, fmt_line, "", overall]
+        if feedback:
+            lines += ["", f"Feedback : {feedback}"]
         if gaps:
             lines += ["", "Gaps:"] + [f"  • {g}" for g in gaps[:5]]
         return "\n".join(lines)

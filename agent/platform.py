@@ -2,7 +2,8 @@ import os
 import platform
 import shutil
 import subprocess
-from typing import Optional, List
+import tempfile
+from typing import Optional
 import structlog
 
 logger = structlog.get_logger()
@@ -127,9 +128,6 @@ class ShellExecutor:
             stdout=stdout.decode() if stdout else "",
             stderr=stderr.decode() if stderr else "",
         )
-
-
-import tempfile
 
 
 def get_default_shell() -> str:

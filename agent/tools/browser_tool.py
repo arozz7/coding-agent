@@ -1,12 +1,10 @@
 import subprocess
 import asyncio
-import os
 import time
 from pathlib import Path
 from typing import Any, Optional
 import structlog
 
-from agent.security.paths import PathTraversalError
 
 logger = structlog.get_logger()
 
@@ -45,7 +43,7 @@ class BrowserTool:
                     if r.status_code == 200:
                         self.logger.info("dev_server_ready", port=port)
                         return {"success": True, "port": port, "url": f"http://localhost:{port}"}
-                except:
+                except Exception:
                     continue
             
             return {"success": False, "error": "Server failed to start within timeout"}

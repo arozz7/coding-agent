@@ -96,7 +96,6 @@ class TaskRouter:
 
     async def _detect_llm(self, task: str) -> str:
         """LLM-based task classifier. Returns one of the 6 valid task types."""
-        import asyncio
         import re as _re
         import yaml as _yaml
 

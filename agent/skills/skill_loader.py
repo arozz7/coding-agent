@@ -9,7 +9,6 @@ Loads skills from the skills/ directory based on:
 Remote fetch (fetch_remote) downloads SKILL.md files from a public GitHub
 repository declared in config/environment.yaml under skills_registry.
 """
-import re
 from pathlib import Path
 from typing import Dict, List, Optional, Any
 import structlog

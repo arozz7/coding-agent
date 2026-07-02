@@ -1,11 +1,9 @@
 import json
 import re
 from pathlib import Path
-from typing import List, Optional
+from typing import List
 import os
 import structlog
-
-from agent.security.paths import PathTraversalError  # noqa: F401 – re-exported
 
 logger = structlog.get_logger()
 
