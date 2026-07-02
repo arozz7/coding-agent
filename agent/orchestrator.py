@@ -1,12 +1,12 @@
 from typing import TYPE_CHECKING, TypedDict, List, Optional, Callable
 from pathlib import Path
 import os
-import re
 import structlog
 
 if TYPE_CHECKING:
     from agent.tools.tool_executor import EventEmittingExecutor
 
+from agent import project_lifecycle
 from agent.security.prompt_guard import guard_task
 from agent.session_id import new_session_id
 from agent.workspace_context import get_workspace
@@ -27,7 +27,11 @@ from observability.logging import AgentLogger
 
 logger = structlog.get_logger()
 
-_PROJECT_NAME_RE = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9_.\-]*$")
+# _run_specialized_agent dispatch: most task_type values match their
+# self.agents[...] key directly (plan, architect, research, mapper,
+# documenter, chat); these three don't, plus anything unmatched falls
+# through to "developer".
+_TASK_TYPE_TO_AGENT_KEY = {"review": "reviewer", "test": "tester", "security": "red_team"}
 
 
 class AgentState(TypedDict):
@@ -93,21 +97,14 @@ class AgentOrchestrator:
             pytest_tool=self.pytest_tool,
             requirements_extractor=self.requirements_extractor,
         )
-        # Keep direct agent references for _run_specialized_agent
-        self.developer_agent = _agents["developer"]
+        self.agents = _agents
+        # Kept as direct attributes: agent/sdlc_workflow.py reads these three
+        # off the orchestrator instance directly (self.orch.plan_agent, etc.),
+        # outside of _run_specialized_agent's dispatch. Every other agent type
+        # is looked up via self.agents[...] — see _run_specialized_agent.
         self.plan_agent = _agents["plan"]
+        self.developer_agent = _agents["developer"]
         self.tester_agent = _agents["tester"]
-        self.reviewer_agent = _agents["reviewer"]
-        self.architect_agent = _agents["architect"]
-        self.chat_agent = _agents["chat"]
-        self.research_agent = _agents["research"]
-        self.mapper_agent = _agents["mapper"]
-        self.red_team_agent = _agents["red_team"]
-        self.documenter_agent = _agents["documenter"]
-        self.verifier_agent = _agents["verifier"]
-        self.acceptance_tester_agent = _agents["acceptance_tester"]
-        self.planner_agent = _agents["planner"]
-        self.plan_reviewer_agent = _agents["plan_reviewer"]
         self.chain_runner = ChainRunner(self)
 
         from api.task_store import TaskStore
@@ -123,7 +120,7 @@ class AgentOrchestrator:
             memory_wiki=self.memory_wiki,
             skill_router=self.task_router,
         )
-        self.verifier_coordinator = VerifierCoordinator(self.verifier_agent, model_router)
+        self.verifier_coordinator = VerifierCoordinator(_agents["verifier"], model_router)
         self.criterion_score_store = CriterionScoreStore()
 
         self._model_switch_notices: list[str] = []
@@ -141,15 +138,15 @@ class AgentOrchestrator:
         self.task_loop = TaskLoop(TaskLoopDeps(
             tool_executor=self.tool_executor,
             context_builder=self.context_builder,
-            planner_agent=self.planner_agent,
-            plan_reviewer_agent=self.plan_reviewer_agent,
+            planner_agent=_agents["planner"],
+            plan_reviewer_agent=_agents["plan_reviewer"],
             task_store=self.task_store,
             verifier_coordinator=self.verifier_coordinator,
             criterion_score_store=self.criterion_score_store,
             session_memory=self.session_memory,
             skill_executor=self.skill_executor,
             memory_wiki=self.memory_wiki,
-            acceptance_tester_agent=self.acceptance_tester_agent,
+            acceptance_tester_agent=_agents["acceptance_tester"],
             run_agent_fn=self._run_specialized_agent,
             drain_switch_fn=self._drain_switch_notices,
         ))
@@ -256,26 +253,9 @@ class AgentOrchestrator:
             "on_phase": on_phase,
         }
 
-        if task_type == "plan":
-            return await self.plan_agent.run(task, context)
-        elif task_type == "review":
-            return await self.reviewer_agent.run(task, context)
-        elif task_type == "test":
-            return await self.tester_agent.run(task, context)
-        elif task_type == "architect":
-            return await self.architect_agent.run(task, context)
-        elif task_type == "research":
-            return await self.research_agent.run(task, context)
-        elif task_type == "mapper":
-            return await self.mapper_agent.run(task, context)
-        elif task_type == "security":
-            return await self.red_team_agent.run(task, context)
-        elif task_type == "documenter":
-            return await self.documenter_agent.run(task, context)
-        elif task_type == "chat":
-            return await self.chat_agent.run(task, context)
-        else:
-            return await self.developer_agent.run(task, context)
+        agent_key = _TASK_TYPE_TO_AGENT_KEY.get(task_type, task_type)
+        agent = self.agents.get(agent_key, self.agents["developer"])
+        return await agent.run(task, context)
 
     async def _run_task_loop(
         self,
@@ -548,61 +528,11 @@ class AgentOrchestrator:
 
     def delete_project(self, project_name: str, dry_run: bool = False) -> dict:
         """Remove all agent-managed data for a project from every storage layer."""
-        import shutil
-
-        _project_name = project_name.strip()
-        if (
-            not _project_name
-            or not _PROJECT_NAME_RE.match(_project_name)
-            or _project_name in {".", ".."}
-            or Path(_project_name).name != _project_name
-        ):
-            raise ValueError(f"Invalid project_name {project_name!r}")
-        _ws_root = Path(self.workspace_path).resolve()
-        _project_dir = (_ws_root / _project_name).resolve()
-        if not _project_dir.is_relative_to(_ws_root):
-            raise ValueError(
-                f"project_name {project_name!r} is outside workspace root {_ws_root}"
-            )
-
-        _project_path_str = str(_project_dir)
-        _project_short_name = _project_dir.name
-        session_ids = self.session_memory.list_sessions_by_project(_project_path_str)
-        job_count = self.task_store.count_by_session_ids(session_ids)
-        chroma_chunks = self.codebase_memory.count_project_chunks(_project_short_name)
-        wiki_entries = 0
-        wiki_dir = (_project_dir / ".agent-wiki").resolve()
-        if not wiki_dir.is_relative_to(_ws_root):
-            raise ValueError(f"wiki_dir {wiki_dir!r} outside workspace root {_ws_root}")
-        wiki_index = (wiki_dir / "index.md").resolve()
-        if not wiki_index.is_relative_to(_ws_root):
-            raise ValueError(f"wiki_index {wiki_index!r} outside workspace root {_ws_root}")
-        if wiki_index.exists():
-            try:
-                lines = wiki_index.read_text(encoding="utf-8").splitlines()
-                wiki_entries = sum(
-                    1 for ln in lines
-                    if ln.startswith("|") and ".md" in ln and "Path" not in ln
-                )
-            except OSError:
-                pass
-        summary = {
-            "project_path": _project_path_str,
-            "project_name": _project_short_name,
-            "sessions": len(session_ids),
-            "jobs": job_count,
-            "chroma_chunks": chroma_chunks,
-            "wiki_entries": wiki_entries,
-            "dry_run": dry_run,
-        }
-
-        if dry_run:
-            return summary
-        self.codebase_memory.clear_project(_project_short_name)
-        self.task_store.delete_by_session_ids(session_ids)
-        deleted_sessions = self.session_memory.delete_sessions_by_project(_project_path_str)
-        if wiki_dir.exists():
-            shutil.rmtree(wiki_dir)
-        summary["deleted_sessions"] = deleted_sessions
-        self.logger.info("project_deleted", **{k: v for k, v in summary.items() if isinstance(v, (str, int, bool, float))})
-        return summary
+        return project_lifecycle.delete_project(
+            project_name,
+            self.workspace_path,
+            self.session_memory,
+            self.task_store,
+            self.codebase_memory,
+            dry_run=dry_run,
+        )
