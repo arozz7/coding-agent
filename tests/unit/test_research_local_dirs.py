@@ -121,10 +121,11 @@ class TestLocalDirRoutingOverride:
     and the task has no explicit web-search signals."""
 
     def _needs_web(self, task: str, local_sections: list) -> bool:
-        from agent.agents.research_agent import _LOCAL_TASK_RE, _SEARCH_TRIGGERS
-        _found_local_dirs = any(s.startswith("Contents of ") for s in local_sections)
-        _has_web_signals = bool(_SEARCH_TRIGGERS.search(task))
-        return not bool(_LOCAL_TASK_RE.search(task)) and not (_found_local_dirs and not _has_web_signals)
+        # Exercise the real routing function rather than a hand-duplicated
+        # copy of its formula — a duplicate previously drifted out of sync
+        # with a routing fix and silently stopped catching the regression.
+        from agent.agents.research_agent import _needs_web_search
+        return _needs_web_search(task, local_sections)
 
     def test_suppresses_web_when_local_dirs_found_no_web_signals(self):
         """Pure local task: local dirs found, no web signals → web suppressed."""

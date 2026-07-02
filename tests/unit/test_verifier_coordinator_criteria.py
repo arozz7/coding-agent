@@ -11,6 +11,9 @@ def _make_coordinator(llm_response: str = '{"passed": true}') -> VerifierCoordin
     verifier_agent = MagicMock()
     router = MagicMock()
     router.get_model.return_value = MagicMock()
+    # Behavioral/visual criteria are judged via the dynamically-selected free
+    # evaluator model (ModelRouter.get_evaluator_model), not get_model("coding").
+    router.get_evaluator_model = AsyncMock(return_value=MagicMock())
     router.generate = AsyncMock(return_value=llm_response)
 
     coord = VerifierCoordinator(verifier_agent=verifier_agent, model_router=router)

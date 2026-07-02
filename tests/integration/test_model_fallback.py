@@ -243,41 +243,23 @@ class TestGenericRemoteRateLimitFallback:
 # ---------------------------------------------------------------------------
 
 class TestKeywordClassifier:
-    """Test _detect_task_type_keyword without instantiating a full orchestrator."""
+    """Test the keyword classifier without instantiating a full orchestrator.
+
+    `AgentOrchestrator._detect_task_type_keyword` is a one-line passthrough to
+    `TaskRouter._detect_keyword` (see agent/orchestrator.py), so exercise the
+    router directly rather than constructing the whole orchestrator dependency
+    graph (agents, memory, mcp server, etc.) just to reach this pure function.
+    """
 
     @pytest.fixture
-    def orch(self, tmp_path):
-        from agent.orchestrator import AgentOrchestrator
+    def orch(self):
+        from agent.orchestration.task_router import TaskRouter
         from unittest.mock import MagicMock
 
         router = MagicMock()
         router.configs = []
         router.config_by_name = {}
-
-        with (
-            patch("agent.orchestrator.SessionMemory"),
-            patch("agent.orchestrator.CodebaseMemory"),
-            patch("agent.orchestrator.FileSystemTool"),
-            patch("agent.orchestrator.PytestTool"),
-            patch("agent.orchestrator.CodeAnalyzer"),
-            patch("agent.orchestrator.DeveloperAgent"),
-            patch("agent.orchestrator.TesterAgent"),
-            patch("agent.orchestrator.ReviewerAgent"),
-            patch("agent.orchestrator.ArchitectAgent"),
-            patch("agent.orchestrator.ChatAgent"),
-            patch("agent.orchestrator.ResearchAgent"),
-            patch("agent.orchestrator.SkillManager"),
-            patch("agent.orchestrator.WikiManager"),
-            patch("agent.orchestrator.SkillExecutor"),
-            patch("agent.orchestrator.MemoryWiki"),
-            patch("agent.orchestrator.AgentLogger"),
-            patch("mcp.server.create_mcp_server"),
-            patch("agent.tools.shell_tool.ShellTool"),
-            patch("agent.tools.browser_tool.BrowserTool"),
-            patch("agent.tools.tool_executor.ToolExecutor"),
-            patch("agent.tools.tool_executor.EventEmittingExecutor"),
-        ):
-            return AgentOrchestrator(str(tmp_path), router)
+        return TaskRouter(router)
 
     @pytest.mark.parametrize("task, expected", [
         # plan mode — must detect BEFORE develop keywords
@@ -307,4 +289,4 @@ class TestKeywordClassifier:
         ("explain recursion to me", "chat"),
     ])
     def test_keyword_classification(self, orch, task, expected):
-        assert orch._detect_task_type_keyword(task) == expected
+        assert orch._detect_keyword(task) == expected

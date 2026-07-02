@@ -3,8 +3,12 @@
 Strategy:
   - Patch `local_coding_agent.create_agent` so the startup event never hits
     real Ollama / model configs.
-  - Patch `api.main._job_store` with a fresh SQLite store rooted in tmp_path
-    so tests are isolated and never touch data/jobs.db.
+  - Patch the `job_store` binding in every route module that imported it
+    (`api.routes.tasks`, `api.routes.system`) with a fresh SQLite store
+    rooted in tmp_path so tests are isolated and never touch data/jobs.db.
+  - Set `api.deps.app_state.orchestrator` directly — `app_state` is a
+    shared singleton object, so this is visible to every route module
+    without needing to patch each one individually.
   - Expose a pre-configured AsyncClient via `client` fixture.
 """
 
@@ -53,6 +57,8 @@ def make_mock_orchestrator(task_type: str = "chat", response: str = "Mock respon
     router.get_model.return_value = mock_config
     router.configs = [mock_config]
     router.set_active_model.return_value = mock_config
+    router.ollama = MagicMock()
+    router.ollama.list_all_models = AsyncMock(return_value=[])
     router.get_cost_summary.return_value = {}
     router.get_healthy_models.return_value = ["test-model"]
     router.health_check = AsyncMock(return_value=True)
@@ -98,19 +104,25 @@ async def client(test_store) -> AsyncGenerator[Tuple[AsyncClient, JobStore, Magi
 
     Yields: (AsyncClient, JobStore, mock_orchestrator)
     """
+    from api.deps import app_state
     from api.main import app
 
     mock_orch = make_mock_orchestrator()
+    previous_orch = app_state.orchestrator
+    app_state.orchestrator = mock_orch
 
     with (
-        patch("api.main._orchestrator", mock_orch),
-        patch("api.main._job_store", test_store),
+        patch("api.routes.tasks.job_store", test_store),
+        patch("api.routes.system.job_store", test_store),
     ):
-        async with AsyncClient(
-            transport=ASGITransport(app=app),
-            base_url="http://test",
-        ) as ac:
-            yield ac, test_store, mock_orch
+        try:
+            async with AsyncClient(
+                transport=ASGITransport(app=app),
+                base_url="http://test",
+            ) as ac:
+                yield ac, test_store, mock_orch
+        finally:
+            app_state.orchestrator = previous_orch
 
 
 async def poll_until_done(

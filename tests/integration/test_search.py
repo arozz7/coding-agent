@@ -121,11 +121,15 @@ class TestBraveSearch:
 
 
 class TestGoogleSearch:
+    """Google CSE is the last-resort tier (deprecated for full-web as of Jan 2026),
+    tried only after Brave, DuckDuckGo, and Playwright-Google all fail — see
+    WebTool.search()'s docstring. These tests exercise _search_google directly
+    rather than going through search(), since routing through search() would
+    require the earlier tiers to fail hermetically too (no Brave key leaking
+    from a local .env, no real DDG/Playwright network calls)."""
+
     @pytest.mark.asyncio
     async def test_google_search_happy_path(self, monkeypatch):
-        monkeypatch.setenv("GOOGLE_SEARCH_API_KEY", "fake_key")
-        monkeypatch.setenv("GOOGLE_SEARCH_CX", "fake_cx")
-
         tool = WebTool()
 
         mock_response = MagicMock()
@@ -144,7 +148,7 @@ class TestGoogleSearch:
         mock_client.get = AsyncMock(return_value=mock_response)
 
         with patch("agent.tools.web_tool.httpx.AsyncClient", return_value=mock_client):
-            results = await tool.search("test query", max_results=2)
+            results = await tool._search_google("test query", max_results=2, api_key="fake_key", cx="fake_cx")
 
         assert len(results) == 2
         assert results[0]["title"] == "Result 1"
@@ -154,6 +158,7 @@ class TestGoogleSearch:
     @pytest.mark.asyncio
     async def test_google_search_fallback_on_http_error(self, monkeypatch):
         """Google returning an HTTP error should silently fall back to DDG."""
+        monkeypatch.delenv("BRAVE_SEARCH_API_KEY", raising=False)
         monkeypatch.setenv("GOOGLE_SEARCH_API_KEY", "fake_key")
         monkeypatch.setenv("GOOGLE_SEARCH_CX", "fake_cx")
 
@@ -181,30 +186,32 @@ class TestGoogleSearch:
         # No hard error key — google error is swallowed, we get DDG results
 
     @pytest.mark.asyncio
-    async def test_google_search_fallback_on_error_key(self, monkeypatch):
-        """Google returning {error: ...} result should fall back to DDG."""
-        monkeypatch.setenv("GOOGLE_SEARCH_API_KEY", "fake_key")
-        monkeypatch.setenv("GOOGLE_SEARCH_CX", "fake_cx")
+    async def test_google_search_returns_error_on_http_failure(self):
+        """Google CSE errors (403, timeout, ...) surface as an {error: ...} result.
 
+        Google is the last tier in search()'s fallback chain, so there is
+        nothing left for it to fall back to — callers of search() instead see
+        whatever the second-to-last tier (Playwright-Google) returned. This
+        test just confirms _search_google itself degrades to an error dict
+        rather than raising.
+        """
         tool = WebTool()
 
-        ddg_results = [
-            {"title": "DDG Hit", "href": "https://ddg.example.com", "body": "body text"},
-        ]
+        mock_client = AsyncMock()
+        mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+        mock_client.__aexit__ = AsyncMock(return_value=False)
+        mock_client.get = AsyncMock(side_effect=Exception("403 Forbidden"))
 
-        fake_ddgs = _make_ddgs_module(ddg_results)
-        with (
-            patch.object(tool, "_search_google", AsyncMock(return_value=[{"error": "403 Forbidden"}])),
-            patch.dict(sys.modules, {"ddgs": fake_ddgs}),
-        ):
-            results = await tool.search("fallback test", max_results=3)
+        with patch("agent.tools.web_tool.httpx.AsyncClient", return_value=mock_client):
+            results = await tool._search_google("fallback test", max_results=3, api_key="fake_key", cx="fake_cx")
 
-        assert len(results) >= 1
-        assert results[0].get("title") == "DDG Hit"
+        assert len(results) == 1
+        assert "403 Forbidden" in results[0]["error"]
 
     @pytest.mark.asyncio
     async def test_no_google_credentials_uses_ddg(self, monkeypatch):
         """When Google credentials are absent, DDG is used directly."""
+        monkeypatch.delenv("BRAVE_SEARCH_API_KEY", raising=False)
         monkeypatch.delenv("GOOGLE_SEARCH_API_KEY", raising=False)
         monkeypatch.delenv("GOOGLE_SEARCH_CX", raising=False)
 

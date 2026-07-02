@@ -107,6 +107,26 @@ _LOCAL_TASK_RE = re.compile(
 )
 
 
+def _needs_web_search(task: str, local_sections: list[str]) -> bool:
+    """Decide whether *task* requires a live web search.
+
+    Default to web search for research tasks. Only skip it when the task
+    explicitly refers to the local workspace/codebase (errors, logs, files).
+    _SEARCH_TRIGGERS was too narrow — planner-generated subtasks like
+    "Research state persistence..." don't contain trigger words but clearly
+    need web search, not local file scanning.
+
+    Exception: if we successfully read local directory content AND the task
+    has no explicit web-search signals, skip web — it would return generic
+    noise. Tasks that want both ("review docs AND search for gaps") still
+    get web search — an explicit web signal always wins.
+    """
+    found_local_dirs = any(s.startswith("Contents of ") for s in local_sections)
+    has_web_signals = bool(_SEARCH_TRIGGERS.search(task))
+    is_local_task = bool(_LOCAL_TASK_RE.search(task)) or (found_local_dirs and not has_web_signals)
+    return has_web_signals or not is_local_task
+
+
 def _emit(on_phase, label: str) -> None:
     if on_phase:
         try:
@@ -196,17 +216,7 @@ Guidelines:
             local_sections.extend(dir_sections)
 
         # --- Routing decision ---
-        # Default to web search for research tasks. Only skip it when the task
-        # explicitly refers to the local workspace/codebase (errors, logs, files).
-        # _SEARCH_TRIGGERS was too narrow — planner-generated subtasks like
-        # "Research state persistence..." don't contain trigger words but clearly
-        # need web search, not local file scanning.
-        # Exception: if we successfully read local directory content AND the task
-        # has no explicit web-search signals, skip web — it would return generic noise.
-        # Tasks that want both ("review docs AND search for gaps") still get web search.
-        _found_local_dirs = any(s.startswith("Contents of ") for s in local_sections)
-        _has_web_signals = bool(_SEARCH_TRIGGERS.search(task))
-        needs_web = not bool(_LOCAL_TASK_RE.search(task)) and not (_found_local_dirs and not _has_web_signals)
+        needs_web = _needs_web_search(task, local_sections)
 
         wants_files = bool(_FILE_WRITE_RE.search(task))
 
