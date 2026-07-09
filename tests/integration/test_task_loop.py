@@ -5,7 +5,18 @@ from datetime import datetime
 
 from agent.agents.planner_agent import PlannerAgent, PlanResult, VALID_AGENT_TYPES
 from agent.agents.verifier_agent import VerifierResult
+from agent.orchestration.criterion_evaluator import CriterionResult
 from agent.orchestration.task_loop import TaskLoop, TaskLoopDeps
+
+
+def _repeat_last(values):
+    """AsyncMock side_effect helper: yield each value in order, then repeat the last forever."""
+    def _side_effect(*args, **kwargs):
+        idx = _side_effect.calls
+        _side_effect.calls += 1
+        return values[min(idx, len(values) - 1)]
+    _side_effect.calls = 0
+    return _side_effect
 
 
 # ---------------------------------------------------------------------------
@@ -136,72 +147,100 @@ class TestPlannerAgentStrategy:
 # build that bundle directly with mocked collaborators instead of mocking
 # the whole orchestrator, matching the new architecture.
 
-class TestTaskLoop:
-    """Test TaskLoop.run without a real LLM, DB, or orchestrator."""
+def _build_task_loop(
+    plan_specs,
+    agent_response="Task done.",
+    job_id=None,
+    objective_resolver=None,
+    completion_criteria=None,
+    verifier_results=None,
+    evaluate_criteria_results=None,
+):
+    """Build a TaskLoop wired with mocked deps and a real TaskStore.
 
-    def _make_task_loop(self, plan_specs, agent_response="Task done.", job_id=None, objective_resolver=None):
-        """Build a TaskLoop wired with mocked deps and a real TaskStore."""
-        import tempfile
-        import os
-        from api.task_store import TaskStore
+    verifier_results: optional list of VerifierResult to return from
+      successive run_verification() calls (last value repeats once
+      exhausted). Defaults to always-passing.
+    evaluate_criteria_results: optional list of CriterionResult lists to
+      return from successive evaluate_criteria() calls.
+    """
+    import tempfile
+    import os
+    from api.task_store import TaskStore
 
-        tmp_fd, tmp_path_db = tempfile.mkstemp(suffix=".db")
-        os.close(tmp_fd)
-        task_store = TaskStore(db_path=tmp_path_db)
+    tmp_fd, tmp_path_db = tempfile.mkstemp(suffix=".db")
+    os.close(tmp_fd)
+    task_store = TaskStore(db_path=tmp_path_db)
 
-        tool_executor = MagicMock()
-        tool_executor.workspace_path = "."
-        tool_executor.execute = AsyncMock(return_value="")
+    tool_executor = MagicMock()
+    tool_executor.workspace_path = "."
+    tool_executor.execute = AsyncMock(return_value="")
 
-        context_builder = MagicMock()
-        context_builder.build_planning_context = AsyncMock(return_value="")
-        context_builder.char_budget = MagicMock(return_value=5000)
-        context_builder.model_router = MagicMock()
+    context_builder = MagicMock()
+    context_builder.build_planning_context = AsyncMock(return_value="")
+    context_builder.char_budget = MagicMock(return_value=5000)
+    context_builder.model_router = MagicMock()
 
-        planner_agent = MagicMock()
-        planner_agent.plan_with_criteria = AsyncMock(
-            return_value=PlanResult(tasks=list(plan_specs))
-        )
+    planner_agent = MagicMock()
+    planner_agent.plan_with_criteria = AsyncMock(
+        return_value=PlanResult(tasks=list(plan_specs), completion_criteria=completion_criteria or [])
+    )
 
-        plan_reviewer_agent = MagicMock()
-        plan_reviewer_agent.review = AsyncMock(side_effect=lambda specs, objective: specs)
+    plan_reviewer_agent = MagicMock()
+    plan_reviewer_agent.review = AsyncMock(side_effect=lambda specs, objective: specs)
 
-        verifier_coordinator = MagicMock()
+    verifier_coordinator = MagicMock()
+    if verifier_results is not None:
+        verifier_coordinator.run_verification = AsyncMock(side_effect=_repeat_last(verifier_results))
+    else:
         verifier_coordinator.run_verification = AsyncMock(
             return_value=VerifierResult(score=8, passed=True)
         )
+    if evaluate_criteria_results is not None:
+        verifier_coordinator.evaluate_criteria = AsyncMock(side_effect=_repeat_last(evaluate_criteria_results))
+    else:
+        verifier_coordinator.evaluate_criteria = AsyncMock(return_value=[])
+    verifier_coordinator.make_fix_specs = MagicMock(return_value=[
+        {"description": "Fix gap", "agent_type": "develop"}
+    ])
 
-        session_memory = MagicMock()
-        skill_executor = MagicMock()
-        skill_executor.execute_post = AsyncMock(return_value={})
-        memory_wiki = MagicMock()
-        acceptance_tester_agent = MagicMock()
+    session_memory = MagicMock()
+    skill_executor = MagicMock()
+    skill_executor.execute_post = AsyncMock(return_value={})
+    memory_wiki = MagicMock()
+    acceptance_tester_agent = MagicMock()
 
-        run_agent_fn = AsyncMock(return_value={
-            "success": True,
-            "response": agent_response,
-            "files_created": [],
-            "new_tasks": [],
-        })
-        drain_switch_fn = MagicMock(return_value=[])
+    run_agent_fn = AsyncMock(return_value={
+        "success": True,
+        "response": agent_response,
+        "files_created": [],
+        "new_tasks": [],
+    })
+    drain_switch_fn = MagicMock(return_value=[])
 
-        deps = TaskLoopDeps(
-            tool_executor=tool_executor,
-            context_builder=context_builder,
-            planner_agent=planner_agent,
-            plan_reviewer_agent=plan_reviewer_agent,
-            task_store=task_store,
-            verifier_coordinator=verifier_coordinator,
-            criterion_score_store=MagicMock(),
-            session_memory=session_memory,
-            skill_executor=skill_executor,
-            memory_wiki=memory_wiki,
-            acceptance_tester_agent=acceptance_tester_agent,
-            run_agent_fn=run_agent_fn,
-            drain_switch_fn=drain_switch_fn,
-            objective_resolver=objective_resolver,
-        )
-        return TaskLoop(deps), task_store
+    deps = TaskLoopDeps(
+        tool_executor=tool_executor,
+        context_builder=context_builder,
+        planner_agent=planner_agent,
+        plan_reviewer_agent=plan_reviewer_agent,
+        task_store=task_store,
+        verifier_coordinator=verifier_coordinator,
+        criterion_score_store=MagicMock(),
+        session_memory=session_memory,
+        skill_executor=skill_executor,
+        memory_wiki=memory_wiki,
+        acceptance_tester_agent=acceptance_tester_agent,
+        run_agent_fn=run_agent_fn,
+        drain_switch_fn=drain_switch_fn,
+        objective_resolver=objective_resolver,
+    )
+    return TaskLoop(deps), task_store
+
+
+class TestTaskLoop:
+    """Test TaskLoop.run without a real LLM, DB, or orchestrator."""
+
+    _make_task_loop = staticmethod(_build_task_loop)
 
     @pytest.mark.asyncio
     async def test_loop_executes_all_tasks(self):
@@ -368,3 +407,74 @@ class TestTaskLoop:
         await loop.run("continue researching", "research", "sess")
 
         resolver.resolve.assert_not_awaited()
+
+
+# ---------------------------------------------------------------------------
+# Verifier quality gate: criteria passing must not declare victory alone
+# ---------------------------------------------------------------------------
+#
+# Regression coverage for the bug seen in production logs: auto-checkable
+# criteria (file exists / file contains / command exits 0) were satisfied —
+# sometimes via literal string-insertion fix tasks — while the holistic
+# verifier scored the same output 0-2/10. TaskLoop reported success anyway.
+
+class TestVerifierQualityGate:
+
+    _make_task_loop = staticmethod(_build_task_loop)
+
+    @pytest.mark.asyncio
+    async def test_criteria_pass_and_verifier_passes_reports_done_cleanly(self):
+        specs = [{"description": "Task 1", "agent_type": "develop"}]
+        loop, _ = self._make_task_loop(
+            specs,
+            completion_criteria=["file exists: index.js"],
+            evaluate_criteria_results=[[CriterionResult(criterion="file exists: index.js", passed=True)]],
+            verifier_results=[VerifierResult(score=8, passed=True)],
+        )
+        result = await loop.run("build the app", "develop", "sess", job_id="job1")
+
+        assert "needs review" not in result["job_summary"].lower()
+        assert result["job_summary"].startswith("**1/1 tasks completed**")
+
+    @pytest.mark.asyncio
+    async def test_criteria_pass_but_low_verifier_score_injects_fix_and_flags_review(self):
+        specs = [{"description": "Task 1", "agent_type": "develop"}]
+        loop, _ = self._make_task_loop(
+            specs,
+            completion_criteria=["file exists: index.js"],
+            evaluate_criteria_results=[[CriterionResult(criterion="file exists: index.js", passed=True)]],
+            # Verifier never passes — stagnation eventually stops the gate loop.
+            verifier_results=[
+                VerifierResult(score=1, passed=False, gaps=["stub output"]),
+                VerifierResult(score=1, passed=False, gaps=["stub output"]),
+            ],
+        )
+        result = await loop.run("build the app", "develop", "sess", job_id="job1")
+
+        # run_agent_fn was called for the original task plus at least one
+        # injected verifier-gate fix task.
+        assert loop._d.run_agent_fn.await_count >= 2
+        assert "needs review" in result["job_summary"].lower()
+        assert "1/10" in result["job_summary"]
+
+    @pytest.mark.asyncio
+    async def test_completed_count_excludes_status_lines_not_real_tasks(self):
+        """Regression test for the '9/7 tasks completed' miscount: the header
+        must reflect real executed tasks, not every checkmarked status line
+        (criteria-satisfied, acceptance-satisfied) appended to the summary.
+        """
+        specs = [
+            {"description": "Task 1", "agent_type": "develop"},
+            {"description": "Task 2", "agent_type": "develop"},
+        ]
+        loop, _ = self._make_task_loop(
+            specs,
+            completion_criteria=["file exists: index.js"],
+            evaluate_criteria_results=[[CriterionResult(criterion="file exists: index.js", passed=True)]],
+            verifier_results=[VerifierResult(score=8, passed=True)],
+        )
+        result = await loop.run("build the app", "develop", "sess", job_id="job1")
+
+        # 2 real tasks executed; the criteria-satisfied line is a status
+        # line, not a third completed task.
+        assert result["job_summary"].startswith("**2/2 tasks completed**")

@@ -114,7 +114,13 @@ class _FixCycleRunner:
                 f" ({len(behavioral_failing)} behavioral criteria not auto-verifiable)"
                 if behavioral_failing else ""
             )
-            task_summaries.append(f"✅ **All auto-checkable criteria satisfied**{behavioral_note} — score {vr.score}/10")
+            # Criteria passing is necessary but not sufficient — the mark
+            # reflects the verifier's actual pass/fail, not the criteria
+            # check alone, so a low score never renders as a checkmark.
+            mark = "✅" if vr.passed else "⚠️"
+            task_summaries.append(
+                f"{mark} **All auto-checkable criteria satisfied**{behavioral_note} — score {vr.score}/10"
+            )
             for c in criterion_attempts:
                 d.criterion_score_store.record(c, succeeded=True)
             return True

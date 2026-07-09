@@ -24,6 +24,7 @@ from typing import TYPE_CHECKING, Callable, Optional
 
 import structlog
 
+from agent.agents.verifier_agent import PASS_THRESHOLD
 from agent.orchestration.task_exec_ctx import TaskLoopDeps, _TaskExecCtx
 from agent.orchestration.task_loop_cycles import _FixCycleRunner, build_research_extra, check_stagnation
 
@@ -120,6 +121,9 @@ class TaskLoop:
         _plateau_count = 0
         _zero_score_count = 0
         _final_verifier_score: int | None = None
+        _final_verifier_result: "VerifierResult | None" = None
+        _completed_task_count = 0
+        _failed_task_count = 0
         _verifier_snapshot_files: set[str] = set()
         _fix_budget = max(1, int(os.getenv("FIX_BUDGET", "20")))
         _criterion_fix_count = 0
@@ -148,13 +152,14 @@ class TaskLoop:
                 return ""
 
         async def _run_final_verifier() -> "VerifierResult":
-            nonlocal _final_verifier_score
+            nonlocal _final_verifier_score, _final_verifier_result
             _emit("verifying:final")
             combined = "\n\n---\n\n".join(all_responses)
             vr = await d.verifier_coordinator.run_verification(
                 objective, task_type, combined, all_files, tool_executor=d.tool_executor
             )
             _final_verifier_score = vr.score
+            _final_verifier_result = vr
             if vr.passed:
                 try:
                     d.session_memory.store_episodic(session_id, objective, combined[:500], vr.score, task_type)
@@ -209,6 +214,45 @@ class TaskLoop:
                     if not criteria_done:
                         break  # shouldn't happen
 
+                    # Verifier quality gate. Auto-checkable criteria (file
+                    # exists / file contains / command exits 0) can be
+                    # satisfied by literal string-insertion — see
+                    # verifier_coordinator.make_targeted_fix_spec — without
+                    # the underlying work being real. Criteria passing alone
+                    # must not declare victory; the holistic verifier score
+                    # has to agree too. Reuses the same gap-driven fix specs
+                    # and stagnation bounds as the no-criteria path below so
+                    # a genuinely stuck low-quality run still stops instead
+                    # of burning the fix budget forever.
+                    if (
+                        _final_verifier_result is not None
+                        and not _final_verifier_result.passed
+                        and _verifier_rounds < _MAX_VERIFIER_ROUNDS
+                    ):
+                        stop, _plateau_count, _zero_score_count = check_stagnation(
+                            _final_verifier_result.score, _prev_verifier_score,
+                            _plateau_count, _zero_score_count, task_summaries,
+                        )
+                        if not stop:
+                            _new_files = [f for f in all_files if f not in _verifier_snapshot_files]
+                            _verifier_snapshot_files = set(all_files)
+                            fix_specs = d.verifier_coordinator.make_fix_specs(
+                                objective, task_type, _final_verifier_result, _verifier_rounds + 1,
+                                files_created=all_files,
+                                files_changed_this_round=_new_files,
+                                prev_score=_prev_verifier_score,
+                            )
+                            _prev_verifier_score = _final_verifier_result.score
+                            _verifier_rounds += 1
+                            ctx.add_tasks(fix_specs)
+                            task_summaries.append(
+                                f"🔍 **Verifier gate** (round {_verifier_rounds}/{_MAX_VERIFIER_ROUNDS}) "
+                                f"— criteria passed but score {_final_verifier_result.score}/{PASS_THRESHOLD} "
+                                f"required; injecting {len(fix_specs)} fix task(s)"
+                            )
+                            _final_verifier_result = None
+                            continue
+
                     # Acceptance test loop
                     if acceptance_criteria and task_type in ("develop", "sdlc") and _acceptance_fix_count < _acceptance_budget:
                         acc_done, _acceptance_fix_count, _last_acceptance_screenshot, screenshot_path = \
@@ -248,6 +292,7 @@ class TaskLoop:
                     )
                     _verifier_rounds += 1
                     _final_verifier_score = vresult.score
+                    _final_verifier_result = vresult
                     if vresult.passed:
                         try:
                             d.session_memory.store_episodic(
@@ -341,6 +386,7 @@ class TaskLoop:
                     completion_summary = result.get("completion_summary", "").strip()
                     short = completion_summary or response_text[:80].replace("\n", " ").strip()
                     task_summaries.append(f"✅ **{description[:60]}** — {short}")
+                    _completed_task_count += 1
 
                     if agent_type not in ("research", "researcher"):
                         try:
@@ -354,6 +400,7 @@ class TaskLoop:
                     all_responses.append(f"**Task {task_num}: {description[:60]}** — failed: {error}")
                     task_summaries.append(f"❌ **{description[:60]}** — {error[:80]}")
                     ctx.mark_done(task_id, "failed", error)
+                    _failed_task_count += 1
                     self.logger.warning("task_loop_task_failed", task_num=task_num, error=error)
 
             except Exception as exc:
@@ -361,6 +408,7 @@ class TaskLoop:
                 ctx.mark_done(task_id, "failed", str(exc))
                 all_responses.append(f"**Task {task_num}: {description[:60]}** — error: {exc}")
                 task_summaries.append(f"❌ **{description[:60]}** — {str(exc)[:80]}")
+                _failed_task_count += 1
 
             # Safety guard for no-persistence mode
             if not job_id and task_num >= len(task_specs):
@@ -368,15 +416,27 @@ class TaskLoop:
 
         combined = "\n\n---\n\n".join(all_responses) if all_responses else "(no output)"
 
-        failed_count = sum(1 for s in task_summaries if s.startswith("❌"))
-        done_count = sum(1 for s in task_summaries if s.startswith("✅"))
+        # needs_review: the verifier ran and did NOT pass. Criteria satisfied
+        # is not the same claim as "this works" — see the verifier quality
+        # gate above — so a low final score must change what gets reported,
+        # not just what's logged.
+        needs_review = _final_verifier_result is not None and not _final_verifier_result.passed
         if task_summaries:
-            header = f"**{done_count}/{task_num} tasks completed**" + (f" · {failed_count} failed" if failed_count else "")
-            next_steps = (
-                "\n\n**Next steps:** Review the errors above. Use `!dev <description>` to continue."
-                if failed_count
-                else "\n\n**Next steps:** Changes applied. Run your test suite to verify, or `!result` to review."
-            )
+            total_tasks = _completed_task_count + _failed_task_count
+            header = f"**{_completed_task_count}/{total_tasks} tasks completed**"
+            if _failed_task_count:
+                header += f" · {_failed_task_count} failed"
+            if needs_review:
+                header += f" · ⚠️ verifier score {_final_verifier_result.score}/10 (needs review)"
+            if _failed_task_count:
+                next_steps = "\n\n**Next steps:** Review the errors above. Use `!dev <description>` to continue."
+            elif needs_review:
+                next_steps = (
+                    "\n\n**Next steps:** ⚠️ Verifier did not pass — output may be incomplete or stubbed. "
+                    "Review the changes before relying on them, or `!dev <description>` to continue."
+                )
+            else:
+                next_steps = "\n\n**Next steps:** Changes applied. Run your test suite to verify, or `!result` to review."
             job_summary = header + "\n\n" + "\n".join(task_summaries) + next_steps
         else:
             job_summary = ""
