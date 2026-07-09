@@ -20,6 +20,7 @@ from agent.skills.wiki_manager import WikiManager
 from agent.skills.skill_executor import SkillExecutor
 from agent.orchestration import ContextBuilder, CriterionScoreStore, TaskRouter, VerifierCoordinator
 from agent.orchestration.requirements_extractor import RequirementsExtractor
+from agent.orchestration.objective_resolver import ObjectiveResolver
 from agent.orchestration.agent_factory import create_agents
 from agent.orchestration.subagent_manager import SubagentManager
 from agent.orchestration.task_loop import TaskLoop, TaskLoopDeps
@@ -88,6 +89,7 @@ class AgentOrchestrator:
         self.agent_logger = AgentLogger("orchestrator")
 
         self.requirements_extractor = RequirementsExtractor(model_router)
+        self.objective_resolver = ObjectiveResolver(model_router)
         _agents = create_agents(
             model_router,
             fs_tool=self.fs_tool,
@@ -149,6 +151,7 @@ class AgentOrchestrator:
             acceptance_tester_agent=_agents["acceptance_tester"],
             run_agent_fn=self._run_specialized_agent,
             drain_switch_fn=self._drain_switch_notices,
+            objective_resolver=self.objective_resolver,
         ))
 
     async def spawn_subagent(

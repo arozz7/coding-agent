@@ -139,7 +139,7 @@ class TestPlannerAgentStrategy:
 class TestTaskLoop:
     """Test TaskLoop.run without a real LLM, DB, or orchestrator."""
 
-    def _make_task_loop(self, plan_specs, agent_response="Task done.", job_id=None):
+    def _make_task_loop(self, plan_specs, agent_response="Task done.", job_id=None, objective_resolver=None):
         """Build a TaskLoop wired with mocked deps and a real TaskStore."""
         import tempfile
         import os
@@ -199,6 +199,7 @@ class TestTaskLoop:
             acceptance_tester_agent=acceptance_tester_agent,
             run_agent_fn=run_agent_fn,
             drain_switch_fn=drain_switch_fn,
+            objective_resolver=objective_resolver,
         )
         return TaskLoop(deps), task_store
 
@@ -322,3 +323,48 @@ class TestTaskLoop:
         )
         task_phases = [p for p in phases_emitted if p.startswith("task:")]
         assert len(task_phases) >= 2
+
+    @pytest.mark.asyncio
+    async def test_objective_resolved_before_planning(self):
+        """A vague objective is rewritten by objective_resolver before the
+        planner ever sees it — the planner must receive the resolved text.
+        """
+        from agent.orchestration.objective_resolver import ResolvedObjective
+
+        specs = [{"description": "Task 1", "agent_type": "develop"}]
+        resolver = MagicMock()
+        resolver.resolve = AsyncMock(return_value=ResolvedObjective(
+            objective="Initialize SQLite schema in src-tauri/db/ using sqlx",
+            context_excerpt="### NEXT_STEPS.md\n- [ ] Initialize SQLite schema",
+        ))
+        loop, _ = self._make_task_loop(specs, objective_resolver=resolver)
+
+        await loop.run("continue with the next steps", "develop", "sess")
+
+        resolver.resolve.assert_awaited_once()
+        planned_objective = loop._d.planner_agent.plan_with_criteria.call_args[0][0]
+        assert planned_objective == "Initialize SQLite schema in src-tauri/db/ using sqlx"
+
+    @pytest.mark.asyncio
+    async def test_objective_unresolved_when_no_resolver_configured(self):
+        """No objective_resolver wired (e.g. older TaskLoopDeps) — planning
+        proceeds against the original objective unchanged.
+        """
+        specs = [{"description": "Task 1", "agent_type": "develop"}]
+        loop, _ = self._make_task_loop(specs, objective_resolver=None)
+
+        await loop.run("continue with the next steps", "develop", "sess")
+
+        planned_objective = loop._d.planner_agent.plan_with_criteria.call_args[0][0]
+        assert planned_objective == "continue with the next steps"
+
+    @pytest.mark.asyncio
+    async def test_objective_resolver_skipped_for_non_develop_task_types(self):
+        specs = [{"description": "Task 1", "agent_type": "research"}]
+        resolver = MagicMock()
+        resolver.resolve = AsyncMock()
+        loop, _ = self._make_task_loop(specs, objective_resolver=resolver)
+
+        await loop.run("continue researching", "research", "sess")
+
+        resolver.resolve.assert_not_awaited()

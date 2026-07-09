@@ -19,6 +19,7 @@ if TYPE_CHECKING:
     from agent.orchestration import VerifierCoordinator
     from agent.orchestration import CriterionScoreStore
     from agent.orchestration.context_builder import ContextBuilder
+    from agent.orchestration.objective_resolver import ObjectiveResolver
     from agent.skills.skill_executor import SkillExecutor
 
 
@@ -112,3 +113,4 @@ class TaskLoopDeps:
     acceptance_tester_agent: "AcceptanceTesterAgent"
     run_agent_fn: Callable    # orchestrator._run_specialized_agent
     drain_switch_fn: Callable # orchestrator._drain_switch_notices
+    objective_resolver: Optional["ObjectiveResolver"] = None

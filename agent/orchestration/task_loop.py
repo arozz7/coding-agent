@@ -65,10 +65,23 @@ class TaskLoop:
                 except Exception:
                     pass
 
-        # 1. Plan
-        _emit("planning:tasks")
+        # 1. Ground the objective — rewrite vague "do the next thing" requests
+        # into one concrete, file-naming deliverable before anything plans
+        # against them. See objective_resolver.py for why this matters.
         _ws_path = Path(getattr(d.tool_executor, "workspace_path", ".") if d.tool_executor else ".")
+        if d.objective_resolver is not None and task_type in ("develop", "sdlc"):
+            _emit("planning:resolve-objective")
+            _resolved = await d.objective_resolver.resolve(objective, _ws_path)
+            objective = _resolved.objective
+            _resolved_context = _resolved.context_excerpt
+        else:
+            _resolved_context = ""
+
+        # 2. Plan
+        _emit("planning:tasks")
         planning_ctx = await d.context_builder.build_planning_context(objective)
+        if _resolved_context:
+            planning_ctx = f"{planning_ctx}\n\n## Target task-file excerpt\n{_resolved_context}"[:4000]
         plan_result = await d.planner_agent.plan_with_criteria(
             objective,
             context=planning_ctx,
@@ -79,12 +92,12 @@ class TaskLoop:
         completion_criteria = plan_result.completion_criteria
         acceptance_criteria = plan_result.acceptance_criteria
 
-        # 1b. Plan review
+        # 2b. Plan review
         if task_type in ("develop", "sdlc") and len(task_specs) >= 3:
             _emit("planning:review")
             task_specs = await d.plan_reviewer_agent.review(task_specs, objective)
 
-        # 2. Persist tasks
+        # 3. Persist tasks
         ctx = _TaskExecCtx(job_id, task_specs, d.task_store)
         ctx.persist_tasks(task_specs)
 
@@ -95,7 +108,7 @@ class TaskLoop:
             job_id=job_id,
         )
 
-        # 3. Loop state
+        # 4. Loop state
         all_responses: list[str] = []
         all_files: list[str] = []
         task_summaries: list[str] = []
@@ -150,7 +163,7 @@ class TaskLoop:
             return vr
 
         # ------------------------------------------------------------------
-        # 4. Main loop
+        # 5. Main loop
         # ------------------------------------------------------------------
         while True:
             task_obj = ctx.fetch_next()
