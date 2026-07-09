@@ -25,6 +25,18 @@ if TYPE_CHECKING:
 logger = structlog.get_logger()
 
 
+# Structured manifest files where APPEND: would corrupt the file's syntax
+# (JSON/TOML don't tolerate trailing raw text) and where "the substring is
+# present" doesn't mean "the dependency actually works" — it needs to be
+# installed through the package manager, not typed into the file.
+_MANIFEST_INSTALL_CMDS: dict[str, tuple[str, str]] = {
+    "package.json": ("npm", "npm install {pkg}"),
+    "cargo.toml":   ("cargo", "cargo add {pkg}"),
+    "pyproject.toml": ("pip", "pip install {pkg}"),
+    "requirements.txt": ("pip", "pip install {pkg}"),
+}
+
+
 def _select_primary_file(output_files: list[str]) -> str:
     """Prefer root-level files over subdirectory files; fall back to first."""
     for f in output_files:
@@ -243,7 +255,23 @@ class VerifierCoordinator:
                 rel, substring = payload.split(":", 1)
                 rel, substring = rel.strip(), substring.strip()
                 detail_lower = failing.detail.lower()
-                if detail_lower.startswith("read error") or detail_lower.startswith("missing:"):
+                manifest_cmd = _MANIFEST_INSTALL_CMDS.get(Path(rel).name.lower())
+                if manifest_cmd and not (
+                    detail_lower.startswith("read error") or detail_lower.startswith("missing:")
+                ):
+                    # The file exists but lacks this substring — for a manifest,
+                    # that means a dependency is missing. Adding raw text via
+                    # APPEND: corrupts JSON/TOML syntax and wouldn't actually
+                    # install anything; the package manager is the only correct fix.
+                    _tool, _cmd_tpl = manifest_cmd
+                    pkg = substring.strip('"\'')
+                    cmd = _cmd_tpl.format(pkg=pkg)
+                    instruction = (
+                        f"Run `{cmd}` to add the dependency through the package manager. "
+                        f"Do NOT hand-edit `{rel}` or use an APPEND: block — manually inserted "
+                        f"text corrupts the file's syntax and does not install the package."
+                    )
+                elif detail_lower.startswith("read error") or detail_lower.startswith("missing:"):
                     instruction = (
                         f"Create the file `{rel}` and ensure it contains the text `{substring}`. "
                         f"Use a FILE: block with appropriate content."

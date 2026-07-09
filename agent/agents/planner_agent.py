@@ -307,6 +307,14 @@ class PlannerAgent:
             "NEVER use grep, sed, awk, find, cat, ls, or any Unix-only utility in this field — "
             "they do not exist on Windows and will always fail.\n"
             "For behavioral/visual criteria use plain English.\n\n"
+            "RULES:\n"
+            "  - Do NOT generate 'file contains' criteria for ANY markdown (.md) file. Markdown "
+            "files (README.md, NEXT_STEPS.md, CHANGELOG.md, ...) are documentation artifacts, not "
+            "evidence that code works — a criterion like 'file contains: NEXT_STEPS.md:Prioritized' "
+            "is satisfied by appending one word and proves nothing about real progress.\n"
+            "  - Every 'file contains' criterion's substring must be something the code/config "
+            "must contain to actually function (an import, a dependency entry, a function "
+            "signature, a config key) — never an arbitrary label chosen just to make the check pass.\n\n"
             'Return ONLY valid JSON: {"criteria": ["<criterion 1>", ...]}'
         )
         prompt = (

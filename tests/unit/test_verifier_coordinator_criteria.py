@@ -164,3 +164,45 @@ class TestMakeTargetedFixSpec:
         failing = CriterionResult(criterion="c", passed=False)
         spec = coord.make_targeted_fix_spec(failing, "obj", round_num=3)
         assert "3" in spec["description"]
+
+
+class TestMakeTargetedFixSpecManifestFiles:
+    """Regression coverage: 'file contains: package.json:"@tauri-apps/cli"'
+    used to produce an APPEND-block instruction, which corrupts JSON and
+    doesn't actually install the dependency (see
+    logs/api-20260705-233402.log, package.json fix rounds 1-2). Manifest
+    files need a package-manager command, not raw text insertion.
+    """
+
+    def test_package_json_dependency_uses_npm_install_not_append(self):
+        coord = _make_coordinator()
+        failing = CriterionResult(
+            criterion='file contains: package.json:"@tauri-apps/cli"',
+            passed=False, detail="missing dependency",
+        )
+        spec = coord.make_targeted_fix_spec(failing, "build app", round_num=1)
+        assert "using an APPEND" not in spec["description"]  # not instructed to append
+        assert "npm install" in spec["description"] or "npm i " in spec["description"]
+
+    def test_cargo_toml_dependency_uses_cargo_add_not_append(self):
+        coord = _make_coordinator()
+        failing = CriterionResult(
+            criterion="file contains: src-tauri/Cargo.toml:sqlx",
+            passed=False, detail="missing dependency",
+        )
+        spec = coord.make_targeted_fix_spec(failing, "build app", round_num=1)
+        assert "using an APPEND" not in spec["description"]  # not instructed to append
+        assert "cargo add" in spec["description"]
+
+    def test_non_manifest_file_still_uses_append(self):
+        """Non-JSON/TOML files (source code, docs) keep the original
+        read-then-append instruction — only manifest files need special
+        handling since only they can be structurally corrupted by it.
+        """
+        coord = _make_coordinator()
+        failing = CriterionResult(
+            criterion="file contains: src/index.ts:export interface Payment",
+            passed=False, detail="substring not found",
+        )
+        spec = coord.make_targeted_fix_spec(failing, "build app", round_num=1)
+        assert "APPEND" in spec["description"]

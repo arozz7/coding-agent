@@ -95,3 +95,30 @@ class TestPlanWithCriteria:
         )
         result = await planner.plan_with_criteria("obj", task_type="develop")
         assert result.completion_criteria == []
+
+    @pytest.mark.asyncio
+    async def test_criteria_prompt_bans_markdown_file_contains(self):
+        """Regression test: completion criteria like 'file contains:
+        NEXT_STEPS.md:Prioritized' are trivially satisfiable by appending a
+        single token, proving nothing about real progress (see
+        logs/api-20260705-233402.log). The criteria-generation system prompt
+        must forbid 'file contains' criteria against markdown files, mirroring
+        the rule RequirementsExtractor already applies to acceptance criteria.
+        """
+        router = MagicMock()
+        router.get_model.return_value = MagicMock(name="test-model")
+        captured: dict = {}
+
+        async def _generate(prompt, model, **kwargs):
+            if "system_prompt" in kwargs and "criteria" in kwargs["system_prompt"].lower():
+                captured["system_prompt"] = kwargs["system_prompt"]
+                return '{"criteria": []}'
+            return '[{"description": "Do stuff", "agent_type": "develop"}]'
+
+        router.generate = _generate
+        planner = PlannerAgent(router)
+        await planner.plan_with_criteria("update NEXT_STEPS.md", task_type="develop")
+
+        assert "system_prompt" in captured, "criteria system prompt was never generated"
+        assert "markdown" in captured["system_prompt"].lower()
+        assert ".md" in captured["system_prompt"]
