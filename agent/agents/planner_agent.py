@@ -40,6 +40,12 @@ _JSON_ARRAY_RE = re.compile(r'\[[\s\S]*?\]', re.DOTALL)
 # Matches the first JSON object in LLM output (for criteria extraction)
 _JSON_OBJ_RE = re.compile(r'\{[\s\S]*\}', re.DOTALL)
 
+# Hard cap on plan length for develop/sdlc objectives. Small local models
+# don't reliably respect the "3-6 tasks" prompt instruction, and each extra
+# task is another full agent call the model has to get right — capping here
+# bounds worst-case cycles regardless of what the model returns.
+_MAX_DEVELOP_TASKS = 6
+
 
 @dataclass
 class PlanResult:
@@ -85,11 +91,21 @@ class PlannerAgent:
             return self._fallback_plan(objective, task_type)
 
         strategy_hint = self._strategy_hint(task_type)
+        task_count_hint = (
+            "Break the following objective into 3–6 concrete, ordered tasks — "
+            "the smaller local model executing each one does better with fewer, "
+            "narrower tasks than with a long plan."
+            if task_type in ("develop", "sdlc") else
+            "Break the following objective into 5–8 concrete, ordered tasks."
+        )
         system_prompt = (
             "You are an expert task planning assistant for an autonomous coding agent.\n\n"
-            "Break the following objective into 5–8 concrete, ordered tasks.\n"
+            f"{task_count_hint}\n"
             "Each task must be small enough that a single agent call can complete it.\n"
             "Each task description must be ≤ 60 words and describe exactly ONE concrete action.\n"
+            "Every develop/test task description must name the specific target file(s) or "
+            "directory it changes — never describe a task only as 'implement the feature' or "
+            "'apply the fixes' with no file named.\n"
             "Assign the correct agent_type to each task.\n\n"
             "Valid agent_type values:\n"
             "- mapper:     map project structure → ARCHITECTURE.md + STACK.md (use as first step for unfamiliar projects)\n"
@@ -123,6 +139,11 @@ class PlannerAgent:
             tasks = self._parse_task_list(raw)
             if task_type == "research":
                 tasks = self._enforce_research_types(tasks)
+            elif task_type in ("develop", "sdlc") and len(tasks) > _MAX_DEVELOP_TASKS:
+                self.logger.warning(
+                    "plan_truncated", requested=len(tasks), cap=_MAX_DEVELOP_TASKS,
+                )
+                tasks = tasks[:_MAX_DEVELOP_TASKS]
             if tasks:
                 self.logger.info(
                     "plan_created",

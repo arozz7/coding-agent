@@ -109,6 +109,20 @@ That should cover it!"""
         tasks = await planner.plan("objective")
         assert len(tasks) >= 1
 
+    @pytest.mark.asyncio
+    async def test_develop_plan_capped_regardless_of_llm_output(self):
+        """Small local models don't reliably respect a '3-6 tasks' prompt
+        instruction. Truncate at the boundary rather than trusting the model,
+        so an over-long plan can't burn cycles across many small-model calls
+        for what should be one narrow deliverable.
+        """
+        raw = "[" + ",".join(
+            f'{{"description": "Task {i}", "agent_type": "develop"}}' for i in range(12)
+        ) + "]"
+        planner = self._make_planner(raw)
+        tasks = await planner.plan("build a feature", task_type="develop")
+        assert len(tasks) <= 6
+
 
 class TestPlannerAgentStrategy:
     def _make_planner(self) -> PlannerAgent:
@@ -407,6 +421,44 @@ class TestTaskLoop:
         await loop.run("continue researching", "research", "sess")
 
         resolver.resolve.assert_not_awaited()
+
+
+class TestRunLedgerWiring:
+
+    _make_task_loop = staticmethod(_build_task_loop)
+
+    @pytest.mark.asyncio
+    async def test_records_run_outcome_for_develop_objectives(self):
+        specs = [{"description": "Task 1", "agent_type": "develop"}]
+        ledger = MagicMock()
+        loop, _ = self._make_task_loop(specs, verifier_results=[VerifierResult(score=8, passed=True)])
+        loop._d = loop._d.__class__(**{**loop._d.__dict__, "run_ledger": ledger})
+
+        await loop.run("build the app", "develop", "sess", job_id="job1")
+
+        ledger.record.assert_called_once()
+        _, kwargs = ledger.record.call_args
+        assert kwargs["tasks_completed"] == 1
+        assert kwargs["verifier_score"] == 8
+
+    @pytest.mark.asyncio
+    async def test_skipped_when_no_ledger_configured(self):
+        specs = [{"description": "Task 1", "agent_type": "develop"}]
+        loop, _ = self._make_task_loop(specs)
+        # Default deps have run_ledger=None — should not raise.
+        result = await loop.run("build the app", "develop", "sess", job_id="job1")
+        assert result["success"] is True
+
+    @pytest.mark.asyncio
+    async def test_not_recorded_for_research_objectives(self):
+        specs = [{"description": "Task 1", "agent_type": "research"}]
+        ledger = MagicMock()
+        loop, _ = self._make_task_loop(specs)
+        loop._d = loop._d.__class__(**{**loop._d.__dict__, "run_ledger": ledger})
+
+        await loop.run("research something", "research", "sess", job_id="job1")
+
+        ledger.record.assert_not_called()
 
 
 # ---------------------------------------------------------------------------

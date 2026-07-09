@@ -19,6 +19,7 @@ main loop but don't participate in its control-flow state directly.
 from __future__ import annotations
 
 import os
+import time
 from pathlib import Path
 from typing import TYPE_CHECKING, Callable, Optional
 
@@ -58,6 +59,8 @@ class TaskLoop:
         job_id: Optional[str] = None,
     ) -> dict:
         d = self._d
+        _run_started = time.monotonic()
+        _orig_objective = objective
 
         def _emit(label: str) -> None:
             if on_phase:
@@ -445,6 +448,20 @@ class TaskLoop:
         unique_files = [f for f in all_files if not (f in seen or seen.add(f))]  # type: ignore[func-returns-value]
 
         self.logger.info("task_loop_complete", tasks_run=task_num, files_created=len(unique_files))
+
+        if d.run_ledger is not None and task_type in ("develop", "sdlc"):
+            d.run_ledger.record(
+                objective=_orig_objective,
+                task_type=task_type,
+                verifier_score=_final_verifier_score,
+                verifier_passed=bool(_final_verifier_result and _final_verifier_result.passed),
+                tasks_completed=_completed_task_count,
+                tasks_failed=_failed_task_count,
+                criterion_fix_count=_criterion_fix_count,
+                acceptance_fix_count=_acceptance_fix_count,
+                duration_seconds=time.monotonic() - _run_started,
+            )
+
         return {
             "success": True,
             "response": combined,

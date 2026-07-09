@@ -20,6 +20,7 @@ if TYPE_CHECKING:
     from agent.orchestration import CriterionScoreStore
     from agent.orchestration.context_builder import ContextBuilder
     from agent.orchestration.objective_resolver import ObjectiveResolver
+    from agent.orchestration.run_ledger import RunLedger
     from agent.skills.skill_executor import SkillExecutor
 
 
@@ -114,3 +115,4 @@ class TaskLoopDeps:
     run_agent_fn: Callable    # orchestrator._run_specialized_agent
     drain_switch_fn: Callable # orchestrator._drain_switch_notices
     objective_resolver: Optional["ObjectiveResolver"] = None
+    run_ledger: Optional["RunLedger"] = None
