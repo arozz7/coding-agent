@@ -337,10 +337,28 @@ coding-agent/
 │       ├── interactive_shell_tool.py  # asyncio expect/send driver for CLI apps
 │       └── tool_executor.py           # Unified tool dispatch, output capping
 ├── api/
-│   ├── main.py                    # FastAPI server, background init, all endpoints
+│   ├── main.py                    # App factory — CORS, routers, startup event (167 lines)
+│   ├── deps.py                    # Shared AppState singleton, job_store, task_store, auth helpers
 │   ├── job_store.py               # SQLite job store (write-through + in-memory cache)
 │   ├── task_store.py              # SQLite task store
-│   └── discord_bot.py             # Discord bot, commands, polling, _safe_edit
+│   ├── routes/
+│   │   ├── tasks.py               # POST /task, /task/start, /task/stream; GET/DELETE /task/{id}
+│   │   ├── workspace.py           # GET/POST /workspace, /wiki/*, /screenshot, /index, /search, /projects
+│   │   ├── models.py              # GET /models, GET/POST /models/active, GET /events/model-switches
+│   │   ├── sessions.py            # GET/DELETE /sessions, POST /wake/{id}, /subagent/*
+│   │   └── system.py              # GET /health, /ready, /stats, /metrics; POST /restart, /environment, /skills, /mcp
+│   ├── discord_bot.py             # Entry point — imports command modules, run_bot()
+│   └── discord/
+│       ├── client.py              # AgentClient, retry/backoff helpers
+│       ├── helpers.py             # Text formatters, screenshot attachment helper
+│       ├── bot_instance.py        # DiscordAgentBot class, bot singleton, _start_bot()
+│       ├── poller.py              # _poll_job, phase labels, _safe_edit, job recovery
+│       └── commands/
+│           ├── tasks.py           # !ask, !dev, !research, !chains, !chain, !continue
+│           ├── jobs.py            # !status, !cancel, !result, !files, !tasks
+│           ├── workspace.py       # !show, !history, !sessions, !clear, !session, !workspace, !project
+│           ├── models.py          # !git, !models, !model
+│           └── admin.py           # !jobs, !skills, !wiki, !restart, !helpme
 ├── llm/
 │   ├── model_router.py            # Routing, fallback chain, load/unload, switch notifications, dynamic free evaluator model
 │   ├── ollama_client.py           # LM Studio / Ollama client (load, unload, poll, list_all_models)
@@ -364,7 +382,7 @@ coding-agent/
 ├── tests/
 │   ├── unit/                      # Unit tests
 │   └── integration/               # Integration tests
-└── aiChangeLog/                   # Per-phase change logs (phase-03 through phase-31)
+└── aiChangeLog/                   # Per-phase change logs (phase-03 through phase-35)
 ```
 
 ---

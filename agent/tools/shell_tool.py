@@ -144,6 +144,57 @@ _BLOCKED_PATTERNS = [
     re.compile(r"export\s+PATH\s*=\s*/tmp", re.IGNORECASE),        # PATH hijack to /tmp
 ]
 
+# Shell commands the LLM commonly hallucinates that don't exist as executables.
+_HALLUCINATED_COMMANDS = frozenset([
+    "find_files", "search_files", "list_files", "read_file", "write_file",
+    "create_file", "delete_file", "copy_file", "move_file",
+])
+
+# Python syntax tokens that are unambiguously not shell commands.
+_PYTHON_FRAGMENT_PATTERNS = [
+    re.compile(r"^import\s+\w"),               # import os, sys
+    re.compile(r"^from\s+\w+\s+import\b"),     # from pathlib import Path
+    re.compile(r"^def\s+\w+\s*\("),            # def my_func(
+    re.compile(r"^class\s+\w+[\s:(]"),         # class Foo:
+    re.compile(r"^print\s*\("),                # print(...)  — distinct from CMD's `print`
+    re.compile(r"^with\s+open\s*\("),          # with open(path, ...):
+    re.compile(r"^return\s+"),                 # return value  (top-level = always Python)
+]
+
+_PYTHON_FRAGMENT_HINT = (
+    "Python code fragment detected — this cannot run as a shell command.\n"
+    "Write the code to a file first, then execute it:\n"
+    "  Step 1: file_write(\"script.py\", \"<your full script>\")\n"
+    "  Step 2: shell(\"python script.py\")"
+)
+
+
+def _detect_code_fragment(command: str) -> Optional[str]:
+    """Return an error string when the command is code, not a runnable command.
+
+    Catches two classes of model errors:
+      1. Hallucinated tool names (find_files, read_file, etc.)
+      2. Python code fragments submitted as shell commands
+    """
+    stripped = command.strip()
+    first_token = stripped.split()[0] if stripped.split() else ""
+
+    if first_token.lower() in _HALLUCINATED_COMMANDS:
+        return (
+            f"'{first_token}' is not a shell command.\n"
+            "To search for files use:\n"
+            "  Windows: dir /s /b \"*.ts\"\n"
+            "  Windows (PowerShell): Get-ChildItem -Recurse -Filter \"*.ts\"\n"
+            "  Unix: find . -name \"*.ts\""
+        )
+
+    for pattern in _PYTHON_FRAGMENT_PATTERNS:
+        if pattern.match(stripped):
+            return _PYTHON_FRAGMENT_HINT
+
+    return None
+
+
 # Windows shell built-ins that cannot run without shell=True.
 _WINDOWS_BUILTINS = frozenset([
     "dir", "type", "del", "copy", "move", "mkdir", "rmdir", "rd",
@@ -164,6 +215,31 @@ def _is_windows_builtin(cmd: str) -> bool:
     """Return True if the first token is a Windows shell built-in."""
     first_token = cmd.strip().split()[0].lower() if cmd.strip() else ""
     return first_token in _WINDOWS_BUILTINS
+
+
+# Characters that only mean "shell operator" to cmd.exe when they appear
+# outside of quotes (redirection, piping, chaining). If any of these appear
+# unquoted, the command MUST run with shell=True — otherwise subprocess.Popen
+# passes them as literal argv tokens to the resolved executable (e.g. cargo.exe
+# receives literal "2>&1" "||" "true" as arguments instead of having the shell
+# interpret them), producing a bogus failure on every run regardless of the
+# command's real outcome.
+_SHELL_OPERATOR_CHARS = frozenset("&|><")
+
+
+def _has_unquoted_shell_operators(cmd: str) -> bool:
+    """Return True if cmd contains &, |, >, or < outside of quotes."""
+    quote = None
+    for ch in cmd:
+        if quote:
+            if ch == quote:
+                quote = None
+            continue
+        if ch in ("'", '"'):
+            quote = ch
+        elif ch in _SHELL_OPERATOR_CHARS:
+            return True
+    return False
 
 
 def _kill_process_tree(pid: int) -> None:
@@ -266,7 +342,7 @@ class ShellTool:
     def _resolve_args(self, cmd: str) -> tuple:
         """Resolve (args, use_shell) for subprocess from the translated command string."""
         if IS_WINDOWS:
-            if _is_windows_builtin(cmd):
+            if _is_windows_builtin(cmd) or _has_unquoted_shell_operators(cmd):
                 return cmd, True
             try:
                 parsed = shlex.split(cmd, posix=False)
@@ -293,6 +369,11 @@ class ShellTool:
         SIGKILL so daemonised grandchildren don't survive.
         """
         cmd = command.strip()
+
+        fragment_error = _detect_code_fragment(cmd)
+        if fragment_error:
+            self.logger.warning("shell_code_fragment_rejected", command=command[:120])
+            return {"success": False, "error": fragment_error}
 
         # Validate the ORIGINAL command before translation so Unix-form patterns
         # (e.g. `rm -rf /`) are caught even when running on Windows.
@@ -378,6 +459,11 @@ class ShellTool:
         """
         cmd = command.strip()
 
+        fragment_error = _detect_code_fragment(cmd)
+        if fragment_error:
+            self.logger.warning("shell_code_fragment_rejected", command=command[:120])
+            return {"success": False, "error": fragment_error}
+
         # Validate original form first, then the translated form.
         try:
             _validate_command(cmd)
@@ -395,11 +481,6 @@ class ShellTool:
         args, use_shell = self._resolve_args(cmd)
         if args is None:
             return {"success": False, "error": f"Could not parse command: {cmd!r}"}
-
-        create_flags = 0
-        if IS_WINDOWS:
-            CREATE_NEW_PROCESS_GROUP = 0x00000200
-            create_flags = CREATE_NEW_PROCESS_GROUP
 
         try:
             proc = await asyncio.create_subprocess_exec(

@@ -1,9 +1,11 @@
-"""Integration tests for the task loop (PlannerAgent + orchestrator routing)."""
+"""Integration tests for the task loop (PlannerAgent + TaskLoop orchestration)."""
 import pytest
 from unittest.mock import AsyncMock, MagicMock, patch
 from datetime import datetime
 
-from agent.agents.planner_agent import PlannerAgent, VALID_AGENT_TYPES
+from agent.agents.planner_agent import PlannerAgent, PlanResult, VALID_AGENT_TYPES
+from agent.agents.verifier_agent import VerifierResult
+from agent.orchestration.task_loop import TaskLoop, TaskLoopDeps
 
 
 # ---------------------------------------------------------------------------
@@ -125,49 +127,80 @@ class TestPlannerAgentStrategy:
 
 
 # ---------------------------------------------------------------------------
-# Task loop integration: orchestrator._run_task_loop()
+# Task loop integration: agent/orchestration/task_loop.TaskLoop
 # ---------------------------------------------------------------------------
+#
+# Phase-33 extracted the loop that used to live in
+# AgentOrchestrator._run_task_loop into its own TaskLoop class driven by a
+# TaskLoopDeps bundle (see agent/orchestration/task_loop.py). These tests
+# build that bundle directly with mocked collaborators instead of mocking
+# the whole orchestrator, matching the new architecture.
 
 class TestTaskLoop:
-    """Test the orchestrator task loop without a real LLM or DB."""
+    """Test TaskLoop.run without a real LLM, DB, or orchestrator."""
 
-    def _make_orchestrator(self, plan_specs, agent_response="Task done."):
-        """Build a minimal orchestrator mock for loop testing."""
-        from agent.orchestrator import AgentOrchestrator
-
-        orch = MagicMock(spec=AgentOrchestrator)
-
-        # Planner returns the given specs
-        planner = MagicMock()
-        planner.plan = AsyncMock(return_value=plan_specs)
-        orch.planner_agent = planner
-
-        # task_store: fully functional using real TaskStore with a temp DB
+    def _make_task_loop(self, plan_specs, agent_response="Task done.", job_id=None):
+        """Build a TaskLoop wired with mocked deps and a real TaskStore."""
         import tempfile
+        import os
         from api.task_store import TaskStore
+
         tmp_fd, tmp_path_db = tempfile.mkstemp(suffix=".db")
-        import os; os.close(tmp_fd)
-        orch.task_store = TaskStore(db_path=tmp_path_db)
+        os.close(tmp_fd)
+        task_store = TaskStore(db_path=tmp_path_db)
 
-        # _build_enriched_context returns empty string
-        orch._build_enriched_context = AsyncMock(return_value="")
-        orch._build_context_from_events = MagicMock(return_value="")
+        tool_executor = MagicMock()
+        tool_executor.workspace_path = "."
+        tool_executor.execute = AsyncMock(return_value="")
 
-        # _run_specialized_agent: called with _direct=True from the loop
-        orch._run_specialized_agent = AsyncMock(return_value={
+        context_builder = MagicMock()
+        context_builder.build_planning_context = AsyncMock(return_value="")
+        context_builder.char_budget = MagicMock(return_value=5000)
+        context_builder.model_router = MagicMock()
+
+        planner_agent = MagicMock()
+        planner_agent.plan_with_criteria = AsyncMock(
+            return_value=PlanResult(tasks=list(plan_specs))
+        )
+
+        plan_reviewer_agent = MagicMock()
+        plan_reviewer_agent.review = AsyncMock(side_effect=lambda specs, objective: specs)
+
+        verifier_coordinator = MagicMock()
+        verifier_coordinator.run_verification = AsyncMock(
+            return_value=VerifierResult(score=8, passed=True)
+        )
+
+        session_memory = MagicMock()
+        skill_executor = MagicMock()
+        skill_executor.execute_post = AsyncMock(return_value={})
+        memory_wiki = MagicMock()
+        acceptance_tester_agent = MagicMock()
+
+        run_agent_fn = AsyncMock(return_value={
             "success": True,
             "response": agent_response,
             "files_created": [],
             "new_tasks": [],
         })
+        drain_switch_fn = MagicMock(return_value=[])
 
-        # logger
-        orch.logger = MagicMock()
-
-        # Bind the real method
-        orch._run_task_loop = AgentOrchestrator._run_task_loop.__get__(orch)
-
-        return orch
+        deps = TaskLoopDeps(
+            tool_executor=tool_executor,
+            context_builder=context_builder,
+            planner_agent=planner_agent,
+            plan_reviewer_agent=plan_reviewer_agent,
+            task_store=task_store,
+            verifier_coordinator=verifier_coordinator,
+            criterion_score_store=MagicMock(),
+            session_memory=session_memory,
+            skill_executor=skill_executor,
+            memory_wiki=memory_wiki,
+            acceptance_tester_agent=acceptance_tester_agent,
+            run_agent_fn=run_agent_fn,
+            drain_switch_fn=drain_switch_fn,
+        )
+        return TaskLoop(deps), task_store
 
     @pytest.mark.asyncio
     async def test_loop_executes_all_tasks(self):
@@ -176,11 +209,11 @@ class TestTaskLoop:
             {"description": "Task 2", "agent_type": "develop"},
             {"description": "Task 3", "agent_type": "develop"},
         ]
-        orch = self._make_orchestrator(specs)
-        result = await orch._run_task_loop("objective", "develop", "session1")
+        loop, _ = self._make_task_loop(specs)
+        result = await loop.run("objective", "develop", "session1")
 
         assert result["success"] is True
-        assert orch._run_specialized_agent.call_count == 3
+        assert loop._d.run_agent_fn.call_count == 3
 
     @pytest.mark.asyncio
     async def test_loop_combines_responses(self):
@@ -188,8 +221,8 @@ class TestTaskLoop:
             {"description": "Step 1", "agent_type": "develop"},
             {"description": "Step 2", "agent_type": "develop"},
         ]
-        orch = self._make_orchestrator(specs, agent_response="output here")
-        result = await orch._run_task_loop("objective", "develop", "session1")
+        loop, _ = self._make_task_loop(specs, agent_response="output here")
+        result = await loop.run("objective", "develop", "session1")
 
         assert "Step 1" in result["response"]
         assert "Step 2" in result["response"]
@@ -197,22 +230,14 @@ class TestTaskLoop:
 
     @pytest.mark.asyncio
     async def test_loop_stores_tasks_when_job_id_given(self):
-        import tempfile, os
-        from api.task_store import TaskStore
-
-        tmp_fd, tmp_path_db = tempfile.mkstemp(suffix=".db")
-        os.close(tmp_fd)
-        task_store = TaskStore(db_path=tmp_path_db)
-
         specs = [
             {"description": "T1", "agent_type": "develop"},
             {"description": "T2", "agent_type": "research"},
         ]
-        orch = self._make_orchestrator(specs)
-        orch.task_store = task_store
+        loop, task_store = self._make_task_loop(specs)
 
         job_id = "test-job-123"
-        await orch._run_task_loop("objective", "develop", "sess", job_id=job_id)
+        await loop.run("objective", "develop", "sess", job_id=job_id)
 
         tasks = task_store.list_tasks(job_id)
         assert len(tasks) == 2
@@ -224,18 +249,18 @@ class TestTaskLoop:
             {"description": "Will fail", "agent_type": "develop"},
             {"description": "Will succeed", "agent_type": "develop"},
         ]
-        orch = self._make_orchestrator(specs)
+        loop, _ = self._make_task_loop(specs)
 
         call_count = [0]
 
-        async def mock_agent(task, agent_type, session_id, on_phase=None, job_id=None, _direct=False):
+        async def mock_agent(task, agent_type, session_id, on_phase=None, job_id=None, _direct=False, extra_context=""):
             call_count[0] += 1
             if call_count[0] == 1:
                 return {"success": False, "error": "npm not found"}
             return {"success": True, "response": "done", "files_created": [], "new_tasks": []}
 
-        orch._run_specialized_agent = mock_agent
-        result = await orch._run_task_loop("objective", "develop", "sess")
+        loop._d.run_agent_fn = mock_agent
+        result = await loop.run("objective", "develop", "sess")
 
         # Both tasks were attempted
         assert call_count[0] == 2
@@ -244,11 +269,11 @@ class TestTaskLoop:
     @pytest.mark.asyncio
     async def test_loop_appends_new_tasks(self):
         specs = [{"description": "Initial task", "agent_type": "develop"}]
-        orch = self._make_orchestrator(specs)
+        loop, _ = self._make_task_loop(specs)
 
         call_count = [0]
 
-        async def mock_agent(task, agent_type, session_id, on_phase=None, job_id=None, _direct=False):
+        async def mock_agent(task, agent_type, session_id, on_phase=None, job_id=None, _direct=False, extra_context=""):
             call_count[0] += 1
             new_tasks = []
             if call_count[0] == 1:
@@ -261,8 +286,8 @@ class TestTaskLoop:
                 "new_tasks": new_tasks,
             }
 
-        orch._run_specialized_agent = mock_agent
-        result = await orch._run_task_loop("objective", "develop", "sess")
+        loop._d.run_agent_fn = mock_agent
+        result = await loop.run("objective", "develop", "sess")
 
         # Both the original and the dynamically-added task ran
         assert call_count[0] == 2
@@ -273,14 +298,14 @@ class TestTaskLoop:
             {"description": "T1", "agent_type": "develop"},
             {"description": "T2", "agent_type": "develop"},
         ]
-        orch = self._make_orchestrator(specs)
-        orch._run_specialized_agent = AsyncMock(return_value={
+        loop, _ = self._make_task_loop(specs)
+        loop._d.run_agent_fn = AsyncMock(return_value={
             "success": True,
             "response": "done",
             "files_created": ["src/app.js"],
             "new_tasks": [],
         })
-        result = await orch._run_task_loop("objective", "develop", "sess")
+        result = await loop.run("objective", "develop", "sess")
         assert result["files_created"].count("src/app.js") == 1
 
     @pytest.mark.asyncio
@@ -289,9 +314,9 @@ class TestTaskLoop:
             {"description": "Step 1", "agent_type": "develop"},
             {"description": "Step 2", "agent_type": "develop"},
         ]
-        orch = self._make_orchestrator(specs)
+        loop, _ = self._make_task_loop(specs)
         phases_emitted = []
-        await orch._run_task_loop(
+        await loop.run(
             "objective", "develop", "sess",
             on_phase=lambda p: phases_emitted.append(p)
         )

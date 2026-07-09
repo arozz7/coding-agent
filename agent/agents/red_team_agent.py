@@ -5,7 +5,7 @@ edge cases, exposed secrets, injection risks, and unsafe defaults.
 Read-only: never modifies files.
 """
 
-from typing import Any, Dict, List
+from typing import Any, Dict
 
 import structlog
 
@@ -41,7 +41,6 @@ class RedTeamRole:
     async def execute(self, context: Dict[str, Any]) -> Dict[str, Any]:
         task = context.get("task", "Perform a security audit")
         model_router = context.get("model_router")
-        tool_executor = context.get("tool_executor")
 
         if not model_router:
             return {"success": False, "error": "model_router not available"}

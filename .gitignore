@@ -30,3 +30,11 @@ workspace/
 # Runtime logs and state (generated at runtime)
 logs/
 .state/
+
+# CodeQL scan artifacts and databases
+*.sarif
+codeql-db/
+.codeqldb/
+
+# Windows redirection accident (e.g. a stray `> nul` in a command)
+/nul

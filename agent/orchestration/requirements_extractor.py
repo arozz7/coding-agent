@@ -53,12 +53,17 @@ class RequirementsExtractor:
             "You are a strict QA engineer. Given an objective and optional project docs, "
             "produce 3–7 acceptance criteria that a separate evaluator model can judge as "
             "pass or fail from the agent's output, terminal logs, or a screenshot alone.\n\n"
-            "STRUCTURE — every criterion must have three parts:\n"
-            "  1. One measurable end state (what is true when done)\n"
-            "  2. A stated check (how to prove it — the exact command, file path, or visible evidence)\n"
-            "  3. A constraint if relevant (what must NOT change on the way there)\n\n"
+            "THINKING (do NOT include in output): before choosing a format, consider: "
+            "(1) what is the measurable end state, "
+            "(2) what is the simplest check that proves it, "
+            "(3) is there a constraint that must hold. "
+            "These three considerations inform which FORMAT to choose — they must NOT appear "
+            "in the criterion string itself.\n\n"
             "FORMATS — pick the most specific one that applies:\n"
-            '  "command exits 0: <exact shell command>" — for any CLI-verifiable outcome\n'
+            '  "command exits 0: <exact shell command>" — for any CLI-verifiable outcome. '
+            "IMPORTANT: the value after the colon must be a BARE SHELL COMMAND only — "
+            "no 'End state:', no 'Constraint:', no pipe-separated prose. "
+            "Example: \"command exits 0: npm run build\" — nothing else after the command.\n"
             '  "file exists: <relative/path>" — ONLY when the objective explicitly names that file\n'
             '  "file contains: <relative/path>:<substring>" — use a colon (:) separator; '
             "for generated source/config file content checks\n"
@@ -76,6 +81,7 @@ class RequirementsExtractor:
             "require a running process.\n\n"
             "EXAMPLES of good criteria:\n"
             '  "command exits 0: python -m pytest tests/ -q"\n'
+            '  "command exits 0: npm install && cargo check --manifest-path src-tauri/Cargo.toml"\n'
             '  "visual: canvas element is present and shows a car shape moving rightward across '
             'the frame; background hills scroll leftward"\n'
             '  "file contains: src/index.html:<canvas id=\\"gameCanvas\\">"\n\n'

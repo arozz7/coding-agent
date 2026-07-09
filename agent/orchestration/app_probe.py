@@ -56,6 +56,36 @@ _PORT_HINTS: list[tuple[str, int]] = [
 
 _PORT_RE = re.compile(r"port[=\s:]+(\d{2,5})", re.IGNORECASE)
 
+# Tauri apps have no HTTP server of their own — the native webview just
+# renders whatever URL is configured as `build.devUrl` (v2) / `devPath` (v1)
+# in tauri.conf.json. Screenshotting that URL captures the actual rendered
+# UI, which is a far more reliable evidence source than trying to capture
+# the OS-level window (focus/occlusion/multi-monitor fragility, and no
+# guarantee the Rust binary has even finished compiling by then either).
+_TAURI_DEV_URL_RE = re.compile(r":(\d{2,5})(?:/|$)")
+
+# Extra settle time after the Tauri dev URL responds, before screenshotting.
+# The frontend dev server (vite) becomes ready independently of whether the
+# Rust binary has finished compiling — this doesn't eliminate that race, just
+# gives the (usually fast, incremental) cargo build a head start.
+_TAURI_SETTLE_SECS = 3.0
+
+
+def _read_tauri_dev_port(workspace: Path) -> Optional[int]:
+    """Return the port from tauri.conf.json's build.devUrl/devPath, or None."""
+    conf_path = workspace / "src-tauri" / "tauri.conf.json"
+    if not conf_path.exists():
+        return None
+    try:
+        data = json.loads(conf_path.read_text(encoding="utf-8", errors="ignore"))
+    except Exception:
+        return None
+    dev_url = data.get("build", {}).get("devUrl") or data.get("build", {}).get("devPath")
+    if not dev_url:
+        return None
+    m = _TAURI_DEV_URL_RE.search(str(dev_url))
+    return int(m.group(1)) if m else None
+
 
 @dataclass
 class AppHandle:
@@ -69,6 +99,8 @@ class AppHandle:
 
 def detect_start_command(workspace: Path) -> Optional[str]:
     """Return the best start command for the project, or None."""
+    if (workspace / "src-tauri").is_dir() and (workspace / "package.json").exists():
+        return "npm run tauri dev"
     for filename, cmd in _ENTRY_CANDIDATES:
         if (workspace / filename).exists():
             return cmd
@@ -77,6 +109,10 @@ def detect_start_command(workspace: Path) -> Optional[str]:
 
 def detect_port(workspace: Path, start_cmd: str) -> Optional[int]:
     """Infer the HTTP port from the start command and source files."""
+    tauri_port = _read_tauri_dev_port(workspace)
+    if tauri_port:
+        return tauri_port
+
     combined = start_cmd.lower()
 
     # Check source files for explicit port= declarations
@@ -131,6 +167,7 @@ class AppProbe:
             return None
 
         handle = AppHandle(process=proc, port=port, start_command=start_cmd, screenshot_dir=screenshot_dir)
+        is_tauri = (self.workspace / "src-tauri").is_dir()
 
         if port:
             ready = await self._wait_ready(port)
@@ -138,8 +175,13 @@ class AppProbe:
                 self.logger.warning("app_probe_readiness_timeout", port=port, cmd=start_cmd)
                 await self.teardown(handle)
                 return None
+            if is_tauri:
+                # devUrl responding means vite is up, not that the Rust binary
+                # has finished compiling — give the (usually fast) incremental
+                # cargo build a head start before screenshotting.
+                await asyncio.sleep(_TAURI_SETTLE_SECS)
 
-        self.logger.info("app_probe_launched", cmd=start_cmd, port=port)
+        self.logger.info("app_probe_launched", cmd=start_cmd, port=port, native=is_tauri)
         return handle
 
     async def screenshot(self, handle: AppHandle) -> Optional[str]:

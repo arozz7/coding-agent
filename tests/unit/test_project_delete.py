@@ -148,7 +148,18 @@ class TestTaskStoreProjectOps:
 
 class TestOrchestratorDeleteProject:
     def _make_orchestrator(self, tmp_path):
-        """Build a minimal orchestrator with real in-memory stores."""
+        """Build a minimal orchestrator with real in-memory stores.
+
+        Phase-33 moved agent construction into
+        agent.orchestration.agent_factory.create_agents(); those agent
+        classes (DeveloperAgent, PlanAgent, ...) are no longer imported
+        into agent.orchestrator, and their constructors are cheap (they
+        just store references — no I/O), so they're left unpatched here
+        and built for real against the mocked model_router. Only the
+        collaborators still imported directly by agent.orchestrator (or
+        that would otherwise touch the filesystem/network/MCP transport)
+        are patched.
+        """
         from agent.orchestrator import AgentOrchestrator
         from unittest.mock import MagicMock
 
@@ -164,18 +175,6 @@ class TestOrchestratorDeleteProject:
             patch("agent.orchestrator.WikiManager"),
             patch("agent.orchestrator.MemoryWiki"),
             patch("mcp.server.create_mcp_server"),
-            patch("agent.orchestrator.DeveloperAgent"),
-            patch("agent.orchestrator.PlanAgent"),
-            patch("agent.orchestrator.TesterAgent"),
-            patch("agent.orchestrator.ReviewerAgent"),
-            patch("agent.orchestrator.ArchitectAgent"),
-            patch("agent.orchestrator.ChatAgent"),
-            patch("agent.orchestrator.ResearchAgent"),
-            patch("agent.orchestrator.MapperAgent"),
-            patch("agent.orchestrator.RedTeamAgent"),
-            patch("agent.orchestrator.DocumenterAgent"),
-            patch("agent.orchestrator.PlannerAgent"),
-            patch("agent.orchestrator.PlanReviewerAgent"),
             patch("agent.orchestrator.ChainRunner"),
             patch("agent.orchestrator.SkillExecutor"),
             patch("agent.orchestrator.AgentLogger"),

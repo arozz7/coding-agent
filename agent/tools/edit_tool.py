@@ -14,13 +14,12 @@ Inspired by badlogic/pi-mono's edit tool design:
 import asyncio
 import difflib
 import os
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
 import structlog
 
-from agent.security.paths import PathTraversalError
 
 logger = structlog.get_logger()
 

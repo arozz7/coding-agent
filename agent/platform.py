@@ -2,7 +2,8 @@ import os
 import platform
 import shutil
 import subprocess
-from typing import Optional, List
+import tempfile
+from typing import Optional
 import structlog
 
 logger = structlog.get_logger()
@@ -50,10 +51,14 @@ class ShellExecutor:
         self._is_windows = platform.system() == "Windows"
     
     def _detect_shell(self) -> str:
+        # Return the bare command name, not shutil.which()'s resolved path --
+        # callers compare self._shell against string literals like "pwsh"/
+        # "powershell" (see run() / _build_env() below), which silently never
+        # match a full path such as "C:\Program Files\PowerShell\7\pwsh.EXE".
         system = platform.system()
         if system == "Windows":
-            return shutil.which("pwsh") or "powershell"
-        return shutil.which("bash") or "sh"
+            return "pwsh" if shutil.which("pwsh") else "powershell"
+        return "bash" if shutil.which("bash") else "sh"
     
     def is_windows(self) -> bool:
         return self._is_windows
@@ -127,9 +132,6 @@ class ShellExecutor:
             stdout=stdout.decode() if stdout else "",
             stderr=stderr.decode() if stderr else "",
         )
-
-
-import tempfile
 
 
 def get_default_shell() -> str:

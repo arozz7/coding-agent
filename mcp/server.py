@@ -1,4 +1,4 @@
-from typing import Optional, Callable, Any, List
+from typing import Optional, Callable, Any
 import os
 from pathlib import Path
 from .tools.filesystem_server import FileSystemMCPServer
@@ -6,7 +6,6 @@ from .tools.git_server import GitMCPServer
 
 import structlog
 
-from agent.security.paths import PathTraversalError
 
 logger = structlog.get_logger()
 

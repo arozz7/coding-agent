@@ -1,6 +1,6 @@
 [build-system]
-requires = ["poetry-core>=1.0.0"]
-build-backend = "poetry.core.masonry.api"
+requires = ["hatchling>=1.18.0"]
+build-backend = "hatchling.build"
 
 [project]
 name = "local-coding-agent"
@@ -10,7 +10,7 @@ readme = "README.md"
 requires-python = ">=3.11"
 license = { text = "MIT" }
 authors = [
-    { name = "Developer", email = "dev@example.com" }
+    { name = "Jesus Arozamena" }
 ]
 keywords = ["coding-agent", "llm", "mcp", "autonomous-agent"]
 classifiers = [
@@ -43,9 +43,11 @@ dependencies = [
     "playwright>=1.40.0",
     "tiktoken>=0.7.0",
     "pypdf>=4.0.0",
+    "pdfplumber>=0.11.0",
+    "python-docx>=1.1.0",
+    "openpyxl>=3.1.0",
     "beautifulsoup4>=4.12.0",
     "ddgs>=1.0.0",
-    "python-dotenv>=1.0.0",
     "prometheus-fastapi-instrumentator>=6.0.0",
 ]
 
@@ -54,6 +56,7 @@ dev = [
     "pytest>=8.2.0",
     "pytest-asyncio>=0.23.0",
     "pytest-cov>=4.0.0",
+    "pytest-timeout>=2.3.0",
     "black>=24.4.0",
     "isort>=5.13.0",
     "mypy>=1.10.0",
@@ -62,41 +65,10 @@ dev = [
 ]
 
 [project.scripts]
-ferrite = "local_coding_agent.__main__:main"
+coding-agent = "local_coding_agent.__main__:main"
 
-[tool.poetry]
-name = "local-coding-agent"
-version = "0.1.0"
-description = "A local coding agent with LLM integration, MCP tools, and multi-agent orchestration"
-authors = ["Developer <dev@example.com>"]
-packages = [{ include = "local_coding_agent" }]
-
-[tool.poetry.dependencies]
-python = "^3.11"
-langgraph = "^1.1"
-mcp = "^1.0"
-chromadb = "^0.6"
-networkx = "^3.3"
-pydantic = "^2.8"
-pydantic-settings = "^2.3"
-sqlalchemy = "^2.0"
-python-dotenv = "^1.0"
-prometheus-client = "^0.20"
-tenacity = "^8.2"
-structlog = "^24.2"
-httpx = "^0.27"
-tiktoken = "^0.7"
-pypdf = "^4.0"
-beautifulsoup4 = "^4.12"
-ddgs = ">=1.0"
-
-[tool.poetry.group.dev.dependencies]
-pytest = "^8.2"
-pytest-asyncio = "^0.23"
-black = "^24.4"
-isort = "^5.13"
-mypy = "^1.10"
-ruff = "^0.4"
+[tool.hatch.build.targets.wheel]
+packages = ["agent", "api", "llm", "mcp", "observability", "local_coding_agent"]
 
 [tool.black]
 line-length = 100
@@ -119,3 +91,9 @@ target-version = "py311"
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 testpaths = ["tests"]
+# Requires pytest-timeout (dev dep). Without the plugin installed this key is
+# silently ignored (a PytestConfigWarning, not an error) — verified empirically.
+timeout = 60
+markers = [
+    "external: hits a real network/LLM endpoint; excluded from CI via -m 'not external'",
+]

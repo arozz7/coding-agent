@@ -16,11 +16,13 @@ from __future__ import annotations
 import os
 import re
 import subprocess
-from datetime import datetime, timezone
 from pathlib import Path
-from typing import TYPE_CHECKING, Callable, List, Optional
+from typing import TYPE_CHECKING, Optional
 
 import structlog
+
+from agent.session_id import new_session_id as _make_session_id
+from agent.workspace_context import get_workspace
 
 # Strips raw FILE:/APPEND: blocks and fenced code from episodic summaries so
 # they don't contaminate the model context with code from unrelated past tasks.
@@ -37,12 +39,12 @@ def _clean_episodic_summary(text: str, max_len: int = 300) -> str:
     cleaned = re.sub(r"\n{3,}", "\n\n", cleaned).strip()
     return cleaned[:max_len]
 
-from agent.workspace_context import get_workspace
 
 if TYPE_CHECKING:
     from agent.memory import SessionMemory
     from agent.memory.codebase_memory import CodebaseMemory
     from agent.memory.memory_wiki import MemoryWiki
+    from agent.orchestration.task_router import TaskRouter
     from agent.skills.skill_executor import SkillExecutor
     from agent.skills.skill_loader import SkillManager
     from llm import ModelRouter
@@ -91,7 +93,7 @@ class ContextBuilder:
         session_memory: "SessionMemory",
         skill_manager: "SkillManager",
         memory_wiki: Optional["MemoryWiki"] = None,
-        skill_router: Optional["TaskRouter"] = None,  # type: ignore[name-defined]
+        skill_router: Optional["TaskRouter"] = None,
     ):
         self.model_router = model_router
         self.skill_executor = skill_executor
@@ -208,7 +210,7 @@ class ContextBuilder:
         config = self.model_router.get_model("coding")
         bridge_text = await self.model_router.generate(prompt, config)
 
-        new_session_id = f"session_{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S')}_bridge"
+        new_session_id = _make_session_id("session") + "_bridge"
         self.session_memory.get_or_create_session(new_session_id, workspace_path)
         self.session_memory.save_message(
             new_session_id,

@@ -2,20 +2,17 @@ import asyncio
 import re
 from datetime import date
 from pathlib import Path
-from typing import Dict, Any, List, Optional
+from typing import Dict, Any, List
 from agent.agents.base_agent import AgentRole
+from agent.agents.research_routing import (
+    _DOCUMENT_EXTS,
+    _PDF_MAGIC,
+    _emit,
+    _is_pdf_url,
+    _needs_web_search,
+    _FILE_WRITE_RE,
+)
 from agent.tools.web_tool import extract_urls
-
-_DOCUMENT_EXTS = {".pdf", ".docx", ".doc", ".xlsx", ".xls", ".csv", ".tsv"}
-
-# PDF MIME signature — detect binary content that slipped through web_fetch.
-_PDF_MAGIC = "%PDF"
-
-
-def _is_pdf_url(url: str) -> bool:
-    lower = url.lower()
-    return lower.endswith(".pdf") or "/pdf/" in lower
-
 
 # Maximum sub-questions from decomposition; follow-up queries per gap pass; coverage rounds.
 _MAX_QUESTIONS = 5
@@ -24,61 +21,6 @@ _MAX_COVERAGE_PASS = 2
 
 # Total character budget for web-gathered content.
 _WEB_CONTENT_BUDGET = 28_000
-
-# Patterns that always trigger the iterative web-research path.
-_SEARCH_TRIGGERS = re.compile(
-    r"\b("
-    r"search\s+(for|the\s+web|online)|look\s+up|find\s+online|google|"
-    r"what('s|\s+is)\s+the\s+(latest|current|news)|current\s+version|"
-    r"recent\s+news|last\s+night|yesterday|today|latest|recent(ly)?|"
-    r"score|scores|weather|stock|price|market|news|headline|"
-    r"who\s+(won|lost|is)|what\s+happened|"
-    r"released|launched|announced|"
-    r"research\s+(on|about|into|for)|deep\s+research|in.?depth|"
-    r"comprehensive|thorough|exhaustive|"
-    r"investigate|explore|study|analyze|analyse|"
-    r"build.*agent|how\s+to\s+build|"
-    r"best\s+practices?|compare|evaluate|assess|"
-    r"survey|overview|landscape|state\s+of"
-    r")\b",
-    re.IGNORECASE,
-)
-
-# Patterns that indicate the user wants output captured to markdown/files.
-_FILE_WRITE_RE = re.compile(
-    r"\b("
-    r"capture\s+(to|into|in)\s+(markdown|files?|docs?|documents?)|"
-    r"save\s+(to|into|as)\s+(markdown|files?|docs?)|"
-    r"write\s+(to|into)\s+(markdown|files?|docs?)|"
-    r"create\s+(markdown\s+files?|docs?|documents?|files?)|"
-    r"output\s+(to|as)\s+(markdown|files?)|"
-    r"logically\s+(into\s+)?(files?|docs?|markdown)|"
-    r"into\s+markdown\s+files?|as\s+markdown\s+files?"
-    r")\b",
-    re.IGNORECASE,
-)
-
-
-# Patterns that indicate the task is about local workspace content — no web
-# search needed even if no specific file names are mentioned.
-_LOCAL_TASK_RE = re.compile(
-    r"\b("
-    r"in\s+the\s+(workspace|project|codebase|repo(?:sitory)?)|"
-    r"last\s+(failed\s+)?(job|error|run|task|build)|"
-    r"(?:find|show|check|look\s+at)\s+(?:the\s+)?(?:errors?|bugs?|issues?|logs?|output|files?)|"
-    r"what\s+(?:is|was|went)\s+wrong|"
-    r"why\s+(?:is|did|does)\s+it\s+fail"
-    r")\b",
-    re.IGNORECASE,
-)
-
-
-def _emit(on_phase, label: str) -> None:
-    if on_phase:
-        try:
-            on_phase(label)
-        except Exception:
-            pass
 
 
 class ResearchRole(AgentRole):
@@ -162,17 +104,7 @@ Guidelines:
             local_sections.extend(dir_sections)
 
         # --- Routing decision ---
-        # Default to web search for research tasks. Only skip it when the task
-        # explicitly refers to the local workspace/codebase (errors, logs, files).
-        # _SEARCH_TRIGGERS was too narrow — planner-generated subtasks like
-        # "Research state persistence..." don't contain trigger words but clearly
-        # need web search, not local file scanning.
-        # Exception: if we successfully read local directory content AND the task
-        # has no explicit web-search signals, skip web — it would return generic noise.
-        # Tasks that want both ("review docs AND search for gaps") still get web search.
-        _found_local_dirs = any(s.startswith("Contents of ") for s in local_sections)
-        _has_web_signals = bool(_SEARCH_TRIGGERS.search(task))
-        needs_web = not bool(_LOCAL_TASK_RE.search(task)) and not (_found_local_dirs and not _has_web_signals)
+        needs_web = _needs_web_search(task, local_sections)
 
         wants_files = bool(_FILE_WRITE_RE.search(task))
 

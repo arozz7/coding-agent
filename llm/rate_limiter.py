@@ -1,8 +1,7 @@
 import asyncio
-from typing import Dict, Optional
+from typing import Dict
 from dataclasses import dataclass
-from datetime import datetime, timezone, timedelta
-from collections import defaultdict
+from datetime import datetime, timezone
 import structlog
 
 logger = structlog.get_logger()

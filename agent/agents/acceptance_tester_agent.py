@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import json
 import re
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, List, Optional
 
@@ -43,6 +43,7 @@ class AcceptanceTesterAgent:
         criteria: List[str],
         workspace: Path,
         screenshot_path: Optional[str],
+        agent_output: str = "",
     ) -> List[AcceptanceResult]:
         """Evaluate all criteria in a single LLM call.
 
@@ -63,6 +64,13 @@ class AcceptanceTesterAgent:
             "Use this path as context when evaluating visual/behavioral criteria."
             if screenshot_path else ""
         )
+        # When there is no screenshot, include the agent's output as evidence so
+        # the LLM can evaluate behavioral criteria (e.g. "Phase 1 expanded into 5+
+        # tasks") against what was actually produced rather than returning blind failures.
+        output_note = ""
+        if not screenshot_path and agent_output:
+            excerpt = agent_output[:6000]
+            output_note = f"\n\nAgent output (evidence for evaluation):\n{excerpt}"
 
         system = (
             "You are a strict acceptance test evaluator. "
@@ -72,7 +80,8 @@ class AcceptanceTesterAgent:
         )
         prompt = (
             f"Workspace: {workspace}\n"
-            f"{screenshot_note}\n\n"
+            f"{screenshot_note}"
+            f"{output_note}\n\n"
             f"Acceptance criteria to evaluate:\n{criteria_block}\n\n"
             "For each criterion return pass/fail with a detail sentence explaining your verdict.\n"
             "Return ONLY:\n"

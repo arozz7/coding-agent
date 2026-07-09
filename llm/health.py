@@ -1,6 +1,5 @@
-import asyncio
 from dataclasses import dataclass
-from typing import Dict, Optional
+from typing import Dict
 from datetime import datetime, timezone, timedelta
 import structlog
 
@@ -46,6 +45,12 @@ class HealthChecker:
             else:
                 available = await self.router.cloud.health_check(config.endpoint)
 
+            if not available:
+                # health_check() returned False without raising (e.g. model
+                # not loaded, endpoint reachable but unhealthy) — this must
+                # be treated as a failure, not silently reported as healthy.
+                raise RuntimeError(f"health_check reported unavailable for {model}")
+
             latency = (datetime.now(timezone.utc) - start).total_seconds() * 1000
             self._record_success(model, latency)
             self.statuses[model] = HealthStatus(
@@ -77,7 +82,7 @@ class HealthChecker:
             self.successes[model] = []
         self.successes[model].append((now, latency_ms))
         self.successes[model] = [
-            (t, l) for t, l in self.successes[model]
+            (t, lat) for t, lat in self.successes[model]
             if now - t < timedelta(hours=1)
         ]
         cb = self._cb_manager.get_or_create(model)
@@ -110,7 +115,7 @@ class HealthChecker:
         return successes / total if total > 0 else 1.0
 
     def _calculate_avg_latency(self, model: str) -> float:
-        latencies = [l for _, l in self.successes.get(model, []) if l > 0]
+        latencies = [lat for _, lat in self.successes.get(model, []) if lat > 0]
         return sum(latencies) / len(latencies) if latencies else 0.0
 
     def get_healthy_models(self) -> list[str]:

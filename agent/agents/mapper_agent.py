@@ -7,9 +7,8 @@ Triggered automatically by the planner as the first step of any develop/sdlc
 task against an unfamiliar project (i.e. when no ARCHITECTURE.md exists yet).
 """
 
-import os
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List
 
 import structlog
 

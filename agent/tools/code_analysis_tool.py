@@ -1,6 +1,6 @@
 import ast
 from pathlib import Path
-from typing import List, Dict, Optional, Set
+from typing import List, Optional, Set
 import structlog
 
 logger = structlog.get_logger()
