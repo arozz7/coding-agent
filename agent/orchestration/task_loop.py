@@ -135,6 +135,7 @@ class TaskLoop:
         _acceptance_fix_count = 0
         _acc_criterion_attempts: dict[str, int] = {}
         _last_acceptance_screenshot: Optional[str] = None
+        _quality_gate_exhausted = False
 
         if task_type in ("develop", "sdlc"):
             _MAX_VERIFIER_ROUNDS = max(1, int(os.getenv("DEVELOP_VERIFIER_ROUNDS", "6")))
@@ -227,16 +228,34 @@ class TaskLoop:
                     # and stagnation bounds as the no-criteria path below so
                     # a genuinely stuck low-quality run still stops instead
                     # of burning the fix budget forever.
-                    if _final_verifier_result is not None and not _final_verifier_result.passed:
+                    #
+                    # IMPORTANT: stagnation/budget exhaustion here must NOT
+                    # break the whole run — the acceptance-criterion loop
+                    # below targets specific named criteria independently of
+                    # the holistic score, and in the run that motivated this
+                    # gate it converged 3/6 -> 6/6 acceptance criteria over
+                    # several rounds even while the holistic score bounced
+                    # around unconverged. Cutting the whole loop the moment
+                    # the holistic gate stagnates would deny that loop its
+                    # turn entirely (verified against logs/api-20260710-100353.log:
+                    # stagnation triggers at round 6, exactly when the
+                    # acceptance loop was about to start). Once exhausted we
+                    # just stop re-invoking THIS gate — the flag makes that
+                    # permanent so it doesn't re-trigger (and re-log a
+                    # "stopping" message) every time this block is re-entered.
+                    if (
+                        not _quality_gate_exhausted
+                        and _final_verifier_result is not None
+                        and not _final_verifier_result.passed
+                    ):
                         if _verifier_rounds < _MAX_VERIFIER_ROUNDS:
                             stop, _plateau_count, _zero_score_count = check_stagnation(
                                 _final_verifier_result.score, _prev_verifier_score,
                                 _plateau_count, _zero_score_count, task_summaries,
                             )
                             # Always advance the baseline, even when stopping —
-                            # otherwise a later round (e.g. re-entering this
-                            # block via the acceptance loop) compares against a
-                            # stale score and mis-detects stagnation itself.
+                            # otherwise a later round compares against a stale
+                            # score and mis-detects stagnation itself.
                             _prev_verifier_score = _final_verifier_result.score
                             if not stop:
                                 _new_files = [f for f in all_files if f not in _verifier_snapshot_files]
@@ -256,16 +275,9 @@ class TaskLoop:
                                 )
                                 _final_verifier_result = None
                                 continue
-                        # Stagnated or round budget exhausted — the holistic
-                        # verifier has given up on this run. Running more
-                        # criterion/acceptance fix cycles on top of a result
-                        # it won't approve just re-triggers fresh verification
-                        # passes for the same "needs review" outcome (this is
-                        # the exact loop observed burning ~40 min across 8
-                        # rounds in logs/api-20260710-100353.log). Stop the
-                        # whole run here instead of falling through to the
-                        # acceptance loop below.
-                        break
+                            _quality_gate_exhausted = True
+                        else:
+                            _quality_gate_exhausted = True
 
                     # Acceptance test loop
                     if acceptance_criteria and task_type in ("develop", "sdlc") and _acceptance_fix_count < _acceptance_budget:

@@ -515,14 +515,18 @@ class TestVerifierQualityGate:
         assert "1/10" in result["job_summary"]
 
     @pytest.mark.asyncio
-    async def test_stagnation_stop_does_not_fall_through_to_acceptance_loop(self):
-        """Regression test for logs/api-20260710-100353.log: a stagnation
-        stop (score dropped 2+ points) must end the run, not silently fall
-        through to the acceptance-criterion loop — which can re-trigger a
-        fresh full verification pass next time round, defeating the whole
-        point of stopping. That run burned ~40 minutes across 8 verification
-        rounds because the gate's "stopping" message never actually stopped
-        anything.
+    async def test_quality_gate_exhaustion_does_not_reinject_but_lets_acceptance_loop_run(self):
+        """Regression test for logs/api-20260710-100353.log, refined after
+        advisor review found the first version of this fix wrong: an early
+        draft made a stagnation stop `break` the whole run, but the real log
+        showed the acceptance-criterion loop converging 3/6 -> 6/6 criteria
+        over several rounds *starting right where stagnation first
+        triggered* — a hard break would have denied it that turn entirely.
+        The correct fix is narrower: once the holistic quality gate
+        stagnates, stop re-injecting ITS OWN fix tasks (that was the actual
+        waste — repeated "stopping" messages that didn't stop anything) but
+        let the acceptance loop keep running on its own budget, since it was
+        the mechanism actually making progress.
         """
         specs = [{"description": "Task 1", "agent_type": "develop"}]
         loop, _ = self._make_task_loop(
@@ -537,14 +541,44 @@ class TestVerifierQualityGate:
                 VerifierResult(score=1, passed=False, gaps=["gap"]),
             ],
         )
-        loop._fix_cycles.run_acceptance_loop = AsyncMock(
-            side_effect=AssertionError("acceptance loop must not run after a stagnation stop")
+
+        result = await loop.run("build the app", "develop", "sess", job_id="job1")
+
+        gate_lines = [s for s in result["job_summary"].splitlines() if "Verifier gate" in s]
+        assert len(gate_lines) == 1, "gate must stop re-injecting its own fix after stagnating once"
+        assert "acceptance" in result["job_summary"].lower(), "acceptance loop must still get to run"
+        assert "needs review" in result["job_summary"].lower()
+
+    @pytest.mark.asyncio
+    async def test_verifier_round_budget_exhaustion_without_stagnation_still_lets_acceptance_run(self):
+        """The other path into the quality-gate exhaustion flag: scores that
+        oscillate without ever tripping check_stagnation's drop/plateau
+        conditions still exhaust the verifier-round budget eventually. Must
+        behave the same as the stagnation-triggered path — stop
+        re-injecting once the round budget runs out, but still let the
+        acceptance loop run — not just the narrower stagnation-drop case.
+        """
+        specs = [{"description": "Task 1", "agent_type": "develop"}]
+        # Bounces 3<->4 forever: no 2pt drop, no same-score plateau at >=5 —
+        # check_stagnation never returns stop=True for this sequence. Only
+        # the round-budget check (_verifier_rounds < _MAX_VERIFIER_ROUNDS)
+        # ends the re-injection.
+        oscillating = [VerifierResult(score=s, passed=False, gaps=["gap"]) for s in [3, 4, 3, 4, 3, 4, 3, 4]]
+        loop, _ = self._make_task_loop(
+            specs,
+            completion_criteria=["file exists: index.js"],
+            acceptance_criteria=["command exits 0: npm run build"],
+            evaluate_criteria_results=[[CriterionResult(criterion="file exists: index.js", passed=True)]],
+            verifier_results=oscillating,
         )
 
         result = await loop.run("build the app", "develop", "sess", job_id="job1")
 
-        loop._fix_cycles.run_acceptance_loop.assert_not_awaited()
-        assert "stagnated" in result["job_summary"].lower()
+        gate_lines = [s for s in result["job_summary"].splitlines() if "Verifier gate" in s]
+        # Bounded by _MAX_VERIFIER_ROUNDS (default 6) — must stop growing,
+        # not keep injecting a fix on every one of the 8 provided scores.
+        assert 0 < len(gate_lines) < 8
+        assert "acceptance" in result["job_summary"].lower(), "acceptance loop must still get to run"
         assert "needs review" in result["job_summary"].lower()
 
     @pytest.mark.asyncio
