@@ -191,7 +191,7 @@ class PlannerAgent:
         acceptance_criteria: List[str] = []
         if self.requirements_extractor is not None and workspace is not None:
             try:
-                acceptance_criteria = await self.requirements_extractor.extract(objective, workspace)
+                acceptance_criteria = await self.requirements_extractor.extract(objective, workspace, tasks=tasks)
             except Exception as exc:
                 self.logger.warning("acceptance_criteria_extraction_failed", error=str(exc))
 

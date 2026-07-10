@@ -167,6 +167,7 @@ def _build_task_loop(
     job_id=None,
     objective_resolver=None,
     completion_criteria=None,
+    acceptance_criteria=None,
     verifier_results=None,
     evaluate_criteria_results=None,
 ):
@@ -197,7 +198,11 @@ def _build_task_loop(
 
     planner_agent = MagicMock()
     planner_agent.plan_with_criteria = AsyncMock(
-        return_value=PlanResult(tasks=list(plan_specs), completion_criteria=completion_criteria or [])
+        return_value=PlanResult(
+            tasks=list(plan_specs),
+            completion_criteria=completion_criteria or [],
+            acceptance_criteria=acceptance_criteria or [],
+        )
     )
 
     plan_reviewer_agent = MagicMock()
@@ -508,6 +513,39 @@ class TestVerifierQualityGate:
         assert loop._d.run_agent_fn.await_count >= 2
         assert "needs review" in result["job_summary"].lower()
         assert "1/10" in result["job_summary"]
+
+    @pytest.mark.asyncio
+    async def test_stagnation_stop_does_not_fall_through_to_acceptance_loop(self):
+        """Regression test for logs/api-20260710-100353.log: a stagnation
+        stop (score dropped 2+ points) must end the run, not silently fall
+        through to the acceptance-criterion loop — which can re-trigger a
+        fresh full verification pass next time round, defeating the whole
+        point of stopping. That run burned ~40 minutes across 8 verification
+        rounds because the gate's "stopping" message never actually stopped
+        anything.
+        """
+        specs = [{"description": "Task 1", "agent_type": "develop"}]
+        loop, _ = self._make_task_loop(
+            specs,
+            completion_criteria=["file exists: index.js"],
+            acceptance_criteria=["command exits 0: npm run build"],
+            evaluate_criteria_results=[[CriterionResult(criterion="file exists: index.js", passed=True)]],
+            # score 3 then a 2-point drop to 1 — triggers check_stagnation's
+            # "dropped >= 2 pts" stop condition on the second gate pass.
+            verifier_results=[
+                VerifierResult(score=3, passed=False, gaps=["gap"]),
+                VerifierResult(score=1, passed=False, gaps=["gap"]),
+            ],
+        )
+        loop._fix_cycles.run_acceptance_loop = AsyncMock(
+            side_effect=AssertionError("acceptance loop must not run after a stagnation stop")
+        )
+
+        result = await loop.run("build the app", "develop", "sess", job_id="job1")
+
+        loop._fix_cycles.run_acceptance_loop.assert_not_awaited()
+        assert "stagnated" in result["job_summary"].lower()
+        assert "needs review" in result["job_summary"].lower()
 
     @pytest.mark.asyncio
     async def test_completed_count_excludes_status_lines_not_real_tasks(self):

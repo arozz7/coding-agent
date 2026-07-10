@@ -94,3 +94,35 @@ class TestRequirementsExtractor:
         )
         result = await extractor.extract("build something", tmp_path)
         assert result == ["command exits 0: npm run build"]
+
+    @pytest.mark.asyncio
+    async def test_planned_tasks_included_in_prompt_when_provided(self, tmp_path):
+        """Regression test: without seeing the actual plan, the extractor
+        invented a Diesel-style migration filename
+        ('00000000000000_create_expenses.sql') that had zero relation to the
+        real task ('Create src-tauri/db/migrations/0001_init.sql') — see
+        logs/api-20260710-100353.log. The extractor must be able to ground
+        file-path criteria in the concrete plan instead of guessing from a
+        generic naming convention.
+        """
+        extractor = _make_extractor('["file exists: src-tauri/db/migrations/0001_init.sql"]')
+        tasks = [
+            {"description": "Create src-tauri/db/migrations/0001_init.sql with the initial schema", "agent_type": "develop"},
+        ]
+        await extractor.extract("build the db layer", tmp_path, tasks=tasks)
+        prompt_arg = extractor.model_router.generate.call_args[0][0]
+        assert "0001_init.sql" in prompt_arg
+
+    @pytest.mark.asyncio
+    async def test_extract_works_without_tasks_arg_for_backward_compat(self, tmp_path):
+        extractor = _make_extractor('["command exits 0: npm run build"]')
+        result = await extractor.extract("build something", tmp_path)
+        assert result == ["command exits 0: npm run build"]
+
+    @pytest.mark.asyncio
+    async def test_system_prompt_forbids_inventing_paths_not_in_tasks(self, tmp_path):
+        extractor = _make_extractor('["command exits 0: npm run build"]')
+        tasks = [{"description": "Create src/app.js", "agent_type": "develop"}]
+        await extractor.extract("build something", tmp_path, tasks=tasks)
+        system_arg = extractor.model_router.generate.call_args[1]["system_prompt"]
+        assert "naming convention" in system_arg.lower()

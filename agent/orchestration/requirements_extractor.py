@@ -8,7 +8,7 @@ from __future__ import annotations
 import json
 import re
 from pathlib import Path
-from typing import TYPE_CHECKING, List
+from typing import TYPE_CHECKING, Dict, List, Optional
 
 import structlog
 
@@ -40,16 +40,28 @@ class RequirementsExtractor:
         self.model_router = model_router
         self.logger = logger.bind(component="requirements_extractor")
 
-    async def extract(self, objective: str, workspace: Path) -> List[str]:
+    async def extract(
+        self, objective: str, workspace: Path, tasks: Optional[List[Dict[str, str]]] = None,
+    ) -> List[str]:
         """Return up to 7 behavioral acceptance criteria for the running app.
 
         Reads workspace docs for context; falls back to [] on any failure.
+
+        `tasks`, when provided, is the already-planned task list for this
+        objective (same shape as PlannerAgent.plan()'s output). Without it,
+        this extractor has no visibility into concrete filenames the plan
+        will actually produce and can invent a plausible-looking but wrong
+        one from a generic naming convention (e.g. a Diesel-style timestamped
+        migration filename for a project that uses sqlx's numbered
+        migrations) — see the regression test for the exact failure this
+        caused in production.
         """
         model = self.model_router.get_model("coding")
         if not model:
             return []
 
         doc_context = self._read_docs(workspace)
+        task_context = self._format_tasks(tasks) if tasks else ""
 
         system = (
             "You are a strict QA engineer. Given an objective and optional project docs, "
@@ -73,7 +85,12 @@ class RequirementsExtractor:
             "— for UI checks; be specific enough that a model can give yes/no from one image\n\n"
             "RULES:\n"
             "  - Do NOT write vague criteria like 'the app works' or 'no errors'.\n"
-            "  - Do NOT generate 'file exists' or 'file contains' from naming conventions.\n"
+            "  - Do NOT generate 'file exists' or 'file contains' from naming conventions. "
+            "If the planned tasks below name a specific file, use that EXACT path. If they don't, "
+            "prefer a glob (e.g. 'src-tauri/db/migrations/*.sql') over guessing an exact filename — "
+            "never invent a filename from a framework naming convention you were trained on "
+            "(e.g. a Diesel-style timestamped migration name) unless that exact convention is "
+            "already visible in the project docs or planned tasks.\n"
             "  - Do NOT generate 'file contains' for ANY markdown (.md) file — markdown files "
             "are documentation artifacts, not evidence that code works. The agent can trivially "
             "satisfy an .md criterion by appending a single token; the criterion proves nothing.\n"
@@ -91,6 +108,7 @@ class RequirementsExtractor:
         )
         prompt = (
             f"Objective: {objective}\n\n"
+            f"{task_context}\n\n"
             f"{doc_context}\n\n"
             "Generate 3–7 acceptance criteria following the structure above."
         )
@@ -107,6 +125,14 @@ class RequirementsExtractor:
     # ------------------------------------------------------------------
     # Internals
     # ------------------------------------------------------------------
+
+    def _format_tasks(self, tasks: List[Dict[str, str]]) -> str:
+        """Return a compact task summary so criteria can reference real filenames."""
+        lines = [
+            f"  {i + 1}. [{t.get('agent_type', 'develop')}] {t.get('description', '')[:100]}"
+            for i, t in enumerate(tasks[:8])
+        ]
+        return "Planned tasks:\n" + "\n".join(lines)
 
     def _read_docs(self, workspace: Path) -> str:
         """Read candidate docs, returning a combined context string."""

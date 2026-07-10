@@ -227,34 +227,45 @@ class TaskLoop:
                     # and stagnation bounds as the no-criteria path below so
                     # a genuinely stuck low-quality run still stops instead
                     # of burning the fix budget forever.
-                    if (
-                        _final_verifier_result is not None
-                        and not _final_verifier_result.passed
-                        and _verifier_rounds < _MAX_VERIFIER_ROUNDS
-                    ):
-                        stop, _plateau_count, _zero_score_count = check_stagnation(
-                            _final_verifier_result.score, _prev_verifier_score,
-                            _plateau_count, _zero_score_count, task_summaries,
-                        )
-                        if not stop:
-                            _new_files = [f for f in all_files if f not in _verifier_snapshot_files]
-                            _verifier_snapshot_files = set(all_files)
-                            fix_specs = d.verifier_coordinator.make_fix_specs(
-                                objective, task_type, _final_verifier_result, _verifier_rounds + 1,
-                                files_created=all_files,
-                                files_changed_this_round=_new_files,
-                                prev_score=_prev_verifier_score,
+                    if _final_verifier_result is not None and not _final_verifier_result.passed:
+                        if _verifier_rounds < _MAX_VERIFIER_ROUNDS:
+                            stop, _plateau_count, _zero_score_count = check_stagnation(
+                                _final_verifier_result.score, _prev_verifier_score,
+                                _plateau_count, _zero_score_count, task_summaries,
                             )
+                            # Always advance the baseline, even when stopping —
+                            # otherwise a later round (e.g. re-entering this
+                            # block via the acceptance loop) compares against a
+                            # stale score and mis-detects stagnation itself.
                             _prev_verifier_score = _final_verifier_result.score
-                            _verifier_rounds += 1
-                            ctx.add_tasks(fix_specs)
-                            task_summaries.append(
-                                f"🔍 **Verifier gate** (round {_verifier_rounds}/{_MAX_VERIFIER_ROUNDS}) "
-                                f"— criteria passed but score {_final_verifier_result.score}/{PASS_THRESHOLD} "
-                                f"required; injecting {len(fix_specs)} fix task(s)"
-                            )
-                            _final_verifier_result = None
-                            continue
+                            if not stop:
+                                _new_files = [f for f in all_files if f not in _verifier_snapshot_files]
+                                _verifier_snapshot_files = set(all_files)
+                                fix_specs = d.verifier_coordinator.make_fix_specs(
+                                    objective, task_type, _final_verifier_result, _verifier_rounds + 1,
+                                    files_created=all_files,
+                                    files_changed_this_round=_new_files,
+                                    prev_score=_prev_verifier_score,
+                                )
+                                _verifier_rounds += 1
+                                ctx.add_tasks(fix_specs)
+                                task_summaries.append(
+                                    f"🔍 **Verifier gate** (round {_verifier_rounds}/{_MAX_VERIFIER_ROUNDS}) "
+                                    f"— criteria passed but score {_final_verifier_result.score}/{PASS_THRESHOLD} "
+                                    f"required; injecting {len(fix_specs)} fix task(s)"
+                                )
+                                _final_verifier_result = None
+                                continue
+                        # Stagnated or round budget exhausted — the holistic
+                        # verifier has given up on this run. Running more
+                        # criterion/acceptance fix cycles on top of a result
+                        # it won't approve just re-triggers fresh verification
+                        # passes for the same "needs review" outcome (this is
+                        # the exact loop observed burning ~40 min across 8
+                        # rounds in logs/api-20260710-100353.log). Stop the
+                        # whole run here instead of falling through to the
+                        # acceptance loop below.
+                        break
 
                     # Acceptance test loop
                     if acceptance_criteria and task_type in ("develop", "sdlc") and _acceptance_fix_count < _acceptance_budget:
