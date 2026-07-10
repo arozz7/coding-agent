@@ -74,3 +74,23 @@ class TestRequirementsExtractor:
         extractor = _make_extractor('["valid criterion", "", "  ", "another valid"]')
         result = await extractor.extract("build something", tmp_path)
         assert all(c.strip() for c in result)
+
+    @pytest.mark.asyncio
+    async def test_find_command_rewritten_to_portable_file_exists(self, tmp_path):
+        """Regression test: 'find <dir> -type f -name X | grep -q .' fails
+        unconditionally on Windows and is redundant on Linux — must come out
+        as the OS-agnostic 'file exists: <glob>' check instead.
+        """
+        extractor = _make_extractor(
+            '["command exits 0: find src-tauri/db/ -type f -name \'*.sql\' | grep -q ."]'
+        )
+        result = await extractor.extract("build the db layer", tmp_path)
+        assert result == ["file exists: src-tauri/db/**/*.sql"]
+
+    @pytest.mark.asyncio
+    async def test_unportable_command_dropped_not_kept_broken(self, tmp_path):
+        extractor = _make_extractor(
+            '["command exits 0: npm run build", "command exits 0: cat package.json | grep version"]'
+        )
+        result = await extractor.extract("build something", tmp_path)
+        assert result == ["command exits 0: npm run build"]

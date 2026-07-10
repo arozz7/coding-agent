@@ -122,3 +122,16 @@ class TestPlanWithCriteria:
         assert "system_prompt" in captured, "criteria system prompt was never generated"
         assert "markdown" in captured["system_prompt"].lower()
         assert ".md" in captured["system_prompt"]
+
+    @pytest.mark.asyncio
+    async def test_find_criterion_rewritten_to_portable_file_exists(self):
+        """Regression test for the same class of bug normalize_criterion
+        exists to fix (see logs/api-20260709-111051.log): completion
+        criteria must not depend on 'find ... | grep' surviving on Windows.
+        """
+        planner = _make_planner(
+            '[{"description": "Do stuff", "agent_type": "develop"}]',
+            '{"criteria": ["command exits 0: find src -type f -name \'*.py\' | grep -q ."]}',
+        )
+        result = await planner.plan_with_criteria("obj", task_type="develop")
+        assert result.completion_criteria == ["file exists: src/**/*.py"]

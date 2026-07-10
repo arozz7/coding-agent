@@ -37,6 +37,51 @@ _EXCLUDE_DIRS = frozenset({
     "vendor", "target", "dist", "build", ".next", ".nuxt",
 })
 
+# "find <dir> -type f -name '<pattern>'" is the shape an LLM reaches for when
+# it means "does a file matching this pattern exist" — but as a literal shell
+# command it is Unix-only (cmd.exe's built-in `find` searches file *content*,
+# not paths) and is redundant even on Unix, since the codebase already has a
+# pure-Python, OS-agnostic equivalent: the "file exists: <glob>" auto-check
+# (Path.glob, no shell involved). Rewriting at generation time means this
+# never depends on the model's prompt-following, matching the same reasoning
+# as PlannerAgent's hard task-count cap — enforce portability programmatically.
+_FIND_TYPE_F_NAME_RE = re.compile(
+    r"^find\s+(?P<dir>\S+?)/?\s+-type\s+f\s+-name\s+['\"]?(?P<pattern>[^\s'\"]+)['\"]?",
+    re.IGNORECASE,
+)
+
+# Bare Unix text/file utilities with no reliable Windows equivalent for the
+# way an LLM typically invokes them (piped, with Unix-only flags). A
+# criterion built around one of these can never be trusted to behave the
+# same on both platforms, so it's dropped rather than kept and left to fail
+# unconditionally on whichever OS the agent happens to run on.
+_UNPORTABLE_COMMAND_VERBS = frozenset({"grep", "ls", "cat", "wc", "sed", "awk", "xargs", "head", "tail", "find"})
+
+
+def normalize_criterion(criterion: str) -> "str | None":
+    """Rewrite or drop a 'command exits 0' criterion that can't run reliably
+    as a shell command on both Windows and Linux.
+
+    Returns the rewritten criterion, the original unchanged (nothing
+    applies), or None (the criterion should be dropped entirely).
+    """
+    lower = criterion.lower()
+    if not lower.startswith("command exits 0:"):
+        return criterion
+
+    cmd = criterion[len("command exits 0:"):].strip()
+    m = _FIND_TYPE_F_NAME_RE.match(cmd)
+    if m:
+        rel_dir = m.group("dir").strip("/")
+        rel_dir = rel_dir if rel_dir else "."
+        return f"file exists: {rel_dir}/**/{m.group('pattern')}"
+
+    first_verb = cmd.split()[0].lower() if cmd.split() else ""
+    if first_verb in _UNPORTABLE_COMMAND_VERBS:
+        return None
+
+    return criterion
+
 
 def _glob_filtered(ws: Path, pattern: str) -> list[Path]:
     """Glob `pattern` relative to `ws`, excluding dependency/build directories.

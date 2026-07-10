@@ -20,6 +20,8 @@ from typing import Dict, List, Optional
 
 import structlog
 
+from agent.orchestration.criterion_evaluator import normalize_criterion
+
 logger = structlog.get_logger()
 
 # Agent types the orchestrator can route to
@@ -352,6 +354,9 @@ class PlannerAgent:
                 return []
             obj, _ = json.JSONDecoder().raw_decode(raw_s[brace:])
             criteria = [str(c).strip() for c in obj.get("criteria", []) if c]
+            # Rewrite/drop criteria that can't run reliably as a shell command
+            # on both Windows and Linux — see criterion_evaluator.normalize_criterion.
+            criteria = [c for c in (normalize_criterion(c) for c in criteria) if c]
             self.logger.info("criteria_generated", count=len(criteria), objective=objective[:60])
             return criteria[:5]
         except Exception as exc:

@@ -242,6 +242,17 @@ def _has_unquoted_shell_operators(cmd: str) -> bool:
     return False
 
 
+# Matches `find <dir> [-type f] -name <pattern>` — the shape an LLM reaches
+# for to search for files by name. cmd.exe has a built-in `find` that
+# searches file *contents*, not paths, so passing this through unchanged
+# always misbehaves on Windows; `-type f`/pattern quoting are optional since
+# models don't always include them.
+_FIND_NAME_RE = re.compile(
+    r"^find\s+(?P<dir>\S+?)/?(?:\s+-type\s+f)?\s+-name\s+['\"]?(?P<pattern>[^\s'\"]+)['\"]?\s*$",
+    re.IGNORECASE,
+)
+
+
 def _kill_process_tree(pid: int) -> None:
     """Kill a process and all its children.
 
@@ -287,6 +298,16 @@ class ShellTool:
         """
         parts = cmd.split()
         verb = parts[0].lower() if parts else ""
+
+        if verb == "find":
+            m = _FIND_NAME_RE.match(cmd)
+            if not m:
+                return cmd  # unrecognized shape — fail loudly rather than guess
+            rel_dir = m.group("dir").strip("/")
+            pattern = m.group("pattern")
+            if rel_dir in ("", "."):
+                return f'dir /s /b "{pattern}"'
+            return f'dir /s /b "{rel_dir.replace("/", chr(92))}\\{pattern}"'
 
         if verb == "ls":
             targets = [p for p in parts[1:] if not p.startswith("-")]

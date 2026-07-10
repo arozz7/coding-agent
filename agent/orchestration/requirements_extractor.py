@@ -12,6 +12,8 @@ from typing import TYPE_CHECKING, List
 
 import structlog
 
+from agent.orchestration.criterion_evaluator import normalize_criterion
+
 if TYPE_CHECKING:
     from llm import ModelRouter
 
@@ -136,4 +138,7 @@ class RequirementsExtractor:
         if not isinstance(items, list):
             return []
         cleaned = [str(c).strip() for c in items if str(c).strip()]
-        return cleaned[:_MAX_CRITERIA]
+        # Rewrite/drop criteria that can't run reliably as a shell command on
+        # both Windows and Linux — see criterion_evaluator.normalize_criterion.
+        normalized = [normalize_criterion(c) for c in cleaned]
+        return [c for c in normalized if c][:_MAX_CRITERIA]

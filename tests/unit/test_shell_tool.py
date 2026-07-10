@@ -40,3 +40,35 @@ def test_resolve_args_simple_exe_command_uses_argv(monkeypatch):
     args, use_shell = tool._resolve_args(cmd)
     assert use_shell is False
     assert args[0] == "cargo"
+
+
+class TestTranslateFindToWindows:
+    """`find <dir> -type f -name '<pattern>'` is a bare Unix filesystem
+    search the agent may issue directly (not just via a criterion — see
+    normalize_criterion in criterion_evaluator.py for the criteria-level
+    fix). On Windows this must become a `dir` recursive listing rather than
+    silently invoking cmd.exe's built-in `find` (which searches file
+    *contents*, not paths, and always fails or misbehaves here).
+    """
+
+    def _translate(self, cmd: str) -> str:
+        tool = object.__new__(ShellTool)
+        return tool._translate_unix_to_windows(cmd)
+
+    def test_find_type_f_name_translated_to_dir_recursive(self):
+        result = self._translate("find src-tauri/db/ -type f -name *.sql")
+        assert result == 'dir /s /b "src-tauri\\db\\*.sql"'
+
+    def test_find_current_dir(self):
+        result = self._translate("find . -type f -name *.py")
+        assert result == 'dir /s /b "*.py"'
+
+    def test_find_without_type_f_still_translated(self):
+        result = self._translate("find src -name *.rs")
+        assert result == 'dir /s /b "src\\*.rs"'
+
+    def test_find_with_no_name_falls_through_unchanged(self):
+        # No recognizable pattern to translate — leave it for the caller to
+        # fail loudly rather than guess.
+        result = self._translate("find src -type f")
+        assert result == "find src -type f"
