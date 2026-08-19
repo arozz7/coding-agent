@@ -27,6 +27,14 @@ _RUN_DEBUG_INTENT_RE = re.compile(
     re.IGNORECASE,
 )
 
+# Developer generations write full files/diffs on top of a long thinking
+# trace (see config/models.yaml max_tokens for Qwen3.8-27B-Q4_K_S) and can
+# legitimately run past the model_router default of 600s. Give the developer
+# role more wall-clock room than lighter-weight roles (classification,
+# planning) so a slow-but-progressing generation doesn't get killed by
+# ollama_hard_timeout and forced into a full task retry.
+_DEVELOPER_TIMEOUT_SECS = 1500.0
+
 # Detect whether an actual app-run command appears in shell output lines
 # (each line starts with "$ <cmd>" after our formatting).
 _APP_RUN_CMD_RE = re.compile(
@@ -202,7 +210,9 @@ Summary: <one sentence>
         if not model:
             return {"success": False, "error": "No coding model configured"}
 
-        response = await model_router.generate(prompt, model, system_prompt=self.get_system_prompt())
+        response = await model_router.generate(
+            prompt, model, system_prompt=self.get_system_prompt(), timeout=_DEVELOPER_TIMEOUT_SECS
+        )
 
         if tool_executor:
             file_writes = _extract_file_writes(response)
@@ -258,7 +268,7 @@ Summary: <one sentence>
                 f"Do NOT run any commands — only output code fixes."
             )
             write_response = await model_router.generate(
-                write_prompt, model, system_prompt=self.get_system_prompt()
+                write_prompt, model, system_prompt=self.get_system_prompt(), timeout=_DEVELOPER_TIMEOUT_SECS
             )
             response += "\n\n**Write phase:**\n" + write_response
 
@@ -313,7 +323,9 @@ Summary: <one sentence>
                 f"Look at the package.json start script or main entry point shown above.\n"
                 f"Output ONLY a fenced shell block that runs the app. Do NOT explore further."
             )
-            force_run_response = await model_router.generate(force_run_prompt, model, system_prompt=self.get_system_prompt())
+            force_run_response = await model_router.generate(
+                force_run_prompt, model, system_prompt=self.get_system_prompt(), timeout=_DEVELOPER_TIMEOUT_SECS
+            )
 
             # Write any files the LLM generated before running
             for file_path, content in _extract_file_writes(force_run_response):

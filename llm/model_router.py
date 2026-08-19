@@ -289,6 +289,7 @@ class ModelRouter(EvaluatorSelectorMixin):
         enable_thinking: bool | None = None,
         system_prompt: Optional[str] = None,
         messages: Optional[List[dict]] = None,
+        max_tokens: Optional[int] = None,
     ) -> str:
         """Generate a completion.
 
@@ -297,6 +298,10 @@ class ModelRouter(EvaluatorSelectorMixin):
         classification calls where a thinking trace is wasteful (e.g. the task
         type classifier that only needs one word back).  Leave as ``None``
         (default) to use the model's own setting.
+
+        ``max_tokens`` overrides the per-model ``max_tokens`` setting in
+        models.yaml for this single call.  Leave as ``None`` (default) to use
+        the model's own budget.
         """
         import asyncio
         await self.rate_limiter.acquire(config.name)
@@ -304,6 +309,8 @@ class ModelRouter(EvaluatorSelectorMixin):
         # Resolve effective enable_thinking: call-site override wins, then
         # per-model config, then None (let the model decide).
         effective_thinking = enable_thinking if enable_thinking is not None else config.enable_thinking
+        # Resolve effective max_tokens the same way.
+        effective_max_tokens = max_tokens if max_tokens is not None else config.max_tokens
 
         # Track how many times we've tried to load / wait for this model.
         # Governed by max_load_attempts (local_runtime), not by max_retries.
@@ -341,6 +348,7 @@ class ModelRouter(EvaluatorSelectorMixin):
                         enable_thinking=effective_thinking,
                         timeout=timeout,
                         messages=messages,
+                        max_tokens=effective_max_tokens,
                     )
                 else:
                     result = await self.cloud.generate(prompt, config, system_prompt=system_prompt)
@@ -404,6 +412,7 @@ class ModelRouter(EvaluatorSelectorMixin):
                     max_retries=max_retries,
                     timeout=timeout,
                     enable_thinking=enable_thinking,
+                    max_tokens=max_tokens,
                     original_error=e,
                     system_prompt=system_prompt,
                     messages=messages,
@@ -430,6 +439,7 @@ class ModelRouter(EvaluatorSelectorMixin):
                         max_retries=max_retries,
                         timeout=timeout,
                         enable_thinking=enable_thinking,
+                        max_tokens=max_tokens,
                         original_error=None,
                         system_prompt=system_prompt,
                         messages=messages,
@@ -456,6 +466,7 @@ class ModelRouter(EvaluatorSelectorMixin):
                         max_retries=max_retries,
                         timeout=timeout,
                         enable_thinking=enable_thinking,
+                        max_tokens=max_tokens,
                         original_error=None,
                         system_prompt=system_prompt,
                         messages=messages,
@@ -485,6 +496,7 @@ class ModelRouter(EvaluatorSelectorMixin):
                         max_retries=max_retries,
                         timeout=timeout,
                         enable_thinking=enable_thinking,
+                        max_tokens=max_tokens,
                         original_error=e,
                         system_prompt=system_prompt,
                     )
@@ -507,6 +519,7 @@ class ModelRouter(EvaluatorSelectorMixin):
                         max_retries=max_retries,
                         timeout=timeout,
                         enable_thinking=enable_thinking,
+                        max_tokens=max_tokens,
                         original_error=e,
                         system_prompt=system_prompt,
                         messages=messages,
@@ -542,6 +555,7 @@ class ModelRouter(EvaluatorSelectorMixin):
         original_error: Optional[Exception],
         system_prompt: Optional[str] = None,
         messages: Optional[List[dict]] = None,
+        max_tokens: Optional[int] = None,
     ) -> str:
         """Try each model in the fallback chain in order.
 
@@ -583,6 +597,7 @@ class ModelRouter(EvaluatorSelectorMixin):
             _fallback_chain=remaining_chain,
             timeout=timeout,
             enable_thinking=enable_thinking,
+            max_tokens=max_tokens,
             system_prompt=system_prompt,
             messages=messages,
         )

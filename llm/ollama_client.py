@@ -54,6 +54,7 @@ class OllamaClient:
         enable_thinking: Optional[bool] = None,
         timeout: float = 600.0,
         messages: Optional[list[dict]] = None,
+        max_tokens: int = 8192,
     ) -> str:
         """Generate a completion.
 
@@ -64,6 +65,9 @@ class OllamaClient:
                 Qwen3/DeepSeek-R1 thinking models.  When these models return
                 an empty ``content`` field (reasoning only, no actual response),
                 we raise RuntimeError so the caller's retry loop handles it.
+            max_tokens: Response token budget. Thinking models spend part of
+                this on their <think> trace before the actual answer — too
+                small a budget truncates mid-thought and yields empty content.
         """
         url = self._get_chat_endpoint()
         self.logger.info("ollama_generate_start", model=model, prompt_len=len(prompt), url=url)
@@ -87,7 +91,7 @@ class OllamaClient:
         # hangs.  asyncio.wait_for cancels the coroutine at the deadline regardless.
         try:
             return await asyncio.wait_for(
-                self._do_generate(url, model, prompt, system_prompt, enable_thinking, timeout, messages),
+                self._do_generate(url, model, prompt, system_prompt, enable_thinking, timeout, messages, max_tokens),
                 timeout=timeout,
             )
         except asyncio.TimeoutError:
@@ -103,6 +107,7 @@ class OllamaClient:
         enable_thinking: Optional[bool],
         timeout: float,
         messages: Optional[list[dict]] = None,
+        max_tokens: int = 8192,
     ) -> str:
         """Inner coroutine — executed inside asyncio.wait_for by generate().
 
@@ -118,7 +123,7 @@ class OllamaClient:
         """
         payload: dict[str, Any] = {
             "model": model,
-            "max_tokens": 8192,
+            "max_tokens": max_tokens,
         }
         if messages is not None:
             payload["messages"] = messages
@@ -183,21 +188,29 @@ class OllamaClient:
         content = message.get("content", "")
 
         if not content:
-            # Thinking models sometimes produce only reasoning_content
-            # with an empty content field.  Returning the raw thinking
-            # trace as a response breaks all downstream parsing, so we
-            # raise instead — the retry loop in model_router will retry
-            # or fall back to another model.
+            # Thinking models sometimes produce only reasoning_content with an
+            # empty content field — this happens when the <think> trace alone
+            # consumes the whole max_tokens budget, cutting the response off
+            # before the model reaches its actual answer. Returning the raw
+            # thinking trace as a response breaks all downstream parsing, so
+            # we raise instead — the retry loop in model_router will retry or
+            # fall back to another model.
             reasoning = message.get("reasoning_content", "")
+            finish_reason = choices[0].get("finish_reason")
             if reasoning:
                 self.logger.warning(
                     "empty_content_with_reasoning",
                     model=model,
+                    max_tokens=max_tokens,
+                    finish_reason=finish_reason,
+                    reasoning_len=len(reasoning),
                     reasoning_preview=reasoning[:120],
                 )
                 raise RuntimeError(
-                    f"Model {model!r} returned empty content (reasoning-only response). "
-                    "Set enable_thinking: false in models.yaml for this model."
+                    f"Model {model!r} returned empty content (reasoning-only response, "
+                    f"finish_reason={finish_reason!r}, {len(reasoning)} reasoning chars hit "
+                    f"the max_tokens={max_tokens} cap before an answer was produced). "
+                    "Raise max_tokens in models.yaml for this model."
                 )
             raise RuntimeError(f"Model {model!r} returned empty content and no reasoning")
 

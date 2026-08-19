@@ -29,6 +29,11 @@ from agent.agents.output_blocks import (
 
 MAX_FIX_ITERATIONS = int(os.getenv("MAX_FIX_ITERATIONS", "50"))
 
+# Same rationale as developer_agent._DEVELOPER_TIMEOUT_SECS — fix-loop
+# generations write full replacements on top of a long thinking trace and
+# can legitimately run past the model_router default of 600s.
+_DEVELOPER_TIMEOUT_SECS = 1500.0
+
 _MISSING_TOOL_NAMES = (
     "jest", "webpack", "ts-node", "tsc", "mocha", "vitest", "eslint", "prettier",
 )
@@ -224,7 +229,9 @@ async def run_fix_loop(
             f"Fix ALL errors shown above, not just the first one."
         )
         model = model_router.get_model("coding")
-        fix_response = await model_router.generate(fix_prompt, model, system_prompt=system_prompt)
+        fix_response = await model_router.generate(
+            fix_prompt, model, system_prompt=system_prompt, timeout=_DEVELOPER_TIMEOUT_SECS
+        )
 
         iteration_files: list[str] = []
 

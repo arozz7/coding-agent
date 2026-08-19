@@ -17,6 +17,10 @@ class ModelConfig(BaseModel):
     # Set to False for Qwen3/DeepSeek-R1 thinking models that return empty content
     # when extended reasoning is enabled.  Passes enable_thinking=false to the API.
     enable_thinking: Optional[bool] = None
+    # Response token budget passed as max_tokens. Thinking models spend part of
+    # this budget on their <think> trace before the actual answer, so models
+    # with enable_thinking left on (the default) need enough headroom for both.
+    max_tokens: int = 8192
     # Inference backend for local models.  Used to decide whether programmatic
     # load/unload via the LM Studio REST API is available.
     # Values: "lmstudio" | "ollama" | "llama_cpp" | "turboquant"
