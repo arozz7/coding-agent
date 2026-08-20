@@ -212,6 +212,30 @@ class TestTesterRole:
         assert matches == [("tests/test_login.py", "def test_login():\n    pass")]
 
     @pytest.mark.asyncio
+    async def test_tester_execute_passes_extended_timeout(self):
+        # Regression: base_agent:tester hit the model_router default 600s
+        # timeout in logs/api-20260819-201238.log while developer_agent's
+        # calls (already raised to 1500s) did not.
+        from agent.agents.tester_agent import TesterRole, _TESTER_TIMEOUT_SECS
+
+        role = TesterRole()
+        mock_router = Mock()
+        mock_model = Mock()
+        mock_router.get_model.return_value = mock_model
+        mock_router.generate = AsyncMock(return_value="Test code")
+
+        context = {
+            "task": "Write tests for login",
+            "code": "def login(): pass",
+            "language": "python",
+            "model_router": mock_router,
+        }
+        await role.execute(context)
+
+        mock_router.generate.assert_called_once()
+        assert mock_router.generate.call_args.kwargs["timeout"] == _TESTER_TIMEOUT_SECS
+
+    @pytest.mark.asyncio
     async def test_tester_execute_python(self):
         from agent.agents.tester_agent import TesterRole
 

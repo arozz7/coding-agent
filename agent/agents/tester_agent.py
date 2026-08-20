@@ -2,6 +2,15 @@ from typing import Dict, Any, List
 import re
 from agent.agents.base_agent import AgentRole
 
+# Same rationale as developer_agent._DEVELOPER_TIMEOUT_SECS — test
+# generations write full files on top of a long thinking trace (see
+# config/models.yaml max_tokens for Qwen3.8-27B-Q4_K_S) and can legitimately
+# run past the model_router default of 600s. Confirmed live:
+# logs/api-20260819-201238.log — base_agent:tester hit ollama_hard_timeout
+# at the 600s default while developer_agent's calls (already raised to
+# 1500s at that point) did not.
+_TESTER_TIMEOUT_SECS = 1500.0
+
 
 class TesterRole(AgentRole):
     def __init__(self, file_system_tool=None, pytest_tool=None):
@@ -85,7 +94,9 @@ Run the tests if pytest tool is available."""
         if not model:
             return {"success": False, "error": "No coding model configured"}
 
-        response = await model_router.generate(prompt, model, system_prompt=self.get_system_prompt())
+        response = await model_router.generate(
+            prompt, model, system_prompt=self.get_system_prompt(), timeout=_TESTER_TIMEOUT_SECS
+        )
 
         files_created = []
         test_output = None
