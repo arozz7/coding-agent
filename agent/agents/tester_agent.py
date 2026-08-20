@@ -31,7 +31,10 @@ Guidelines:
 - Be concise in your responses"""
 
     def _extract_file_writes(self, response: str) -> List[tuple]:
-        pattern = r'FILE:\s*(.+?)\n```\w*\n(.*?)```'
+        # Path group is [^\n]+ (not .+?) — see output_blocks.py's
+        # APPEND_BLOCK_RE comment for why an unbounded DOTALL path group
+        # misfires when the model's prose mentions "FILE:" first.
+        pattern = r'FILE:\s*([^\n]+)\n```\w*\n(.*?)```'
         matches = re.findall(pattern, response, re.DOTALL)
         return [(path.strip(), content.strip()) for path, content in matches]
 

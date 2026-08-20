@@ -56,6 +56,20 @@ class TestArchitectRole:
         assert result["role"] == "architect"
         mock_router.generate.assert_called_once()
 
+    def test_extract_file_writes_ignores_prose_mention_of_file(self):
+        # Regression: an unbounded DOTALL path group used to swallow the real
+        # FILE: line when the model's own prose mentioned "FILE:" first.
+        from agent.agents.architect_agent import ArchitectRole
+
+        role = ArchitectRole()
+        response = (
+            "I'll write this as a FILE: rather than editing in place.\n\n"
+            "FILE: docs/ARCHITECTURE.md\n"
+            "```markdown\n# Architecture\n```\n"
+        )
+        matches = role._extract_file_writes(response)
+        assert matches == [("docs/ARCHITECTURE.md", "# Architecture")]
+
 
 class TestDeveloperRole:
     @pytest.mark.asyncio
@@ -126,10 +140,24 @@ class TestReviewerRole:
 
 
 class TestTesterRole:
+    def test_extract_file_writes_ignores_prose_mention_of_file(self):
+        # Regression: an unbounded DOTALL path group used to swallow the real
+        # FILE: line when the model's own prose mentioned "FILE:" first.
+        from agent.agents.tester_agent import TesterRole
+
+        role = TesterRole()
+        response = (
+            "I'll add this as a new FILE: for the login test.\n\n"
+            "FILE: tests/test_login.py\n"
+            "```python\ndef test_login():\n    pass\n```\n"
+        )
+        matches = role._extract_file_writes(response)
+        assert matches == [("tests/test_login.py", "def test_login():\n    pass")]
+
     @pytest.mark.asyncio
     async def test_tester_execute_python(self):
         from agent.agents.tester_agent import TesterRole
-        
+
         role = TesterRole()
         
         mock_router = Mock()

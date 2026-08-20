@@ -142,7 +142,10 @@ class MapperRole:
 
         files_created: List[str] = []
         if tool_executor:
-            file_pattern = r'FILE:\s*(.+?)\n```\w*\n(.*?)```'
+            # Path group is [^\n]+ (not .+?) — see output_blocks.py's
+            # APPEND_BLOCK_RE comment for why an unbounded DOTALL path group
+            # misfires when the model's prose mentions "FILE:" first.
+            file_pattern = r'FILE:\s*([^\n]+)\n```\w*\n(.*?)```'
             import re
             for path_str, content in re.findall(file_pattern, response, re.DOTALL):
                 fp = path_str.strip()

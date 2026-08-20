@@ -65,8 +65,19 @@ REPLACE_BLOCK_RE = re.compile(
 #   ```language
 #   content to add at the end
 #   ```
+#
+# The path group is [^\n]+ (not .+?) so it can never cross a newline even
+# under DOTALL. Without that restriction, when the model's own prose
+# mentions "APPEND:" before the real block (e.g. "I'll append the marker
+# using an APPEND: block:\n\nAPPEND: real/path.sql\n```sql\n..."), the
+# non-greedy .+? would swallow everything between the prose mention and the
+# next code fence — including the real "APPEND: real/path.sql" line — into
+# the path, producing garbage like "block:\n\nAPPEND: real/path.sql" that
+# fails the path-traversal guard and silently drops the append. Restricting
+# the path to a single line makes that prose match fail outright (no fence
+# immediately follows it), so the regex backtracks to the real marker line.
 APPEND_BLOCK_RE = re.compile(
-    r'APPEND:\s*(.+?)\n```\w*\n(.*?)```',
+    r'APPEND:\s*([^\n]+)\n```\w*\n(.*?)```',
     re.DOTALL,
 )
 
@@ -98,7 +109,10 @@ def format_file_with_lines(content: str, path: str, max_chars: int = 3000) -> st
 
 
 def extract_file_writes(response: str) -> List[tuple]:
-    pattern = r'FILE:\s*(.+?)\n```\w*\n(.*?)```'
+    # Path group is [^\n]+ (not .+?) — see APPEND_BLOCK_RE comment above for
+    # why an unbounded, DOTALL-crossing path group misfires when the model's
+    # prose mentions "FILE:" before the real block.
+    pattern = r'FILE:\s*([^\n]+)\n```\w*\n(.*?)```'
     matches = re.findall(pattern, response, re.DOTALL)
     return [(path.strip(), content.strip()) for path, content in matches]
 

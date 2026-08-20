@@ -40,7 +40,10 @@ Guidelines:
         return "/".join(parts)
 
     def _extract_file_writes(self, response: str) -> List[tuple]:
-        pattern = r'FILE:\s*(.+?)\n```markdown\n(.*?)```'
+        # Path group is [^\n]+ (not .+?) so a stray prose mention of "FILE:"
+        # before the real block can't swallow the real marker line into the
+        # path under DOTALL — see output_blocks.py's APPEND_BLOCK_RE comment.
+        pattern = r'FILE:\s*([^\n]+)\n```markdown\n(.*?)```'
         matches = _re.findall(pattern, response, _re.DOTALL)
         return [(self._sanitize_path(path), content.strip()) for path, content in matches]
     
