@@ -12,10 +12,77 @@ import re
 from typing import List
 
 # Fenced shell blocks: ```shell / ```bash / ```sh / ```cmd / ```powershell
+# Captures the fence language too — used to decide whether a block should
+# run as a single script rather than being split line-by-line (see
+# split_shell_block below).
 SHELL_BLOCK_RE = re.compile(
-    r'```(?:shell|bash|sh|cmd|powershell|ps1)\n(.*?)```',
+    r'```(?P<lang>shell|bash|sh|cmd|powershell|ps1)\n(?P<content>.*?)```',
     re.DOTALL | re.IGNORECASE,
 )
+
+# PowerShell variable assignment ($x = ...) or control-flow keyword
+# (if/while/for/foreach/function/try/switch) at the start of a line — signs
+# the block is a multi-statement script with cross-line state (variables,
+# loop bodies), not a sequence of independent one-liners. Seen live:
+# logs/api-20260819-201238.log — a block assigning $root/$log/$err and
+# calling Start-Process, split naively into per-line "commands", each
+# failing with WinError 2 (a bare `$root = "..."` line isn't an executable).
+_PS_SCRIPT_HINT_RE = re.compile(
+    r'^\s*(?:\$\w+\s*=|(?:if|while|for|foreach|function|try|switch)\s*[\s(])',
+    re.MULTILINE | re.IGNORECASE,
+)
+
+
+def is_powershell_script(language: str, content: str) -> bool:
+    """True when a fenced block is a multi-statement PowerShell script.
+
+    Such a block has cross-line state (variable assignments read by later
+    lines, loop/conditional bodies) and must run as a single script via
+    ``powershell -File``, not be split into independent per-line commands.
+    """
+    return bool(
+        language.lower() in ("powershell", "ps1")
+        or _PS_SCRIPT_HINT_RE.search(content.strip())
+    )
+
+
+def split_shell_block(content: str) -> list[str]:
+    """Split a non-script fenced block into independent one-line commands.
+
+    Quote-aware: merges lines while a single/double quote opened on an
+    earlier line is still unclosed, so a multi-line quoted argument (e.g.
+    ``python -c "\\n...\\n"`` — seen live splitting a heredoc-style call
+    into broken per-line fragments, each failing with WinError 2) stays one
+    command instead of being torn apart at every newline.
+
+    Callers should route blocks where :func:`is_powershell_script` is True
+    through a temp ``.ps1`` file instead of this function.
+    """
+    stripped = content.strip()
+    if not stripped:
+        return []
+
+    commands: list[str] = []
+    buffer: list[str] = []
+    quote: str | None = None
+    for line in stripped.splitlines():
+        buffer.append(line)
+        for ch in line:
+            if quote:
+                if ch == quote:
+                    quote = None
+            elif ch in ("'", '"'):
+                quote = ch
+        if quote is None:
+            merged = "\n".join(buffer).strip()
+            if merged and not merged.startswith("#"):
+                commands.append(merged)
+            buffer = []
+    if buffer:
+        merged = "\n".join(buffer).strip()
+        if merged:
+            commands.append(merged)
+    return commands
 
 # Standalone inline backtick commands on their own line, prefixed with a known
 # CLI tool.  This catches lines like:  `npm run start`  or  `python app.py`

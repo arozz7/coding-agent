@@ -73,6 +73,63 @@ class TestArchitectRole:
 
 class TestDeveloperRole:
     @pytest.mark.asyncio
+    async def test_run_shell_blocks_routes_powershell_script_through_temp_file(self):
+        # Regression: logs/api-20260819-201238.log — a PowerShell block
+        # assigning $root/$log/$err and calling Start-Process was split
+        # naively by newline into per-line "commands", each failing with
+        # WinError 2. Such a block must be written to a temp .ps1 and
+        # invoked as one powershell -File call instead.
+        from agent.agents.developer_agent import DeveloperRole
+
+        role = DeveloperRole()
+        response = (
+            "```shell\n"
+            '$root = "J:\\Projects\\agent-workspace\\payment-tracker"\n'
+            '$log  = "$root\\tauri-launch.log"\n'
+            'Start-Process -FilePath "cargo" -ArgumentList "run"\n'
+            "```\n"
+        )
+
+        tool_executor = Mock()
+        tool_executor.execute = AsyncMock(return_value="ok")
+
+        all_outputs, failed_outputs = await role._run_shell_blocks(response, tool_executor)
+
+        calls = tool_executor.execute.call_args_list
+        write_calls = [c for c in calls if c.args[0] == "file_write"]
+        shell_calls = [c for c in calls if c.args[0] == "shell"]
+
+        assert len(write_calls) == 1
+        assert write_calls[0].args[1]["path"].endswith(".ps1")
+        assert "Start-Process" in write_calls[0].args[1]["content"]
+
+        assert len(shell_calls) == 1
+        shell_cmd = shell_calls[0].args[1]["command"]
+        assert shell_cmd.startswith("powershell -NoProfile -ExecutionPolicy Bypass -File ")
+        # No quotes around the path — shell_tool.py resolves this command via
+        # shlex.split(posix=False) + subprocess.Popen(list, shell=False),
+        # which passes argv literally with no shell to strip quote chars.
+        assert '"' not in shell_cmd
+        assert failed_outputs == []
+
+    @pytest.mark.asyncio
+    async def test_run_shell_blocks_plain_commands_still_split_per_line(self):
+        from agent.agents.developer_agent import DeveloperRole
+
+        role = DeveloperRole()
+        response = "```shell\nnpm install\nnpm run build\n```\n"
+
+        tool_executor = Mock()
+        tool_executor.execute = AsyncMock(return_value="ok")
+
+        await role._run_shell_blocks(response, tool_executor)
+
+        shell_cmds = [
+            c.args[1]["command"] for c in tool_executor.execute.call_args_list if c.args[0] == "shell"
+        ]
+        assert shell_cmds == ["npm install", "npm run build"]
+
+    @pytest.mark.asyncio
     async def test_developer_execute(self):
         from agent.agents.developer_agent import DeveloperRole
         

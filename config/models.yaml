@@ -7,7 +7,14 @@ models:
     type: local
     provider: turboquant  # TQL auto-switches models; name must match TQL [[models]] registry or models_dir file stem
     endpoint: ${TURBOQUANT_URL:-http://127.0.0.1:7432}
-    context_window: 262144
+    # TurboQuantLoader's config.toml sets context_size = 131072 (halved from
+    # 262144 for VRAM headroom) AND --parallel 2, so llama-server splits that
+    # across 2 slots — the real per-request ceiling is 131072 / 2 = 65536.
+    # 262144 here was stale and let context_builder's budgeting (which reads
+    # this field directly) size prompts up to 4x too large, causing
+    # "exceeds the available context size (65536 tokens)" failures under
+    # concurrent requests (logs/api-20260819-201238.log, task_num 7).
+    context_window: 65536
     is_coding_optimized: true
     recommended_for: [coding, code_review, test_generation, planning, research]
     rate_limit_rpm: 60
@@ -16,7 +23,14 @@ models:
     type: local
     provider: turboquant  # TQL auto-switches models; name must match TQL [[models]] registry or models_dir file stem
     endpoint: ${TURBOQUANT_URL:-http://127.0.0.1:7432}
-    context_window: 262144
+    # TurboQuantLoader's config.toml sets context_size = 131072 (halved from
+    # 262144 for VRAM headroom) AND --parallel 2, so llama-server splits that
+    # across 2 slots — the real per-request ceiling is 131072 / 2 = 65536.
+    # 262144 here was stale and let context_builder's budgeting (which reads
+    # this field directly) size prompts up to 4x too large, causing
+    # "exceeds the available context size (65536 tokens)" failures under
+    # concurrent requests (logs/api-20260819-201238.log, task_num 7).
+    context_window: 65536
     is_coding_optimized: true
     recommended_for: [coding, code_review, test_generation, planning, research]
     rate_limit_rpm: 60

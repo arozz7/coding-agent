@@ -1,6 +1,7 @@
 from typing import Dict, Any
 import os
 import re
+import uuid
 from agent.agents.base_agent import AgentRole
 from agent.agents.fix_loop import is_readonly_probe as _is_readonly_probe, run_fix_loop
 from agent.agents.output_blocks import (
@@ -12,6 +13,8 @@ from agent.agents.output_blocks import (
     extract_file_appends as _extract_file_appends,
     execute_append as _execute_append,
     extract_file_edits as _extract_file_edits,
+    is_powershell_script as _is_powershell_script,
+    split_shell_block as _split_shell_block,
 )
 
 # Screenshot is triggered only when the task explicitly requests a browser capture.
@@ -136,10 +139,27 @@ Code quality rules (apply to all code you write):
         # Collect commands: fenced blocks first, then standalone inline backticks
         commands: list[str] = []
         for block in _SHELL_BLOCK_RE.finditer(response):
-            for line in block.group(1).strip().splitlines():
-                cmd = line.strip()
-                if cmd and not cmd.startswith("#"):
-                    commands.append(cmd)
+            language = block.group("lang") or ""
+            block_content = block.group("content")
+            if _is_powershell_script(language, block_content):
+                # Multi-statement script (variable assignments read by later
+                # lines, loop/conditional bodies) — must run as one unit via
+                # a real PowerShell process, not be split into per-line
+                # "commands" that each fail as an unrecognized executable.
+                script_path = f".agent-tmp/ps-script-{uuid.uuid4().hex[:8]}.ps1"
+                await tool_executor.execute(
+                    "file_write", {"path": script_path, "content": block_content.strip()}
+                )
+                # No quotes around script_path: shell_tool.py resolves this
+                # via shlex.split(cmd, posix=False) + subprocess.Popen(list,
+                # shell=False), which passes argv tokens to the executable
+                # literally with no shell to strip quote characters — a
+                # quoted path here would reach `-File` with the quote marks
+                # baked into the argument. The relative path has no spaces
+                # (workspace-relative), so it's unambiguous unquoted.
+                commands.append(f"powershell -NoProfile -ExecutionPolicy Bypass -File {script_path}")
+            else:
+                commands.extend(_split_shell_block(block_content))
 
         for match in _INLINE_CMD_RE.finditer(response):
             cmd = match.group(1).strip()
