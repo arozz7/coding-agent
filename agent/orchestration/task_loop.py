@@ -253,6 +253,13 @@ class TaskLoop:
                                 _final_verifier_result.score, _prev_verifier_score,
                                 _plateau_count, _zero_score_count, task_summaries,
                             )
+                            self.logger.info(
+                                "verifier_score_delta",
+                                round=_verifier_rounds + 1,
+                                prev_score=_prev_verifier_score,
+                                new_score=_final_verifier_result.score,
+                                regressed=_final_verifier_result.score < _prev_verifier_score,
+                            )
                             # Always advance the baseline, even when stopping —
                             # otherwise a later round compares against a stale
                             # score and mis-detects stagnation itself.
@@ -337,6 +344,13 @@ class TaskLoop:
                             files_created=all_files,
                             files_changed_this_round=_new_files,
                             prev_score=_prev_verifier_score,
+                        )
+                        self.logger.info(
+                            "verifier_score_delta",
+                            round=_verifier_rounds,
+                            prev_score=_prev_verifier_score,
+                            new_score=vresult.score,
+                            regressed=vresult.score < _prev_verifier_score,
                         )
                         _prev_verifier_score = vresult.score
                         ctx.add_tasks(fix_specs)

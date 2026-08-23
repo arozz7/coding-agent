@@ -3,8 +3,9 @@
 If any commands failed after the initial write, this loop asks the LLM to
 fix the code and re-runs the original failing command explicitly after
 each fix (regardless of what shell blocks the LLM's fix response includes),
-up to MAX_FIX_ITERATIONS times. Detects cycling (identical error text on
-consecutive attempts) and aborts early rather than burning the whole
+up to MAX_FIX_ITERATIONS times. Detects cycling (the same file set touched on
+consecutive attempts without resolving the failure), nudging the model to
+change approach before aborting early rather than burning the whole
 iteration budget.
 
 All dependencies (model_router, tool_executor, logger, system_prompt, the
@@ -14,7 +15,6 @@ calls it once real_failures/tool_executor are confirmed present.
 """
 from __future__ import annotations
 
-import hashlib
 import os
 import re
 from typing import Awaitable, Callable, List, Optional
@@ -29,10 +29,16 @@ from agent.agents.output_blocks import (
 
 MAX_FIX_ITERATIONS = int(os.getenv("MAX_FIX_ITERATIONS", "50"))
 
-# Same rationale as developer_agent._DEVELOPER_TIMEOUT_SECS — fix-loop
-# generations write full replacements on top of a long thinking trace and
-# can legitimately run past the model_router default of 600s.
-_DEVELOPER_TIMEOUT_SECS = 1500.0
+# Cycling detection is keyed on the set of files touched per attempt (the
+# model's action), not on error text — error output can shift trivially
+# (a line number, a reordered symbol) while the model repeats the same
+# broken fix, which would evade a text-hash check. At _CYCLE_NUDGE_STREAK
+# consecutive attempts touching the identical file set, the model gets an
+# advisory nudge instead of an immediate abort; only at _CYCLE_ABORT_STREAK
+# does the loop give up.
+_CYCLE_NUDGE_STREAK = int(os.getenv("FIX_LOOP_CYCLE_NUDGE_STREAK", "1"))
+_CYCLE_ABORT_STREAK = int(os.getenv("FIX_LOOP_CYCLE_ABORT_STREAK", "3"))
+
 
 _MISSING_TOOL_NAMES = (
     "jest", "webpack", "ts-node", "tsc", "mocha", "vitest", "eslint", "prettier",
@@ -125,9 +131,10 @@ async def run_fix_loop(
     fix_attempt_blocks: int = 0
     # Ensure npm install runs at most once per fix session.
     _ran_npm_install: bool = False
-    # Detect cycling: if the same error hash appears twice in a row the
-    # model is stuck — abort rather than burning all iterations.
-    _prev_error_hash: str = ""
+    # Detect cycling: consecutive attempts that touch the identical set of
+    # files without resolving the failure mean the model is stuck.
+    _prev_action_signature: frozenset = frozenset()
+    _repeat_streak: int = 0
 
     for _attempt in range(MAX_FIX_ITERATIONS):
         if on_phase:
@@ -142,13 +149,26 @@ async def run_fix_loop(
         if len(raw_errors) > _MAX_ERROR_CHARS:
             raw_errors = "…(truncated)…\n" + raw_errors[-_MAX_ERROR_CHARS:]
 
-        # Break early if the same error text repeats — the model is cycling.
-        _cur_hash = hashlib.md5(raw_errors.encode()).hexdigest()
-        if _attempt > 0 and _cur_hash == _prev_error_hash:
-            response += "\n\n*(Fix loop aborted: identical error on consecutive attempts — model is cycling)*"
-            logger.info("fix_loop_cycling_detected", attempt=_attempt + 1)
+        # Escalate on repeated identical actions rather than aborting on the
+        # first repeat: give the model a chance to self-correct before
+        # burning the rest of the iteration budget.
+        if _repeat_streak >= _CYCLE_ABORT_STREAK:
+            _repeated_files = ", ".join(sorted(_prev_action_signature))
+            response += (
+                f"\n\n*(Fix loop aborted: {_repeated_files} modified "
+                f"{_repeat_streak + 1} times in a row without resolving the failure — "
+                "model is cycling)*"
+            )
+            logger.info("fix_loop_cycling_detected", attempt=_attempt + 1, streak=_repeat_streak)
             break
-        _prev_error_hash = _cur_hash
+        if _repeat_streak >= _CYCLE_NUDGE_STREAK:
+            _repeated_files = ", ".join(sorted(_prev_action_signature))
+            raw_errors += (
+                f"\n\n[Fix loop note: you have modified {_repeated_files} "
+                f"{_repeat_streak + 1} times in a row without resolving this failure. "
+                "Re-read the latest error carefully and try a different fix — "
+                "do not repeat the last change.]"
+            )
 
         history_note = (
             f"\nFiles already modified in prior fix attempts: {', '.join(files_fixed_history)}\n"
@@ -230,7 +250,7 @@ async def run_fix_loop(
         )
         model = model_router.get_model("coding")
         fix_response = await model_router.generate(
-            fix_prompt, model, system_prompt=system_prompt, timeout=_DEVELOPER_TIMEOUT_SECS
+            fix_prompt, model, system_prompt=system_prompt
         )
 
         iteration_files: list[str] = []
@@ -291,6 +311,13 @@ async def run_fix_loop(
 
         files_fixed_history.extend(f for f in iteration_files if f not in files_fixed_history)
         made_progress = len(iteration_files) > 0
+
+        _cur_signature = frozenset(iteration_files)
+        if _cur_signature and _cur_signature == _prev_action_signature:
+            _repeat_streak += 1
+        else:
+            _repeat_streak = 0
+        _prev_action_signature = _cur_signature
 
         # If package.json was just edited, run npm install before verifying
         # so newly added devDependencies are actually available.

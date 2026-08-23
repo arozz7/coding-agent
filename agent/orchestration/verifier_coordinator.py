@@ -343,6 +343,7 @@ class VerifierCoordinator:
                 f"{shot_block}"
             ),
             "agent_type": "develop",
+            "phase": phase,
         }
 
     # ------------------------------------------------------------------

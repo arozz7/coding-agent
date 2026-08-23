@@ -70,7 +70,9 @@ class VerifierAgent:
         # Call 1: Coverage (0-5) + Depth (0-5)
         system1 = (
             "You are a strict research quality reviewer. Be critical and precise. "
-            "Identify what is MISSING or INCOMPLETE, not what is present."
+            "Identify what is MISSING or INCOMPLETE, not what is present. "
+            "When evidence is ambiguous or incomplete, fail the criterion rather than "
+            "assuming it passed."
         )
         prompt1 = (
             f"Original objective:\n{objective}\n\n"
@@ -98,7 +100,11 @@ class VerifierAgent:
             for kw in ("file", "markdown", "report", "document", "write", "save", "output")
         )
         if files_requested:
-            system2 = "You are a strict output format checker. Answer only yes or no."
+            system2 = (
+                "You are a strict output format checker. Answer only yes or no. "
+                "When evidence is ambiguous or incomplete, answer no rather than "
+                "assuming it passed."
+            )
             prompt2 = (
                 f"Objective: {objective}\n\n"
                 f"Files created: {files_created if files_created else ['(none)']}\n\n"
@@ -161,7 +167,9 @@ class VerifierAgent:
 
         system = (
             "You are a strict code reviewer. Focus on correctness and completeness. "
-            "Do not accept partial implementations as sufficient."
+            "Do not accept partial implementations as sufficient. "
+            "When evidence is ambiguous or incomplete, fail the criterion rather than "
+            "assuming it passed."
         )
 
         if self._is_static_deliverable(files_created, test_output):
@@ -399,7 +407,7 @@ class VerifierAgent:
 
     async def _call_llm(self, system: str, prompt: str) -> dict:
         try:
-            model = self.model_router.get_model("coding")
+            model = self.model_router.get_model("verify")
             response = await self.model_router.generate(
                 prompt,
                 model,

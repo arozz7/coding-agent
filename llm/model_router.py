@@ -12,6 +12,7 @@ from .evaluator_selector import EvaluatorSelectorMixin
 from .ollama_client import OllamaClient, ModelNotReadyError
 from .cloud_api_client import CloudAPIClient, _OpenRouterRateLimitError, _OpenRouterPaymentRequiredError
 from .cost_tracker import CostTracker
+from .usage import UsageInfo
 from .rate_limiter import RateLimiter, RateLimitExceeded
 from .health import HealthChecker
 from .circuit_breaker import CircuitBreakerOpenError
@@ -141,8 +142,12 @@ class ModelRouter(EvaluatorSelectorMixin):
         if default_name and default_name in self.config_by_name:
             return self.config_by_name[default_name]
 
-        # 3. First coding-optimized model for coding purposes
-        if purpose == "coding":
+        # 3. First coding-optimized model for coding purposes. "verify" shares
+        # this fallback so the verifier gets a sensible default even with no
+        # verify_model override in models.yaml, but resolves independently
+        # once one is set — the routing is a real seam, not an accident of
+        # both purposes asking for "coding".
+        if purpose in ("coding", "verify"):
             for config in self.configs:
                 if config.is_coding_optimized:
                     return config
@@ -285,7 +290,7 @@ class ModelRouter(EvaluatorSelectorMixin):
         max_retries: int = 3,
         _is_fallback: bool = False,
         _fallback_chain: Optional[list] = None,
-        timeout: float = 600.0,
+        timeout: Optional[float] = None,
         enable_thinking: bool | None = None,
         system_prompt: Optional[str] = None,
         messages: Optional[List[dict]] = None,
@@ -311,6 +316,11 @@ class ModelRouter(EvaluatorSelectorMixin):
         effective_thinking = enable_thinking if enable_thinking is not None else config.enable_thinking
         # Resolve effective max_tokens the same way.
         effective_max_tokens = max_tokens if max_tokens is not None else config.max_tokens
+        # Resolve effective timeout: an explicit call-site override wins,
+        # otherwise fall back to the model's own declared budget rather than
+        # a flat constant — generation speed and max_tokens/thinking budget
+        # are properties of the model, not of whichever role is calling it.
+        effective_timeout = timeout if timeout is not None else config.timeout_secs
 
         # Track how many times we've tried to load / wait for this model.
         # Governed by max_load_attempts (local_runtime), not by max_retries.
@@ -341,19 +351,28 @@ class ModelRouter(EvaluatorSelectorMixin):
                     # was processed last.  Setting it here ensures each model (and
                     # every fallback hop) uses its own URL.
                     self._configure_ollama_endpoint(config)
+                    # Caller-owned dict, not a shared attribute on OllamaClient/
+                    # ModelRouter — sub-agents run concurrent generate() calls,
+                    # and a shared mutable last_usage would race between them.
+                    usage_out: dict = {}
                     result = await self.ollama.generate(
                         prompt,
                         config.name,
                         system_prompt=system_prompt,
                         enable_thinking=effective_thinking,
-                        timeout=timeout,
+                        timeout=effective_timeout,
                         messages=messages,
                         max_tokens=effective_max_tokens,
+                        usage_out=usage_out,
                     )
                 else:
-                    result = await self.cloud.generate(prompt, config, system_prompt=system_prompt)
+                    usage_out = {}
+                    result = await self.cloud.generate(
+                        prompt, config, system_prompt=system_prompt, usage_out=usage_out
+                    )
 
-                self.cost_tracker.track_usage(config, prompt, result)
+                usage = UsageInfo(**usage_out) if usage_out else None
+                self.cost_tracker.track_usage(config, prompt, result, usage=usage)
                 self.health_checker.record_success(config.name)
                 return result
 
@@ -410,7 +429,7 @@ class ModelRouter(EvaluatorSelectorMixin):
                     reason="load_timeout" if config.provider in ("lmstudio", "turboquant") else "reload_exhausted",
                     chain=_fallback_chain,
                     max_retries=max_retries,
-                    timeout=timeout,
+                    timeout=effective_timeout,
                     enable_thinking=enable_thinking,
                     max_tokens=max_tokens,
                     original_error=e,
@@ -437,7 +456,7 @@ class ModelRouter(EvaluatorSelectorMixin):
                         reason="circuit_open",
                         chain=_fallback_chain,
                         max_retries=max_retries,
-                        timeout=timeout,
+                        timeout=effective_timeout,
                         enable_thinking=enable_thinking,
                         max_tokens=max_tokens,
                         original_error=None,
@@ -457,6 +476,12 @@ class ModelRouter(EvaluatorSelectorMixin):
                     model=config.name,
                     blacklisted_for_hours=self._EVALUATOR_BLACKLIST_TTL / 3600,
                 )
+                self.logger.info(
+                    "evaluator_blacklist_changed",
+                    reason="payment_required",
+                    models=[config.name],
+                    remaining_blacklisted=len(self._evaluator_blacklist),
+                )
                 if not _is_fallback:
                     return await self._run_fallback_chain(
                         prompt=prompt,
@@ -464,7 +489,7 @@ class ModelRouter(EvaluatorSelectorMixin):
                         reason="payment_required",
                         chain=_fallback_chain,
                         max_retries=max_retries,
-                        timeout=timeout,
+                        timeout=effective_timeout,
                         enable_thinking=enable_thinking,
                         max_tokens=max_tokens,
                         original_error=None,
@@ -487,6 +512,13 @@ class ModelRouter(EvaluatorSelectorMixin):
                 blacklist_ttl = max(e.retry_after, 120)
                 self._evaluator_blacklist[config.name] = time.monotonic() - (self._EVALUATOR_BLACKLIST_TTL - blacklist_ttl)
                 self._evaluator_cache = None
+                self.logger.info(
+                    "evaluator_blacklist_changed",
+                    reason="rate_limited",
+                    models=[config.name],
+                    blacklist_ttl_secs=blacklist_ttl,
+                    remaining_blacklisted=len(self._evaluator_blacklist),
+                )
                 if not _is_fallback:
                     return await self._run_fallback_chain(
                         prompt=prompt,
@@ -494,7 +526,7 @@ class ModelRouter(EvaluatorSelectorMixin):
                         reason="rate_limited",
                         chain=_fallback_chain,
                         max_retries=max_retries,
-                        timeout=timeout,
+                        timeout=effective_timeout,
                         enable_thinking=enable_thinking,
                         max_tokens=max_tokens,
                         original_error=e,
@@ -517,7 +549,7 @@ class ModelRouter(EvaluatorSelectorMixin):
                         reason="rate_limited",
                         chain=_fallback_chain,
                         max_retries=max_retries,
-                        timeout=timeout,
+                        timeout=effective_timeout,
                         enable_thinking=enable_thinking,
                         max_tokens=max_tokens,
                         original_error=e,

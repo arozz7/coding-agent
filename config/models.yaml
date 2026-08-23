@@ -40,7 +40,12 @@ models:
     # 5 straight developer-role failures with reasoning_content populated and
     # content empty). Raised to give thinking + answer both room.
     max_tokens: 24576
-    
+    # Thinking + a 24576-token response budget legitimately runs past the
+    # model_router default of 600s (see logs/api-20260819-201238.log —
+    # developer-role and tester-role generate() calls both hit
+    # ollama_hard_timeout at 600s before this was raised per-role).
+    timeout_secs: 1500
+
   - name: qwen3.6-27b
     type: local
     provider: lmstudio   # lmstudio | ollama | llama_cpp
@@ -147,6 +152,9 @@ defaults:
   coding_model: Qwen3.8-27B-Q4_K_S
   planning_model: Qwen3.8-27B-Q4_K_S
   fallback_model: openai/gpt-oss-120b:free
+  # verify_model: <model-name>  # uncomment to route verification (verifier_agent)
+  #   to a different/stronger model than development — otherwise it defaults
+  #   to the same coding-optimized model as coding_model.
 
   # Local model runtime behaviour.
   # single_model_only: false — TurboQuantLoader manages its own lifecycle and

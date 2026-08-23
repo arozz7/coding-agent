@@ -114,6 +114,17 @@ class EvaluatorSelectorMixin:
 
             _now = time.monotonic()
             # Expire stale blacklist entries before filtering.
+            _expired = [
+                k for k, v in self._evaluator_blacklist.items()
+                if _now - v >= self._EVALUATOR_BLACKLIST_TTL
+            ]
+            if _expired:
+                self.logger.info(
+                    "evaluator_blacklist_changed",
+                    reason="ttl_expired",
+                    models=_expired,
+                    remaining_blacklisted=len(self._evaluator_blacklist) - len(_expired),
+                )
             self._evaluator_blacklist = {
                 k: v for k, v in self._evaluator_blacklist.items()
                 if _now - v < self._EVALUATOR_BLACKLIST_TTL

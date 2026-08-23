@@ -212,11 +212,15 @@ class TestTesterRole:
         assert matches == [("tests/test_login.py", "def test_login():\n    pass")]
 
     @pytest.mark.asyncio
-    async def test_tester_execute_passes_extended_timeout(self):
-        # Regression: base_agent:tester hit the model_router default 600s
-        # timeout in logs/api-20260819-201238.log while developer_agent's
-        # calls (already raised to 1500s) did not.
-        from agent.agents.tester_agent import TesterRole, _TESTER_TIMEOUT_SECS
+    async def test_tester_execute_does_not_override_model_router_timeout(self):
+        # Regression guard, updated: base_agent:tester used to hit the
+        # model_router default 600s timeout (logs/api-20260819-201238.log)
+        # while developer_agent's calls (already raised to 1500s) did not.
+        # The fix moved the timeout budget onto ModelConfig.timeout_secs
+        # (see tests/unit/test_model_router_timeout.py), so tester_agent
+        # should no longer pass its own timeout override — it must fall
+        # through to the model's declared budget like every other role.
+        from agent.agents.tester_agent import TesterRole
 
         role = TesterRole()
         mock_router = Mock()
@@ -233,7 +237,7 @@ class TestTesterRole:
         await role.execute(context)
 
         mock_router.generate.assert_called_once()
-        assert mock_router.generate.call_args.kwargs["timeout"] == _TESTER_TIMEOUT_SECS
+        assert "timeout" not in mock_router.generate.call_args.kwargs
 
     @pytest.mark.asyncio
     async def test_tester_execute_python(self):

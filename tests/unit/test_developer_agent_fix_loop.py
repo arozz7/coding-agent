@@ -102,8 +102,10 @@ class TestFixLoopSuccess:
 
 class TestFixLoopCyclingDetection:
     @pytest.mark.asyncio
-    async def test_identical_error_twice_aborts_without_exhausting_iterations(self):
-        """Same failing output every time -> loop detects cycling and stops early."""
+    async def test_repeated_same_file_fix_aborts_without_exhausting_iterations(self):
+        """Same file re-touched every attempt without resolving the failure ->
+        loop nudges the model first, then aborts once the repeat streak hits
+        the abort threshold — bounded well short of MAX_FIX_ITERATIONS."""
 
         def shell_fn(cmd):
             if cmd == "npm test":
@@ -113,17 +115,34 @@ class TestFixLoopCyclingDetection:
         tool_executor = _FakeToolExecutor(
             shell_fn, file_read_map={"src/app.js": "console.log('broken');\n"}
         )
+        # 1 initial write + 4 fix attempts, all touching the same file — the
+        # 4th attempt pushes the repeat streak to the abort threshold (3),
+        # so the loop aborts before requesting a 5th fix.
         router = _FakeModelRouter([
             "FILE: app.js\n```js\nconsole.log('v1')\n```\n\n```shell\nnpm test\n```",
-            "REPLACE: src/app.js 1-1\n<<<\nconsole.log('still broken');\n>>>",
+            "REPLACE: src/app.js 1-1\n<<<\nconsole.log('fix attempt 1');\n>>>",
+            "REPLACE: src/app.js 1-1\n<<<\nconsole.log('fix attempt 2');\n>>>",
+            "REPLACE: src/app.js 1-1\n<<<\nconsole.log('fix attempt 3');\n>>>",
+            "REPLACE: src/app.js 1-1\n<<<\nconsole.log('fix attempt 4');\n>>>",
         ])
         role = DeveloperRole()
         result = await role.execute(_make_context(router, tool_executor))
 
         assert "cycling" in result["response"].lower()
-        # Bounded: only ran the initial shell block + one fix-verify cycle,
-        # nowhere near MAX_FIX_ITERATIONS (default 50).
-        assert tool_executor.shell_calls.count("npm test") == 2
+        assert "src/app.js" in result["response"]
+        # Bounded: initial verify + 4 fix-verify cycles, nowhere near
+        # MAX_FIX_ITERATIONS (default 50).
+        assert tool_executor.shell_calls.count("npm test") == 5
+        # router.calls[0] is the initial write prompt (outside the fix loop).
+        # router.calls[1]/[2] are fix-loop attempts 0/1 (streak still 0 at
+        # generation time for both — the repeat is only detected once attempt
+        # 1's file-set is compared against attempt 0's afterward). The 3rd
+        # fix prompt, router.calls[3], is generated with streak=1 — below
+        # the abort threshold — so it must carry an advisory nudge rather
+        # than nothing, giving the model a chance to self-correct before
+        # the eventual abort.
+        assert "modified" in router.calls[3].lower()
+        assert "in a row" in router.calls[3].lower()
 
 
 class TestFixLoopNoFileContext:

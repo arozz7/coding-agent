@@ -161,6 +161,7 @@ class _FixCycleRunner:
             criterion=target.criterion[:60],
             attempt=criterion_attempts[target.criterion],
             fix_num=criterion_fix_count + 1,
+            phase=fix_spec.get("phase"),
         )
         return None  # fix injected — caller increments and continues
 
@@ -269,5 +270,6 @@ class _FixCycleRunner:
             criterion=acc_target.criterion[:60],
             fix_num=acceptance_fix_count,
             attempt=acc_criterion_attempts[acc_target.criterion],
+            phase=acc_fix_spec.get("phase"),
         )
         return False, acceptance_fix_count, last_screenshot, screenshot_path
