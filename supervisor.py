@@ -234,11 +234,14 @@ def _start_bot() -> subprocess.Popen:
 
     cmd = [_BOT_PYTHON, "-m", "api.discord_bot"]
     print(f"[supervisor] Starting bot:  {' '.join(cmd)}  → {_bot_log.name}")
+    bot_env = os.environ.copy()
+    bot_env["PYTHONUNBUFFERED"] = "1"
     return subprocess.Popen(
         cmd,
         cwd=str(_ROOT),
         stdout=_bot_log,
         stderr=subprocess.STDOUT,
+        env=bot_env,
         creationflags=subprocess.CREATE_NEW_PROCESS_GROUP,
     )
 

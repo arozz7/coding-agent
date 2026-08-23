@@ -6,11 +6,14 @@ import time
 from typing import Optional
 
 import discord
+import structlog
 from discord.ext import commands
 
 from api.discord.bot_instance import bot
 from api.discord.client import POLL_INTERVAL, _backoff
 from api.discord.helpers import _chunk, _truncate, _send_screenshot
+
+logger = structlog.get_logger()
 
 _PHASE_LABELS: dict[str, str] = {
     "queued":          "Queued",
@@ -80,22 +83,25 @@ async def _resolve_last_job_id(
 
 
 async def _safe_edit(msg: discord.Message, content: str) -> None:
-    """Edit a Discord message, swallowing transient Discord server errors."""
+    """Edit a Discord message, swallowing any Discord API failure.
+
+    A status edit failing (message deleted, missing perms, rate limit,
+    server error, ...) must never kill the _poll_job loop — the job itself
+    keeps running regardless, so losing the ability to *report* progress is
+    not a reason to also stop *tracking* it.
+    """
     try:
         await msg.edit(content=content)
-    except discord.errors.DiscordServerError:
-        pass
     except discord.errors.HTTPException as exc:
-        if exc.status >= 500:
-            pass
-        else:
-            raise
+        logger.warning("discord_status_edit_failed", error=str(exc), status=getattr(exc, "status", None))
+    except Exception as exc:
+        logger.warning("discord_status_edit_failed", error=str(exc), error_type=type(exc).__name__)
 
 
 def _on_poll_done(fut: asyncio.Future) -> None:
     """Log any exception that escaped _poll_job so it isn't silently dropped."""
     if not fut.cancelled() and (exc := fut.exception()):
-        print(f"[bot] _poll_job unhandled exception: {type(exc).__name__}: {exc}")
+        logger.error("poll_job_unhandled_exception", error_type=type(exc).__name__, error=str(exc))
 
 
 async def _poll_job(ctx: commands.Context, status_msg: discord.Message, job_id: str):
