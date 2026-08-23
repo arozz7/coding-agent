@@ -48,6 +48,27 @@ class TestDetectStartCommand:
         cmd = detect_start_command(tmp_path)
         assert "python" in cmd.lower()
 
+    def test_static_html_with_no_known_entry_gets_static_server(self, tmp_path):
+        """A bare index.html (no package.json/server) must not fall through to
+        None — it's exactly the "single-file game, no build step" deliverable
+        shape this agent produces, and it has to be launchable to be
+        acceptance-tested at all."""
+        (tmp_path / "index.html").write_text("<!DOCTYPE html><html></html>")
+        cmd = detect_start_command(tmp_path)
+        assert cmd is not None
+        assert "http.server" in cmd
+
+    def test_known_entry_point_preferred_over_static_html(self, tmp_path):
+        (tmp_path / "index.html").write_text("<html></html>")
+        (tmp_path / "app.py").write_text("# flask app")
+        cmd = detect_start_command(tmp_path)
+        assert "http.server" not in cmd
+
+    def test_no_html_and_no_known_entry_still_returns_none(self, tmp_path):
+        (tmp_path / "README.md").write_text("# not runnable")
+        cmd = detect_start_command(tmp_path)
+        assert cmd is None
+
 
 class TestDetectPort:
 
@@ -64,6 +85,10 @@ class TestDetectPort:
     def test_returns_none_when_unknown(self, tmp_path):
         port = detect_port(tmp_path, start_cmd="./my_binary")
         assert port is None
+
+    def test_recovers_port_from_static_server_command(self, tmp_path):
+        port = detect_port(tmp_path, start_cmd="python -m http.server 54321")
+        assert port == 54321
 
     def test_reads_tauri_v2_dev_url(self, tmp_path):
         (tmp_path / "src-tauri").mkdir()
@@ -128,3 +153,22 @@ class TestAppProbe:
         handle = AppHandle(process=None, port=None, start_command="python app.py")
         shot = await probe.screenshot(handle)
         assert shot is None
+
+    @pytest.mark.asyncio
+    async def test_launch_serves_static_html_workspace(self, tmp_path):
+        """A static single-file deliverable must actually launch via the
+        generic static-server fallback, not return None the way it did
+        before this fix (which caused acceptance testing to be silently
+        skipped for every single-file/no-build-step project)."""
+        (tmp_path / "index.html").write_text("<html></html>")
+        probe = AppProbe(tmp_path, shell_fn=AsyncMock())
+
+        mock_proc = MagicMock()
+        with patch("agent.orchestration.app_probe.subprocess.Popen", return_value=mock_proc) as mock_popen, \
+             patch.object(AppProbe, "_wait_ready", new=AsyncMock(return_value=True)):
+            handle = await probe.launch()
+
+        assert handle is not None
+        assert "http.server" in handle.start_command
+        assert handle.port is not None
+        mock_popen.assert_called_once()

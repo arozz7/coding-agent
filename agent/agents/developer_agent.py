@@ -15,6 +15,7 @@ from agent.agents.output_blocks import (
     extract_file_edits as _extract_file_edits,
     is_powershell_script as _is_powershell_script,
     split_shell_block as _split_shell_block,
+    looks_like_leaked_non_shell_content as _looks_like_leaked_non_shell_content,
 )
 
 # Screenshot is triggered only when the task explicitly requests a browser capture.
@@ -134,6 +135,16 @@ Code quality rules (apply to all code you write):
         for block in _SHELL_BLOCK_RE.finditer(response):
             language = block.group("lang") or ""
             block_content = block.group("content")
+            if _looks_like_leaked_non_shell_content(block_content):
+                # An unclosed fence let this "shell block" swallow another
+                # block format's content (or a stray code fence) instead of
+                # real commands — running its lines would just fail each one
+                # with "command not found". Skip it rather than execute it.
+                self.logger.warning(
+                    "shell_block_leaked_content_skipped",
+                    preview=block_content[:120],
+                )
+                continue
             if _is_powershell_script(language, block_content):
                 # Multi-statement script (variable assignments read by later
                 # lines, loop/conditional bodies) — must run as one unit via

@@ -16,6 +16,7 @@ import json
 import os
 import re
 import signal
+import socket
 import subprocess
 import time
 from dataclasses import dataclass, field
@@ -39,6 +40,43 @@ _ENTRY_CANDIDATES = [
     ("index.js",      "node index.js"),
     ("server.js",     "node server.js"),
 ]
+
+# Matches the port embedded in a static-server start command by _static_serve_command,
+# so detect_port() can recover it without a second free-port lookup.
+_STATIC_SERVER_PORT_RE = re.compile(r"http\.server\s+(\d+)")
+
+
+def _find_free_port() -> int:
+    """Return a currently-unused localhost port.
+
+    Small race window between release and actual bind (standard for this
+    pattern) — acceptable here since this is a single dev-time probe, not a
+    production listener.
+    """
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.bind(("127.0.0.1", 0))
+        return s.getsockname()[1]
+
+
+def _static_serve_command(workspace: Path) -> Optional[str]:
+    """Return a static-file-server command when the workspace has no
+    recognized app entry point but does have at least one HTML file to serve.
+
+    Deliberately generic — no per-framework special-casing. Any language or
+    build tool that ends up producing plain static HTML/CSS/JS with no
+    server of its own (a single-file game, a static site generator's output,
+    a no-build-step prototype) is covered by this one fallback, not by
+    growing the language-specific _ENTRY_CANDIDATES list.
+
+    Uses `file://` instead of this for screenshotting would silently break
+    the many browser features gated on a real origin (ES module imports,
+    fetch(), pointer lock in some browsers) — serving over http:// avoids
+    that whole class of false negative.
+    """
+    if not any(workspace.glob("*.html")):
+        return None
+    port = _find_free_port()
+    return f"python -m http.server {port}"
 
 # Port hints: patterns in start_cmd or source → default port
 _PORT_HINTS: list[tuple[str, int]] = [
@@ -98,17 +136,25 @@ class AppHandle:
 
 
 def detect_start_command(workspace: Path) -> Optional[str]:
-    """Return the best start command for the project, or None."""
+    """Return the best start command for the project, or None.
+
+    Falls back to a generic static-file server when nothing in
+    _ENTRY_CANDIDATES matches but the workspace has HTML to serve — see
+    _static_serve_command.
+    """
     if (workspace / "src-tauri").is_dir() and (workspace / "package.json").exists():
         return "npm run tauri dev"
     for filename, cmd in _ENTRY_CANDIDATES:
         if (workspace / filename).exists():
             return cmd
-    return None
+    return _static_serve_command(workspace)
 
 
 def detect_port(workspace: Path, start_cmd: str) -> Optional[int]:
     """Infer the HTTP port from the start command and source files."""
+    if static_port := _STATIC_SERVER_PORT_RE.search(start_cmd):
+        return int(static_port.group(1))
+
     tauri_port = _read_tauri_dev_port(workspace)
     if tauri_port:
         return tauri_port

@@ -13,6 +13,7 @@ from agent.agents.output_blocks import (
     extract_file_writes,
     is_powershell_script,
     split_shell_block,
+    looks_like_leaked_non_shell_content,
 )
 
 
@@ -103,3 +104,26 @@ def test_split_shell_block_keeps_multiline_quoted_argument_together():
 def test_split_shell_block_ignores_comment_lines():
     content = "# a comment\nnpm install\n"
     assert split_shell_block(content) == ["npm install"]
+
+
+def test_looks_like_leaked_non_shell_content_false_for_real_commands():
+    content = "npm install\nnpm run build\n"
+    assert looks_like_leaked_non_shell_content(content) is False
+
+
+def test_looks_like_leaked_non_shell_content_detects_replace_marker():
+    # Live failure mode: logs/api-20260822-210550.log 02:30:33-34 — an
+    # unclosed shell fence swallowed a REPLACE: block and bare JS statements,
+    # each then executed as a shell command and failing with WinError 2.
+    content = "REPLACE: index.html 109-112\n<<<\nupdateHud();\n>>>\n"
+    assert looks_like_leaked_non_shell_content(content) is True
+
+
+def test_looks_like_leaked_non_shell_content_detects_stray_fence():
+    content = "npm install\n```\nsome other block's content\n"
+    assert looks_like_leaked_non_shell_content(content) is True
+
+
+def test_looks_like_leaked_non_shell_content_detects_file_marker():
+    content = "FILE: other.py\n```python\nprint('leaked')\n"
+    assert looks_like_leaked_non_shell_content(content) is True

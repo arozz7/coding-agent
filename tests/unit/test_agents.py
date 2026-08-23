@@ -130,6 +130,35 @@ class TestDeveloperRole:
         assert shell_cmds == ["npm install", "npm run build"]
 
     @pytest.mark.asyncio
+    async def test_run_shell_blocks_skips_block_with_leaked_non_shell_content(self):
+        # Regression: logs/api-20260822-210550.log 02:30:33-34 — an unclosed
+        # ```shell fence let the non-greedy match swallow a REPLACE: block
+        # and bare JS statements, each executed as a shell command and
+        # failing with WinError 2. Such a block must be skipped, not run.
+        from agent.agents.developer_agent import DeveloperRole
+
+        role = DeveloperRole()
+        role.logger = Mock()
+        response = (
+            "```shell\n"
+            "REPLACE: index.html 109-112\n"
+            "<<<\n"
+            "updateHud();\n"
+            ">>>\n"
+            "```\n"
+        )
+
+        tool_executor = Mock()
+        tool_executor.execute = AsyncMock(return_value="ok")
+
+        all_outputs, failed_outputs = await role._run_shell_blocks(response, tool_executor)
+
+        shell_calls = [c for c in tool_executor.execute.call_args_list if c.args[0] == "shell"]
+        assert shell_calls == []
+        assert all_outputs == []
+        assert failed_outputs == []
+
+    @pytest.mark.asyncio
     async def test_developer_execute(self):
         from agent.agents.developer_agent import DeveloperRole
         

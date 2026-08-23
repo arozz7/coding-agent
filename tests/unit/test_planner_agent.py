@@ -1,4 +1,5 @@
 """Unit tests for PlannerAgent.plan_with_criteria() and PlanResult."""
+import json
 import pytest
 from unittest.mock import AsyncMock, MagicMock
 
@@ -38,6 +39,64 @@ class TestPlanResult:
     def test_default_empty_criteria(self):
         pr = PlanResult(tasks=[])
         assert pr.completion_criteria == []
+
+
+class TestStrategyHintCreation:
+    """Regression coverage for the fix that replaced the CREATION strategy's
+    single hardcoded web-specific (HTML/CSS/<script>) template — which forced
+    every non-trivial build into one file grown via repeated APPEND: — with a
+    language-agnostic, per-file-per-responsibility principle."""
+
+    def test_no_hardcoded_html_template(self):
+        from agent.agents.planner_agent import PlannerAgent
+
+        planner = PlannerAgent(MagicMock())
+        hint = planner._strategy_hint("develop")
+
+        assert "HTML skeleton, CSS, opening <script>" not in hint
+        assert "APPEND ONLY" not in hint
+
+    def test_mentions_multiple_languages(self):
+        from agent.agents.planner_agent import PlannerAgent
+
+        planner = PlannerAgent(MagicMock())
+        hint = planner._strategy_hint("develop")
+
+        # Concrete examples across languages, not just the web-only case —
+        # a weak local model needs something to pattern-match, but it must
+        # not overfit to one language the way the old prompt did.
+        assert "player.js" in hint
+        assert ".py" in hint
+        assert ".rs" in hint
+
+    def test_one_task_per_file_principle_stated(self):
+        from agent.agents.planner_agent import PlannerAgent
+
+        planner = PlannerAgent(MagicMock())
+        hint = planner._strategy_hint("develop")
+
+        assert "one" in hint.lower() and "per" in hint.lower()
+
+
+class TestMaxDevelopTasksCap:
+    @pytest.mark.asyncio
+    async def test_plan_truncates_at_raised_cap(self):
+        """The cap was raised from 6 to accommodate one-task-per-file plans
+        for multi-responsibility objectives, but a hard ceiling must still
+        exist regardless of what the model returns."""
+        from agent.agents.planner_agent import _MAX_DEVELOP_TASKS
+
+        assert _MAX_DEVELOP_TASKS > 6  # raised, not just renamed
+
+        oversized = [
+            {"description": f"Write file_{i}.py", "agent_type": "develop"}
+            for i in range(_MAX_DEVELOP_TASKS + 5)
+        ]
+        planner = _make_planner(json.dumps(oversized))
+
+        tasks = await planner.plan("Build a multi-module app", task_type="develop")
+
+        assert len(tasks) == _MAX_DEVELOP_TASKS
 
 
 class TestPlanWithCriteria:

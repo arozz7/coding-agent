@@ -20,6 +20,31 @@ SHELL_BLOCK_RE = re.compile(
     re.DOTALL | re.IGNORECASE,
 )
 
+# Signs that a "shell block" match actually swallowed a different block
+# format's content, not real shell commands. Happens when the model omits
+# (or the response gets cut off before) the closing ``` for a shell fence —
+# SHELL_BLOCK_RE's non-greedy .*? then matches through to whatever the NEXT
+# ``` in the response happens to be, which can belong to an unrelated FILE:/
+# APPEND:/REPLACE: block or plain code fence. Live example (logs/
+# api-20260822-210550.log, 02:30:33-34): a block matched this way produced
+# "commands" of `REPLACE: index.html 109-112` and bare JS statements like
+# `animate();`, each executed as a shell command and failing with
+# `[WinError 2] The system cannot find the file specified`. Language-agnostic
+# on purpose — this is a response-format guard, not tied to any tech stack.
+_LEAKED_BLOCK_MARKER_RE = re.compile(
+    r'^(?:FILE|APPEND|EDIT|REPLACE|SKILL|SCRIPT):\s|```',
+    re.MULTILINE,
+)
+
+
+def looks_like_leaked_non_shell_content(shell_block_content: str) -> bool:
+    """True when a captured ```shell block's content contains another
+    block-format marker or a stray code fence — i.e. it isn't real shell
+    commands, it's another block's content that leaked in through an
+    unclosed fence. Callers should skip executing such a block rather than
+    running its lines as shell commands."""
+    return bool(_LEAKED_BLOCK_MARKER_RE.search(shell_block_content))
+
 # PowerShell variable assignment ($x = ...) or control-flow keyword
 # (if/while/for/foreach/function/try/switch) at the start of a line — signs
 # the block is a multi-statement script with cross-line state (variables,

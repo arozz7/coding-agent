@@ -14,7 +14,7 @@ from typing import Dict, List
 
 import structlog
 
-from agent.agents.planner_agent import VALID_AGENT_TYPES, _JSON_ARRAY_RE
+from agent.agents.planner_agent import VALID_AGENT_TYPES, _JSON_ARRAY_RE, _MAX_DEVELOP_TASKS
 
 logger = structlog.get_logger()
 
@@ -72,7 +72,16 @@ class PlanReviewerAgent:
             f"- For develop tasks: is there a final step that actually runs the program "
             f"(e.g. 'node src/index.js', 'python main.py', 'cargo run') and verifies "
             f"it starts without errors? If not, add one.\n"
-            f"- Are any steps too vague or too large for one agent call?\n"
+            f"- Are any steps too vague or too large for one agent call? A develop task "
+            f"is too large if it targets more than roughly 300 lines, or if 3+ "
+            f"consecutive tasks all append to the SAME file (a sign the plan crammed a "
+            f"multi-responsibility build into one growing file instead of one file per "
+            f"responsibility). Split any such task/run into one task per logical "
+            f"file/module instead — pick whatever file boundary is idiomatic for the "
+            f"language/framework the objective implies (e.g. separate .js files for a "
+            f"browser app, separate modules for a Python package, separate files under "
+            f"src/ for a Rust crate). Do not solve this by shortening the objective's "
+            f"scope — solve it by adding more, narrower tasks.\n"
             f"- Are there hidden ordering dependencies violated?\n\n"
             f"Return the corrected task list as a JSON array:\n"
             f'[{{"description": "...", "agent_type": "..."}}, ...]'
@@ -104,6 +113,19 @@ class PlanReviewerAgent:
 
             if not validated:
                 return tasks
+
+            # The reviewer can freely expand a plan (e.g. splitting an
+            # oversized single-file task into one task per file/module, per
+            # the checklist above) — but that expansion must still respect
+            # the same hard ceiling plan() enforces, so review can't
+            # silently reintroduce unbounded plans it was meant to fix.
+            if len(validated) > _MAX_DEVELOP_TASKS:
+                self.logger.warning(
+                    "plan_review_truncated",
+                    requested=len(validated),
+                    cap=_MAX_DEVELOP_TASKS,
+                )
+                validated = validated[:_MAX_DEVELOP_TASKS]
 
             self.logger.info(
                 "plan_reviewed",

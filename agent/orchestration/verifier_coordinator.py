@@ -206,18 +206,34 @@ class VerifierCoordinator:
         screenshot_path: Optional[str] = None
 
         if handle is None:
-            # No server entry point — try to screenshot the largest HTML file directly
-            # via file:// so Discord gets a preview of the static deliverable.
+            # detect_start_command() already tries a generic static-file-server
+            # fallback for any workspace with HTML to serve (app_probe.py), so
+            # reaching here with HTML files present means that fallback itself
+            # failed to launch (port conflict, spawn error, readiness timeout) —
+            # not merely "no entry point found". Either way, still try a direct
+            # file:// screenshot and actually evaluate it, rather than silently
+            # skipping acceptance testing for the whole workspace.
             html_files = sorted(
                 workspace.glob("*.html"),
                 key=lambda p: p.stat().st_size,
                 reverse=True,
             )
-            if html_files:
-                screenshot_path = await app_probe.screenshot_file(html_files[0])
-                self.last_screenshot_path = screenshot_path
-            self.logger.info("acceptance_skipped_no_entry_point", workspace=str(workspace))
-            return []
+            if not html_files:
+                self.logger.info("acceptance_skipped_no_entry_point", workspace=str(workspace))
+                return []
+
+            screenshot_path = await app_probe.screenshot_file(html_files[0])
+            self.last_screenshot_path = screenshot_path
+            if screenshot_path is None:
+                self.logger.info(
+                    "acceptance_skipped_static_screenshot_failed", workspace=str(workspace)
+                )
+                return []
+
+            self.logger.info("acceptance_static_fallback", workspace=str(workspace))
+            return await acceptance_tester.run_tests(
+                criteria, workspace, screenshot_path=screenshot_path, agent_output=agent_output
+            )
 
         try:
             screenshot_path = await app_probe.screenshot(handle)

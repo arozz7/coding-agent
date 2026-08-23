@@ -43,10 +43,17 @@ _JSON_ARRAY_RE = re.compile(r'\[[\s\S]*?\]', re.DOTALL)
 _JSON_OBJ_RE = re.compile(r'\{[\s\S]*\}', re.DOTALL)
 
 # Hard cap on plan length for develop/sdlc objectives. Small local models
-# don't reliably respect the "3-6 tasks" prompt instruction, and each extra
+# don't reliably respect the prompt's task-count guidance, and each extra
 # task is another full agent call the model has to get right — capping here
 # bounds worst-case cycles regardless of what the model returns.
-_MAX_DEVELOP_TASKS = 6
+#
+# Raised from 6: the CREATION strategy now plans one task per file/module for
+# multi-responsibility objectives instead of a fixed 2-3 append-to-one-file
+# tasks (see _strategy_hint), so a moderately-scoped build can legitimately
+# need more tasks than before. 12 gives headroom for roughly Pi Coding Agent's
+# quake-remake reference shape (~9 files) plus setup/wrap tasks, without
+# letting a plan run away unbounded.
+_MAX_DEVELOP_TASKS = 12
 
 
 @dataclass
@@ -94,9 +101,13 @@ class PlannerAgent:
 
         strategy_hint = self._strategy_hint(task_type)
         task_count_hint = (
-            "Break the following objective into 3–6 concrete, ordered tasks — "
-            "the smaller local model executing each one does better with fewer, "
-            "narrower tasks than with a long plan."
+            "Break the following objective into concrete, ordered tasks. "
+            "The local model executing each task does better — faster, and less prone "
+            "to hallucinating — on more, narrower tasks than on fewer, broad ones: a "
+            "small objective may only need 1–3 tasks, but an objective spanning several "
+            "distinct files or responsibilities should get one task per file/module "
+            "rather than a handful of tasks that each try to cover multiple files. "
+            "Do not compress scope to hit a low task count."
             if task_type in ("develop", "sdlc") else
             "Break the following objective into 5–8 concrete, ordered tasks."
         )
@@ -257,15 +268,30 @@ class PlannerAgent:
                 "Choose the strategy that matches the objective — do NOT default to the longest one:\n\n"
                 "CREATION — objective uses words like create/write/build/generate/make and describes "
                 "producing new file(s) with no mention of existing errors or an existing project:\n"
-                "  Simple output (plain HTML page, short script, config file, < ~150 lines):\n"
+                "  Simple output (fits comfortably in ~300 lines, one clear file — a short "
+                "script, a config file, a small single-purpose page):\n"
                 "    → 1 task: [develop] Write the complete FILE: block directly.\n"
-                "  Complex output (canvas animation, game, simulation, multi-section document, > ~150 lines):\n"
-                "    → 2–3 tasks: split into logical chunks, each under 150 lines:\n"
-                "      1. [develop] Write FILE: <filename> — HTML skeleton, CSS, opening <script>, constants, config. End at the opening brace of the first function.\n"
-                "      2. [develop] ⚠️ APPEND ONLY — do NOT use FILE:. Use APPEND: <filename> to add the core logic functions (drawing helpers, update functions, scenery generators).\n"
-                "      3. [develop] ⚠️ APPEND ONLY — do NOT use FILE:. Use APPEND: <filename> to add the animation loop, initialization call, and closing </script></body></html> tags.\n"
-                "    CRITICAL: Tasks 2 and 3 MUST start with '⚠️ APPEND ONLY — do NOT use FILE:' "
-                "in their description. Using FILE: on tasks 2+ destroys all earlier content.\n"
+                "  Larger scope (the objective implies multiple distinct responsibilities — "
+                "e.g. a game with rendering + input + entities + UI, a service with routes + "
+                "models + business logic, a CLI with commands + config + I/O):\n"
+                "    → One [develop] task PER logical file/module, each writing ONE complete, "
+                "self-contained FILE: sized to roughly 300 lines. Pick whatever file/module "
+                "boundary is idiomatic for the language and framework the objective implies — "
+                "never force everything into a single file grown via repeated APPEND: as the "
+                "default shape. Illustrative examples (apply the same per-responsibility, "
+                "per-file principle to whatever language/framework actually fits — these are "
+                "not literal templates to copy):\n"
+                "      • Browser app: separate index.html (markup/skeleton only), a "
+                "stylesheet, and one .js file per responsibility (e.g. player.js, world.js, "
+                "weapons.js) — not one giant HTML file with everything inlined.\n"
+                "      • Python: an entry-point file (e.g. main.py) plus one module per "
+                "responsibility under a package directory (e.g. game/player.py, "
+                "game/world.py).\n"
+                "      • Rust: src/main.rs plus one file per responsibility under src/ "
+                "(e.g. src/player.rs, src/world.rs), following normal crate conventions.\n"
+                "    APPEND:/EDIT:/REPLACE: remain available for later legitimate "
+                "modification of a file that already exists — they should never be the "
+                "planned shape of a file's FIRST creation task.\n"
                 "    NEVER add a 'verify', 'test', 'review', or 'open in browser' task — "
                 "the orchestrator runs verification automatically after all tasks complete.\n\n"
                 "DEBUGGING — objective uses words like fix/debug/error/crash/broken/failing/not working:\n"

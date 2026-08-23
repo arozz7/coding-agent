@@ -111,17 +111,25 @@ That should cover it!"""
 
     @pytest.mark.asyncio
     async def test_develop_plan_capped_regardless_of_llm_output(self):
-        """Small local models don't reliably respect a '3-6 tasks' prompt
-        instruction. Truncate at the boundary rather than trusting the model,
-        so an over-long plan can't burn cycles across many small-model calls
-        for what should be one narrow deliverable.
+        """Small local models don't reliably respect the prompt's task-count
+        guidance. Truncate at the boundary rather than trusting the model, so
+        an over-long plan can't burn cycles across many small-model calls.
+
+        Cap raised from 6 to _MAX_DEVELOP_TASKS (12) alongside the CREATION
+        strategy change to one-task-per-file/module for multi-responsibility
+        objectives — a moderately-scoped build can legitimately need more
+        tasks than the old fixed 2-3-append-to-one-file shape did, but a
+        ceiling must still exist regardless of what the model returns.
         """
+        from agent.agents.planner_agent import _MAX_DEVELOP_TASKS
+
         raw = "[" + ",".join(
-            f'{{"description": "Task {i}", "agent_type": "develop"}}' for i in range(12)
+            f'{{"description": "Task {i}", "agent_type": "develop"}}'
+            for i in range(_MAX_DEVELOP_TASKS + 6)
         ) + "]"
         planner = self._make_planner(raw)
         tasks = await planner.plan("build a feature", task_type="develop")
-        assert len(tasks) <= 6
+        assert len(tasks) <= _MAX_DEVELOP_TASKS
 
 
 class TestPlannerAgentStrategy:
@@ -301,6 +309,53 @@ class TestTaskLoop:
         tasks = task_store.list_tasks(job_id)
         assert len(tasks) == 2
         assert all(t.status == "done" for t in tasks)
+
+    @pytest.mark.asyncio
+    async def test_mid_run_checkpoint_runs_auto_criteria_before_all_tasks_finish(self, monkeypatch):
+        """A long-running plan previously produced zero verification signal
+        until every planned task finished. The checkpoint must fire the
+        cheap (LLM-free) auto-checkable criteria mid-loop, using only the
+        auto-checkable subset -- not the behavioral ones the final verifier
+        loop is responsible for."""
+        monkeypatch.setenv("CHECKPOINT_TASK_INTERVAL", "1")
+        specs = [
+            {"description": "Task 1", "agent_type": "develop"},
+            {"description": "Task 2", "agent_type": "develop"},
+            {"description": "Task 3", "agent_type": "develop"},
+        ]
+        loop, _ = self._make_task_loop(
+            specs,
+            completion_criteria=[
+                "file exists: index.html",
+                "the game is playable",  # behavioral -- must not appear in checkpoint calls
+            ],
+        )
+
+        await loop.run("objective", "develop", "session1")
+
+        checkpoint_calls = [
+            c for c in loop._d.verifier_coordinator.evaluate_criteria.call_args_list
+            if c.args[0] == ["file exists: index.html"]
+        ]
+        # One checkpoint per completed task (interval=1) while tasks remain
+        # pending, distinct from the final criterion-loop call after all
+        # tasks are done (which passes the full criteria list, not filtered).
+        assert len(checkpoint_calls) >= 3
+
+    @pytest.mark.asyncio
+    async def test_no_checkpoint_calls_when_no_completion_criteria(self):
+        """Regression guard: a plan with no completion_criteria must not
+        attempt any checkpoint evaluation at all."""
+        specs = [
+            {"description": "Task 1", "agent_type": "develop"},
+            {"description": "Task 2", "agent_type": "develop"},
+            {"description": "Task 3", "agent_type": "develop"},
+        ]
+        loop, _ = self._make_task_loop(specs, completion_criteria=[])
+
+        await loop.run("objective", "develop", "session1")
+
+        loop._d.verifier_coordinator.evaluate_criteria.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_loop_handles_failed_task_and_continues(self):

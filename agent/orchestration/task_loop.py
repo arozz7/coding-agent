@@ -128,6 +128,16 @@ class TaskLoop:
         _completed_task_count = 0
         _failed_task_count = 0
         _verifier_snapshot_files: set[str] = set()
+        # Cheap (LLM-free) progress signal logged every N completed tasks —
+        # pure observability, does not affect loop control flow. A run that
+        # goes wrong (a task ballooning into a giant file, repeated
+        # timeouts) previously produced zero verification signal until every
+        # planned task finished — for a long-running plan that could be
+        # hours in. This surfaces the same auto-checkable criteria
+        # (file exists / file contains / command exits 0) the final
+        # criterion loop already uses, just earlier and without gating
+        # anything on the result.
+        _CHECKPOINT_INTERVAL = max(1, int(os.getenv("CHECKPOINT_TASK_INTERVAL", "3")))
         _fix_budget = max(1, int(os.getenv("FIX_BUDGET", "20")))
         _criterion_fix_count = 0
         _criterion_attempts: dict[str, int] = {}
@@ -427,6 +437,35 @@ class TaskLoop:
                     short = completion_summary or response_text[:80].replace("\n", " ").strip()
                     task_summaries.append(f"✅ **{description[:60]}** — {short}")
                     _completed_task_count += 1
+
+                    if (
+                        completion_criteria
+                        and task_type in _VERIFIABLE_TYPES
+                        and _completed_task_count % _CHECKPOINT_INTERVAL == 0
+                    ):
+                        _auto_checkpoint_criteria = [
+                            c for c in completion_criteria
+                            if any(c.lower().startswith(p) for p in _AUTO_PREFIXES)
+                        ]
+                        if _auto_checkpoint_criteria:
+                            try:
+                                _ws_checkpoint = Path(
+                                    getattr(d.tool_executor, "workspace_path", ".") if d.tool_executor else "."
+                                )
+                                _checkpoint_results = await d.verifier_coordinator.evaluate_criteria(
+                                    _auto_checkpoint_criteria, _ws_checkpoint, _shell
+                                )
+                                self.logger.info(
+                                    "mid_run_checkpoint",
+                                    task_num=task_num,
+                                    total=ctx.total,
+                                    auto_criteria_checked=len(_checkpoint_results),
+                                    auto_criteria_failing=sum(1 for r in _checkpoint_results if not r.passed),
+                                )
+                            except Exception as ce:
+                                self.logger.warning(
+                                    "mid_run_checkpoint_failed", task_num=task_num, error=str(ce)
+                                )
 
                     if agent_type not in ("research", "researcher"):
                         try:
