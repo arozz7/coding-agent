@@ -29,6 +29,40 @@ class TestCostTracker:
         assert "total_cost" in summary
         assert "total_tokens" in summary
 
+    def test_track_usage_prefers_real_usage_over_estimate(self):
+        """When a UsageInfo is passed, it must be used verbatim instead of
+        re-deriving token counts from prompt/response text — real usage from
+        the provider is always more accurate than chars//4 or tiktoken
+        (which is the wrong vocabulary for local Qwen/DeepSeek models)."""
+        from llm.cost_tracker import CostTracker
+        from llm.usage import UsageInfo
+        from llm.model_router import ModelConfig
+
+        tracker = CostTracker()
+        config = ModelConfig(name="test", type="local", provider="turboquant")
+        # Prompt/response text would estimate very differently from this —
+        # proves the real usage numbers win, not the text-derived estimate.
+        real_usage = UsageInfo(prompt_tokens=42, completion_tokens=7, total_tokens=49)
+        tracker.track_usage(config, "a" * 1000, "b" * 1000, usage=real_usage)
+
+        record = tracker.records[0]
+        assert record.prompt_tokens == 42
+        assert record.completion_tokens == 7
+
+    def test_track_usage_falls_back_to_estimate_when_no_usage(self):
+        """Regression guard: omitting `usage=` must behave exactly like
+        before this change — the estimate path is untouched."""
+        from llm.cost_tracker import CostTracker
+        from llm.model_router import ModelConfig
+
+        tracker = CostTracker()
+        config = ModelConfig(name="test", type="local")
+        tracker.track_usage(config, "Hello", "World")
+
+        record = tracker.records[0]
+        assert record.prompt_tokens == tracker.estimate_tokens("Hello")
+        assert record.completion_tokens == tracker.estimate_tokens("World")
+
 
 class TestRateLimiter:
     def test_configure(self):

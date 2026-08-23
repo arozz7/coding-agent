@@ -55,6 +55,7 @@ class OllamaClient:
         timeout: float = 600.0,
         messages: Optional[list[dict]] = None,
         max_tokens: int = 8192,
+        usage_out: Optional[dict] = None,
     ) -> str:
         """Generate a completion.
 
@@ -68,6 +69,10 @@ class OllamaClient:
             max_tokens: Response token budget. Thinking models spend part of
                 this on their <think> trace before the actual answer — too
                 small a budget truncates mid-thought and yields empty content.
+            usage_out: if given, filled in-place with the backend's real
+                ``prompt_tokens``/``completion_tokens``/``total_tokens`` when
+                the response includes a ``usage`` object (TurboQuantLoader and
+                most OpenAI-compatible backends do). Left untouched if absent.
         """
         url = self._get_chat_endpoint()
         self.logger.info("ollama_generate_start", model=model, prompt_len=len(prompt), url=url)
@@ -91,7 +96,10 @@ class OllamaClient:
         # hangs.  asyncio.wait_for cancels the coroutine at the deadline regardless.
         try:
             return await asyncio.wait_for(
-                self._do_generate(url, model, prompt, system_prompt, enable_thinking, timeout, messages, max_tokens),
+                self._do_generate(
+                    url, model, prompt, system_prompt, enable_thinking, timeout, messages, max_tokens,
+                    usage_out=usage_out,
+                ),
                 timeout=timeout,
             )
         except asyncio.TimeoutError:
@@ -108,6 +116,7 @@ class OllamaClient:
         timeout: float,
         messages: Optional[list[dict]] = None,
         max_tokens: int = 8192,
+        usage_out: Optional[dict] = None,
     ) -> str:
         """Inner coroutine — executed inside asyncio.wait_for by generate().
 
@@ -186,6 +195,11 @@ class OllamaClient:
 
         message = choices[0].get("message", {})
         content = message.get("content", "")
+
+        if usage_out is not None and (usage := data.get("usage")):
+            usage_out["prompt_tokens"] = usage.get("prompt_tokens", 0)
+            usage_out["completion_tokens"] = usage.get("completion_tokens", 0)
+            usage_out["total_tokens"] = usage.get("total_tokens", 0)
 
         if not content:
             # Thinking models sometimes produce only reasoning_content with an

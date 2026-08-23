@@ -1,8 +1,10 @@
 from dataclasses import dataclass
 from datetime import datetime, timezone, timedelta
-from typing import Dict, List
+from typing import Dict, List, Optional
 from collections import defaultdict
 import structlog
+
+from .usage import UsageInfo
 
 try:
     import tiktoken as _tiktoken
@@ -41,10 +43,21 @@ class CostTracker:
         return len(text) // 4
 
     def track_usage(
-        self, config, prompt: str, response: str
+        self, config, prompt: str, response: str, usage: Optional[UsageInfo] = None
     ) -> None:
-        prompt_tokens = self.estimate_tokens(prompt)
-        completion_tokens = self.estimate_tokens(response)
+        if usage is not None:
+            prompt_tokens = usage.prompt_tokens
+            completion_tokens = usage.completion_tokens
+        else:
+            if config.provider in ("turboquant", "openrouter"):
+                self.logger.debug(
+                    "usage_estimated_fallback",
+                    model=config.name,
+                    provider=config.provider,
+                    reason="no real usage reported for this call",
+                )
+            prompt_tokens = self.estimate_tokens(prompt)
+            completion_tokens = self.estimate_tokens(response)
 
         if config.type == "local":
             cost = 0.0
@@ -79,6 +92,7 @@ class CostTracker:
             prompt_tokens=prompt_tokens,
             completion_tokens=completion_tokens,
             cost=round(cost, 6),
+            real_usage=usage is not None,
         )
 
     def get_summary(self) -> dict:

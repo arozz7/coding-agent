@@ -40,13 +40,23 @@ class CloudAPIClient:
             return "openai"
         return "openai"  # default to OpenAI-compatible for unknown endpoints
 
-    async def generate(self, prompt: str, config: "ModelConfig", system_prompt: Optional[str] = None) -> str:
+    async def generate(
+        self,
+        prompt: str,
+        config: "ModelConfig",
+        system_prompt: Optional[str] = None,
+        usage_out: Optional[dict] = None,
+    ) -> str:
+        """``usage_out``, if given, is filled in-place with the provider's real
+        token usage when the response includes one. Only the OpenAI-compatible
+        path populates it today (Phase 1) — anthropic/openrouter accept the
+        param but leave it empty for now (Phase 3 adds their extraction)."""
         kind = self._endpoint_type(config)
         if kind == "anthropic":
             return await self._anthropic_generate(prompt, config, system_prompt)
         if kind == "openrouter":
             return await self._openrouter_generate(prompt, config, system_prompt)
-        return await self._openai_generate(prompt, config, system_prompt)
+        return await self._openai_generate(prompt, config, system_prompt, usage_out=usage_out)
 
     async def stream_generate(
         self, prompt: str, config: "ModelConfig", system_prompt: Optional[str] = None
@@ -124,7 +134,13 @@ class CloudAPIClient:
                         elif data.get("type") == "message_stop":
                             break
 
-    async def _openai_generate(self, prompt: str, config: "ModelConfig", system_prompt: Optional[str]) -> str:
+    async def _openai_generate(
+        self,
+        prompt: str,
+        config: "ModelConfig",
+        system_prompt: Optional[str],
+        usage_out: Optional[dict] = None,
+    ) -> str:
         headers = {
             "Authorization": f"Bearer {config.api_key or ''}",
             "content-type": "application/json",
@@ -147,7 +163,39 @@ class CloudAPIClient:
             )
             response.raise_for_status()
             data = response.json()
-            return data["choices"][0]["message"]["content"]
+            message = data["choices"][0]["message"]
+            content = message.get("content", "")
+
+            if usage_out is not None and (usage := data.get("usage")):
+                usage_out["prompt_tokens"] = usage.get("prompt_tokens", 0)
+                usage_out["completion_tokens"] = usage.get("completion_tokens", 0)
+                usage_out["total_tokens"] = usage.get("total_tokens", 0)
+
+            if not content:
+                # Same failure mode ollama_client.py already guards against:
+                # a reasoning model spent its whole max_tokens budget on the
+                # <think> trace and never reached an answer. Returning the
+                # empty string here would silently break downstream parsing,
+                # so raise instead — the caller's retry loop handles it.
+                reasoning = message.get("reasoning_content", "")
+                finish_reason = data["choices"][0].get("finish_reason")
+                if reasoning:
+                    self.logger.warning(
+                        "empty_content_with_reasoning",
+                        model=config.name,
+                        finish_reason=finish_reason,
+                        reasoning_len=len(reasoning),
+                        reasoning_preview=reasoning[:120],
+                    )
+                    raise RuntimeError(
+                        f"Model {config.name!r} returned empty content (reasoning-only "
+                        f"response, finish_reason={finish_reason!r}, {len(reasoning)} "
+                        "reasoning chars hit the max_tokens cap before an answer was "
+                        "produced). Raise max_tokens in models.yaml for this model."
+                    )
+                raise RuntimeError(f"Model {config.name!r} returned empty content and no reasoning")
+
+            return content
 
     async def _openai_stream(
         self, prompt: str, config: "ModelConfig", system_prompt: Optional[str]
